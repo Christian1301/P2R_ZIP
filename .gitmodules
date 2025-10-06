@@ -1,0 +1,6 @@
+[submodule "third_party/P2RLoss"]
+	path = third_party/P2RLoss
+	url = https://github.com/Christian1301/p2r.git
+[submodule "third_party/ZIP"]
+	path = third_party/ZIP
+	url = https://github.com/Christian1301/ZIP-private.git

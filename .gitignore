@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dati temporanei
+*.npy
+*.npz
+*.csv
+*.log
+*.tmp
+
+# Checkpoint e esperimenti
+exp/
+weights/
+runs/
+
+# Ambiente
+.venv/
+env/
+venv/
+*.egg-info/
+
+# Editor
+.vscode/
+.idea/
+
+# Sistemi operativi
+.DS_Store
+Thumbs.db

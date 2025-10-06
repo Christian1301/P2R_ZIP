@@ -1,0 +1,89 @@
+# P2R_ZIP/train_stage2_p2r.py
+import os, yaml, random, numpy as np, torch
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+from models.p2r_zip_model import P2R_ZIP_Model
+from datasets import get_dataset
+from losses.p2r_losses import p2r_density_mse
+from train_utils import resume_if_exists, save_checkpoint, setup_experiment
+
+def set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+def evaluate_p2r(model, loader, device, cfg):
+    model.eval(); total = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            img = batch["image"].to(device)
+            points = [p.to(device) for p in batch["points"]]
+            out = model(img)
+            total += p2r_density_mse(out["density"], points,
+                                     sigma=cfg["LOSS"]["P2R_SIGMA"],
+                                     count_l1_w=cfg["LOSS"]["COUNT_L1_W"]).item()
+    model.train(); return total / len(loader)
+
+def main():
+    cfg = yaml.safe_load(open("config.yaml"))
+    set_seed(cfg["SEED"])
+    device = torch.device(cfg["DEVICE"] if torch.cuda.is_available() else "cpu")
+
+    Dataset = get_dataset(cfg["DATASET"])
+    train_ds = Dataset(cfg["DATA"]["ROOT"], split=cfg["DATA"]["TRAIN_SPLIT"], block_size=cfg["DATA"]["ZIP_BLOCK_SIZE"])
+    val_ds = Dataset(cfg["DATA"]["ROOT"], split=cfg["DATA"]["VAL_SPLIT"], block_size=cfg["DATA"]["ZIP_BLOCK_SIZE"])
+    dl_train = DataLoader(train_ds, batch_size=cfg["OPTIM"]["BATCH_SIZE"], shuffle=True,
+                          num_workers=cfg["OPTIM"]["NUM_WORKERS"], drop_last=True)
+    dl_val = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    model = P2R_ZIP_Model(
+        backbone_name=cfg["MODEL"]["BACKBONE"],
+        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
+        gate=cfg["MODEL"]["GATE"],
+        upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"]
+    ).to(device)
+
+    zip_ckpt = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"] + "_zip", "best_model.pth")
+    assert os.path.isfile(zip_ckpt), f"Checkpoint ZIP non trovato: {zip_ckpt}"
+    model.load_state_dict(torch.load(zip_ckpt, map_location="cpu"), strict=False)
+
+    for p in model.backbone.parameters(): p.requires_grad = False
+    for p in model.zip_head.parameters(): p.requires_grad = False
+
+    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                            lr=cfg["OPTIM"]["LR"], weight_decay=cfg["OPTIM"]["WEIGHT_DECAY"])
+
+    exp_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"] + "_p2r")
+    writer = setup_experiment(exp_dir)
+    start_ep, best_val = (1, float("inf"))
+    if cfg["OPTIM"]["RESUME_LAST"]:
+        start_ep, best_val = resume_if_exists(model, opt, exp_dir, device)
+
+    epochs = cfg["OPTIM"]["EPOCHS"]
+    for ep in range(start_ep, epochs + 1):
+        total = 0.0
+        pbar = tqdm(dl_train, desc=f"[P2R] Epoch {ep}/{epochs}")
+        for batch in pbar:
+            img = batch["image"].to(device)
+            points = [p.to(device) for p in batch["points"]]
+            out = model(img)
+            loss = p2r_density_mse(out["density"], points,
+                                   sigma=cfg["LOSS"]["P2R_SIGMA"],
+                                   count_l1_w=cfg["LOSS"]["COUNT_L1_W"])
+            opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        avg_train = total / len(dl_train)
+        writer.add_scalar("train/loss", avg_train, ep)
+
+        if ep % cfg["OPTIM"]["VAL_INTERVAL"] == 0 or ep == epochs:
+            val_loss = evaluate_p2r(model, dl_val, device, cfg)
+            writer.add_scalar("val/loss", val_loss, ep)
+            is_best = val_loss < best_val
+            if is_best: best_val = val_loss
+            save_checkpoint(model, opt, ep, val_loss, best_val, exp_dir, is_best=is_best)
+            print(f"Val: {val_loss:.4f} | Best: {best_val:.4f}")
+
+    writer.close()
+
+if __name__ == "__main__":
+    main()

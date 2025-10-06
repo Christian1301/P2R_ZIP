@@ -1,0 +1,80 @@
+# P2R_ZIP/train_stage1_zip.py
+import os, yaml, random, numpy as np, torch
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from models.p2r_zip_model import P2R_ZIP_Model
+from datasets import get_dataset
+from losses.zip_nll import zip_nll
+from train_utils import resume_if_exists, save_checkpoint, setup_experiment
+
+def set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+def evaluate_zip(model, loader, device):
+    model.eval(); total = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            img = batch["image"].to(device)
+            blocks = batch["zip_blocks"].to(device)
+            out = model(img)
+            total += zip_nll(out["pi"], out["lam"], blocks).item()
+    model.train(); return total / len(loader)
+
+def main():
+    cfg = yaml.safe_load(open("config.yaml"))
+    set_seed(cfg["SEED"])
+    device = torch.device(cfg["DEVICE"] if torch.cuda.is_available() else "cpu")
+
+    Dataset = get_dataset(cfg["DATASET"])
+    train_ds = Dataset(cfg["DATA"]["ROOT"], split=cfg["DATA"]["TRAIN_SPLIT"], block_size=cfg["DATA"]["ZIP_BLOCK_SIZE"])
+    val_ds = Dataset(cfg["DATA"]["ROOT"], split=cfg["DATA"]["VAL_SPLIT"], block_size=cfg["DATA"]["ZIP_BLOCK_SIZE"])
+    dl_train = DataLoader(train_ds, batch_size=cfg["OPTIM"]["BATCH_SIZE"], shuffle=True,
+                          num_workers=cfg["OPTIM"]["NUM_WORKERS"], drop_last=True)
+    dl_val = DataLoader(val_ds, batch_size=1, shuffle=False)
+
+    model = P2R_ZIP_Model(
+        backbone_name=cfg["MODEL"]["BACKBONE"],
+        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
+        gate=cfg["MODEL"]["GATE"],
+        upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"]
+    ).to(device)
+
+    for p in model.p2r_head.parameters(): p.requires_grad = False
+    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                            lr=cfg["OPTIM"]["LR"], weight_decay=cfg["OPTIM"]["WEIGHT_DECAY"])
+
+    exp_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"] + "_zip")
+    writer = setup_experiment(exp_dir)
+    start_ep, best_val = (1, float("inf"))
+    if cfg["OPTIM"]["RESUME_LAST"]:
+        start_ep, best_val = resume_if_exists(model, opt, exp_dir, device)
+
+    epochs = cfg["OPTIM"]["EPOCHS"]
+    for ep in range(start_ep, epochs + 1):
+        total = 0.0
+        pbar = tqdm(dl_train, desc=f"[ZIP] Epoch {ep}/{epochs}")
+        for batch in pbar:
+            img = batch["image"].to(device)
+            blocks = batch["zip_blocks"].to(device)
+            out = model(img)
+            loss = zip_nll(out["pi"], out["lam"], blocks)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        avg_train = total / len(dl_train)
+        writer.add_scalar("train/loss", avg_train, ep)
+
+        if ep % cfg["OPTIM"]["VAL_INTERVAL"] == 0 or ep == epochs:
+            val_loss = evaluate_zip(model, dl_val, device)
+            writer.add_scalar("val/loss", val_loss, ep)
+            is_best = val_loss < best_val
+            if is_best: best_val = val_loss
+            save_checkpoint(model, opt, ep, val_loss, best_val, exp_dir, is_best=is_best)
+            print(f"Val: {val_loss:.4f} | Best: {best_val:.4f}")
+
+    writer.close()
+
+if __name__ == "__main__":
+    main()

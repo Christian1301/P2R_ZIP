@@ -33,30 +33,30 @@ Input → Backbone CNN → ZIP Head → Mask π → P2R Head → Density Map
 
 ## ⚙️ Struttura del repository
 
+```text
 P2R_ZIP/
 ├─ models/
-│ ├─ backbone.py # Backbone CNN
-│ ├─ zip_head.py # Testa ZIP (π, λ)
-│ ├─ p2r_head.py # Testa P2R
-│ └─ p2r_zip_model.py # Architettura combinata ZIP→P2R
+│  ├─ backbone.py          # Backbone CNN
+│  ├─ zip_head.py          # Testa ZIP (π, λ)
+│  ├─ p2r_head.py          # Testa P2R
+│  └─ p2r_zip_model.py     # Architettura combinata ZIP→P2R
 │
 ├─ datasets/
-│ ├─ base_dataset.py # Classe base per caricamento immagini e punti
-│ ├─ jhu.py, shha.py,
-│ ├─ ucf_qnrf.py, nwpu.py # Dataset supportati
+│  ├─ base_dataset.py      # Classe base per caricamento immagini e punti
+│  ├─ jhu.py, shha.py, ucf_qnrf.py, nwpu.py   # Dataset supportati
 │
 ├─ losses/
-│ ├─ zip_nll.py # Loss Zero-Inflated Poisson NLL
-│ └─ p2r_losses.py # Loss MSE + opzionale L1 sul conteggio
+│  ├─ zip_nll.py           # Loss Zero-Inflated Poisson NLL
+│  └─ p2r_losses.py        # Loss MSE + opzionale L1 sul conteggio
 │
-├─ train_utils.py # Resume, checkpoint, TensorBoard writer
+├─ train_utils.py          # Resume, checkpoint, TensorBoard writer
 │
-├─ train_stage1_zip.py # Fase 1: pre-training ZIP
-├─ train_stage2_p2r.py # Fase 2: training P2R con ZIP congelato
-├─ train_stage3_joint.py # Fase 3: fine-tuning congiunto
+├─ train_stage1_zip.py     # Fase 1: pre-training ZIP
+├─ train_stage2_p2r.py     # Fase 2: training P2R con ZIP congelato
+├─ train_stage3_joint.py   # Fase 3: fine-tuning congiunto
 │
-├─ infer.py # Inferenza end-to-end ZIP→P2R
-├─ config.yaml # Configurazione completa esperimento
+├─ infer.py                # Inferenza end-to-end ZIP→P2R
+├─ config.yaml             # Configurazione completa esperimento
 └─ README.md
 
 

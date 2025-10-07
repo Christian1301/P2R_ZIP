@@ -19,8 +19,8 @@ Input → Backbone CNN → ZIP Head → Mask π → P2R Head → Density Map
 
 - **Backbone condiviso:** es. VGG16-BN o ResNet50 pre-addestrato su ImageNet.
 - **ZIP Head:** calcola per ogni blocco:
-  - \( \pi \): probabilità che il blocco contenga persone,
-  - \( \lambda \): valore atteso di conteggio (Poisson rate).
+  - pi: probabilità che il blocco contenga persone,
+  - lambda: valore atteso di conteggio (Poisson rate).
 - **P2R Head:** prende le feature mascherate dalla ZIP Head e produce una mappa di densità raffinata.
 
 ---
@@ -54,32 +54,101 @@ P2R_ZIP/
 └─ README.md
 
 
----
-
 ## 🧠 Perché ci sono **tre file di training**
 
-Il modello è addestrato in **tre stadi progressivi** per garantire stabilità e specializzazione dei moduli:
+L’addestramento del modello **P2R-ZIP** è suddiviso in **tre stadi progressivi**, progettati per garantire stabilità numerica, separazione dei compiti e una convergenza più robusta.  
+Ogni fase affronta un sotto-problema specifico del crowd counting e contribuisce in modo complementare al risultato finale.
 
-### 🩵 1️⃣ Stage 1 — Pre-training ZIP
-- Allena **solo** il backbone e la ZIP Head.
-- Loss: *Zero-Inflated Poisson NLL*.
-- Obiettivo: imparare a identificare blocchi contenenti persone.
-- Output: `exp/<run_name>_zip/best_model.pth`.
+---
 
-### 💙 2️⃣ Stage 2 — Training P2R
-- Carica ZIP pre-addestrata e **la congela**.
-- Allena **solo la P2R Head** sulle annotazioni puntuali.
-- Loss: *MSE sulla mappa di densità + opzionale L1 sul conteggio*.
-- Output: `exp/<run_name>_p2r/best_model.pth`.
+### 🩵 1️⃣ Stage 1 — Pre-training ZIP (Zero-Inflated Poisson)
+**Obiettivo:**  
+Addestrare la testa ZIP e il backbone a stimare correttamente la *distribuzione dei conteggi* nei blocchi dell’immagine.
 
-### 💜 3️⃣ Stage 3 — Joint Fine-tuning
-- Sblocca tutto il modello.
-- Loss combinata:
-  \[
-  L_{total} = L_{ZIP} + \alpha L_{P2R}
-  \]
-- Ottimizza coerenza e precisione globale.
-- Output: `exp/<run_name>_joint/best_model.pth`.
+**Motivazione:**  
+Le immagini di crowd counting contengono moltissime regioni vuote.  
+Un modello non supervisionato su queste aree rischierebbe di imparare rumore.  
+La ZIP Loss consente di modellare in modo statistico sia:
+- la probabilità che un blocco contenga zero persone (pi),
+- l’intensità media dei conteggi (lambda) nei blocchi non vuoti.
+
+**Cosa impara:**  
+- Il backbone estrattore di feature visive.  
+- La ZIP Head, che distingue tra regioni *vuote* e *popolate*.  
+
+**Output:**  
+Un modello che sa *“dove guardare”* — individua con buona precisione le zone dove è probabile che ci sia crowd.
+
+---
+
+### 💙 2️⃣ Stage 2 — Training P2R (Point-to-Region)
+**Obiettivo:**  
+Raffinare la mappa di densità a livello di pixel, partendo dalle aree identificate dal modulo ZIP.
+
+**Motivazione:**  
+La stima ZIP è a grana grossa (per blocchi 16×16 o 32×32 pixel).  
+Per ottenere conteggi precisi servono mappe *dense e continue* che riflettano le annotazioni puntuali.  
+
+Durante questo stage:
+- Il **backbone e la ZIP Head vengono congelati** (non aggiornati).  
+- Si addestra **solo la P2R Head**, che apprende a proiettare le feature filtrate dalla maschera ZIP in una mappa di densità continua.  
+
+**Loss utilizzata:**  
+L_{P2R} = L_{MSE} + \beta L_{count}
+
+dove il termine L1 opzionale garantisce coerenza nel conteggio totale.
+
+**Cosa impara:**  
+- La P2R Head apprende a stimare “quanto e dove” ci sono persone all’interno delle regioni attive previste da ZIP.  
+
+**Output:**  
+Un modello che sa *“quanto e dove esattamente”*, ma sempre vincolato dalle regioni ZIP.
+
+---
+
+### 💜 3️⃣ Stage 3 — Joint Fine-tuning (Ottimizzazione congiunta)
+**Obiettivo:**  
+Integrare le due componenti (ZIP + P2R) in un addestramento unico, bilanciando le loro loss per ottenere una predizione coerente tra scala globale e scala locale.
+
+**Motivazione:**  
+Dopo le due fasi precedenti, ZIP e P2R lavorano bene separatamente ma non necessariamente in sinergia.  
+Il fine-tuning congiunto consente di:
+- adattare le feature condivise del backbone,
+- migliorare la coerenza tra la probabilità di crowd (ZIP) e la densità generata (P2R),
+- ottimizzare insieme la precisione e la consistenza globale.
+
+**Loss combinata:**  
+L_{total} = L_{ZIP} + \alpha L_{P2R}
+dove:
+- L_{ZIP} regola la stima dei blocchi e la struttura globale,  
+- L_{P2R} regola la precisione locale pixel-wise,  
+- \alpha  controlla il peso relativo dei due obiettivi.
+
+**Interpretazione:**  
+ZIP guida P2R fornendo un contesto spaziale affidabile;  
+P2R affina la stima dentro le regioni attive di ZIP, migliorando la precisione del conteggio.
+
+**Output:**  
+Un modello end-to-end stabile, capace di combinare accuratezza locale e robustezza globale.
+
+---
+
+### 🧩 Riassunto visivo
+
+| Stage | Moduli addestrati | Obiettivo | Output |
+|-------|--------------------|------------|---------|
+| **1️⃣ ZIP Pre-training** | Backbone + ZIP Head | Imparare dove c’è crowd (regioni attive) | Maschera π e λ per blocchi |
+| **2️⃣ P2R Training** | P2R Head | Raffinare la densità pixel-wise | Mappa densità coerente con i punti |
+| **3️⃣ Joint Fine-tuning** | Tutto il modello | Integrare ZIP e P2R per coerenza globale | Predizione end-to-end stabile |
+
+---
+
+### 💡 Intuizione finale
+
+> La pipeline a tre stadi risolve il problema in modo gerarchico:  
+> **ZIP** impara la *distribuzione globale del crowd*,  
+> **P2R** ne affina la *rappresentazione locale*,  
+> e lo **stage congiunto** armonizza le due scale, producendo mappe di densità accurate e consistenti.
 
 ---
 
@@ -87,43 +156,39 @@ Il modello è addestrato in **tre stadi progressivi** per garantire stabilità e
 
 Durante il fine-tuning congiunto (Stage 3), la rete viene ottimizzata con una **loss ibrida** che bilancia due obiettivi:
 
-\[
-L_{total} = L_{ZIP} + \alpha \, L_{P2R}
-\]
+L_{total} = L_{ZIP} + \alpha L_{P2R}
 
 dove:
 
-### 🔹 1. \( L_{ZIP} \): Zero-Inflated Poisson Loss
+### 🔹 1. L_{ZIP}: Zero-Inflated Poisson Loss
 Serve a modellare i **conteggi per blocco**.  
 Ogni blocco ha due parametri:
-- \( \pi \): probabilità che il blocco sia vuoto (nessuna persona),
-- \( \lambda \): intensità media (Poisson rate) se il blocco è occupato.
+- pi: probabilità che il blocco sia vuoto (nessuna persona),
+- lambda: intensità media (Poisson rate) se il blocco è occupato.
 
-La loss NLL per il blocco \( i \) è:
-\[
-L_{ZIP} = - \log \left[ \pi_i \mathbf{1}_{\{c_i=0\}} + (1-\pi_i) e^{-\lambda_i} \frac{\lambda_i^{c_i}}{c_i!} \right]
-\]
+La loss NLL per il blocco i  è:
+
+L_ZIP = -log [ π_i * I(c_i = 0) + (1 - π_i) * exp(-λ_i) * (λ_i^c_i / c_i!) ]
 
 In sintesi:
-- Se il blocco è vuoto, la rete è premiata se \( \pi_i \) è alto.
-- Se è occupato, la rete è premiata se \( \lambda_i \) stima correttamente il conteggio.
+- Se il blocco è vuoto, la rete è premiata se pi_i è alto.
+- Se è occupato, la rete è premiata se lambda_i stima correttamente il conteggio.
 
 Questa formulazione permette di gestire dataset **sbilanciati**, in cui la maggior parte dei blocchi è priva di persone.
 
 ---
 
-### 🔹 2. \( L_{P2R} \): Point-to-Region Loss
+### 🔹 2. L_{P2R}: Point-to-Region Loss
 Serve a **raffinare la mappa di densità** a livello di pixel.
 
 Viene calcolata come:
-\[
-L_{P2R} = \frac{1}{HW} \sum_{x,y} (D_{pred}(x,y) - D_{gt}(x,y))^2 + \beta \, \left| \sum D_{pred} - \sum D_{gt} \right|
-\]
+
+L_P2R = (1 / (H * W)) * Σ[(D_pred(x, y) - D_gt(x, y))²] + β * |ΣD_pred - ΣD_gt|
 
 dove:
-- \( D_{pred} \): mappa di densità predetta,
-- \( D_{gt} \): mappa generata dai punti annotati con un kernel gaussiano (σ definito in `config.yaml`),
-- \( \beta \): coefficiente del termine L1 sul conteggio totale (parametro `COUNT_L1_W`).
+- D_{pred}: mappa di densità predetta,
+- D_{gt}: mappa generata dai punti annotati con un kernel gaussiano (σ definito in `config.yaml`),
+- beta: coefficiente del termine L1 sul conteggio totale (parametro `COUNT_L1_W`).
 
 Il primo termine (MSE) forza la rete a replicare la forma della mappa di densità,  
 il secondo (L1) mantiene il **conteggio totale coerente** con le annotazioni.
@@ -150,15 +215,13 @@ se la rete deve concentrarsi più sul “dove” (ZIP) o sul “quanto” (P2R).
 
 Combinando tutto:
 
-\[
 L_{total} = L_{ZIP} + \alpha \left[ L_{P2R}^{MSE} + \beta L_{count} \right]
-\]
 
 dove:
-- \( L_{ZIP} \) → regola la struttura globale del crowd,  
-- \( L_{P2R}^{MSE} \) → regola la precisione locale,  
-- \( L_{count} \) → mantiene coerente il conteggio totale,  
-- \( \alpha \) → bilancia i due livelli (globale ↔ locale).
+- L_{ZIP} → regola la struttura globale del crowd,  
+- L_{P2R}^{MSE} → regola la precisione locale,  
+- L_{count} → mantiene coerente il conteggio totale,  
+- alpha → bilancia i due livelli (globale ↔ locale).
 
 ---
 

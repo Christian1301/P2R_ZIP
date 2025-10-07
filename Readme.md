@@ -24,7 +24,7 @@ Input → Backbone CNN → ZIP Head → Mask π → P2R Head → Density Map
 - **P2R Head:** prende le feature mascherate dalla ZIP Head e produce una mappa di densità raffinata.
 
 <p align="center">
-  <img src="images/architecture.png" alt="Architettura P2R-ZIP" width="650"/>
+  <img src="readme_image/architecture.png" alt="Architettura P2R-ZIP" width="650"/>
   <br>
   <em>Figura 1 — Flusso sequenziale ZIP → P2R (Zero-Inflated Poisson + Point-to-Region Refinement).</em>
 </p>

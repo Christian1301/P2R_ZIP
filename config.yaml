@@ -1,16 +1,19 @@
 # ========================================
-# CONFIGURAZIONE P2R+ZIP
+# CONFIGURAZIONE FINALE P2R + ZIP
+# Basata sui paper originali:
+# - ZIP: Scalable Crowd Counting via Zero-Inflated Poisson Modeling (2025)
+# - P2R: Point-to-Region Loss for Semi-Supervised Point-Based Crowd Counting (2025)
 # ========================================
 
-RUN_NAME: "jhu_p2rzip_v1"   # Nome esperimento -> exp/jhu_p2rzip_v1
+RUN_NAME: "jhu_p2rzip_final"
 SEED: 2024
-DEVICE: "cuda"               # "cuda" o "cpu"
+DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "jhu"               # "jhu", "ucf", "shha", "nwpu"
+DATASET: "jhu"                        # jhu, ucf, shha, nwpu
 DATA:
-  ROOT: "/mnt/localstorage/datasets/jhu_crowd_v2"   # root dataset
-  ZIP_BLOCK_SIZE: 32          # dimensione blocchi ZIP
+  ROOT: "/mnt/localstorage/datasets/jhu_crowd_v2"
+  ZIP_BLOCK_SIZE: 16                  # stride del backbone VGG16-BN (1/16)
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
@@ -19,28 +22,32 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"       # "vgg16_bn" o "resnet50"
-  ZIP_PI_THRESH: 0.5
-  GATE: "multiply"           # "multiply" o "concat"
+  BACKBONE: "vgg16_bn"                # VGG16-BN -> stride 16
+  ZIP_PI_THRESH: 0.5                  # soglia di attivazione ZIP
+  GATE: "multiply"                    # 'multiply' o 'concat'
   UPSAMPLE_TO_INPUT: true
 
 # === TRAINING ===
 OPTIM:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
-  EPOCHS: 300
+  EPOCHS: 1300                        # come nel paper ZIP
+  WARMUP_EPOCHS: 25                   # warm-up lineare (1e-5 → 1e-4)
   LR: 1.0e-4
+  LR_BACKBONE: 1.0e-5                 # come nel paper P2R
   WEIGHT_DECAY: 1.0e-4
-  VAL_INTERVAL: 10           # valida ogni N epoche
-  RESUME_LAST: true          # riprendi da ultimo checkpoint se esiste
+  SCHEDULER: "cosine"                 # Cosine Annealing Restart (T₀=5, Tmult=2)
+  VAL_INTERVAL: 10                    # validazione ogni 10 epoche
+  RESUME_LAST: true                   # resume automatico
+  SAVE_BEST: true
 
 # === LOSS ===
 LOSS:
-  JOINT_ALPHA: 1.0           # peso della loss P2R nella fase 3 (congiunta)
-  P2R_SIGMA: 4.0
-  COUNT_L1_W: 0.01
+  JOINT_ALPHA: 1.0                    # peso loss P2R nella fase joint
+  P2R_SIGMA: 4.0                      # sigma per generare mappa densità
+  COUNT_L1_W: 0.01                    # peso termine L1 sul conteggio totale
 
-# === ESPERIMENTO ===
+# === ESPERIMENTI ===
 EXP:
   OUT_DIR: "exp"
   SAVE_BEST: true

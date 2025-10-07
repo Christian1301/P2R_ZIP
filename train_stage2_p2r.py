@@ -1,7 +1,7 @@
-# P2R_ZIP/train_stage2_p2r.py
 import os, yaml, random, numpy as np, torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -49,8 +49,22 @@ def main():
     for p in model.backbone.parameters(): p.requires_grad = False
     for p in model.zip_head.parameters(): p.requires_grad = False
 
-    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                            lr=cfg["OPTIM"]["LR"], weight_decay=cfg["OPTIM"]["WEIGHT_DECAY"])
+    # === Optimizer con LR differenziato ===
+    params = [
+        {"params": model.backbone.parameters(), "lr": cfg["OPTIM"].get("LR_BACKBONE", cfg["OPTIM"]["LR"])},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n],
+         "lr": cfg["OPTIM"]["LR"]}
+    ]
+    opt = torch.optim.AdamW(params, weight_decay=cfg["OPTIM"]["WEIGHT_DECAY"])
+
+    # === Scheduler: warm-up + cosine annealing ===
+    def warmup_lambda(epoch):
+        warmup_epochs = cfg["OPTIM"].get("WARMUP_EPOCHS", 0)
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        return 1.0
+    warmup = LambdaLR(opt, lr_lambda=warmup_lambda)
+    cosine = CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2)
 
     exp_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"] + "_p2r")
     writer = setup_experiment(exp_dir)
@@ -74,6 +88,8 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
         avg_train = total / len(dl_train)
         writer.add_scalar("train/loss", avg_train, ep)
+        writer.add_scalar("lr/backbone", opt.param_groups[0]["lr"], ep)
+        writer.add_scalar("lr/decoder", opt.param_groups[1]["lr"], ep)
 
         if ep % cfg["OPTIM"]["VAL_INTERVAL"] == 0 or ep == epochs:
             val_loss = evaluate_p2r(model, dl_val, device, cfg)
@@ -82,6 +98,12 @@ def main():
             if is_best: best_val = val_loss
             save_checkpoint(model, opt, ep, val_loss, best_val, exp_dir, is_best=is_best)
             print(f"Val: {val_loss:.4f} | Best: {best_val:.4f}")
+
+        # === Step scheduler ===
+        if ep <= cfg["OPTIM"].get("WARMUP_EPOCHS", 0):
+            warmup.step()
+        else:
+            cosine.step()
 
     writer.close()
 

@@ -58,6 +58,7 @@ P2R_ZIP/
 ├─ infer.py                # Inferenza end-to-end ZIP→P2R
 ├─ config.yaml             # Configurazione completa esperimento
 └─ README.md
+```
 
 
 ## 🧠 Perché ci sono **tre file di training**

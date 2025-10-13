@@ -5,20 +5,20 @@
 # - P2R: Point-to-Region Loss for Semi-Supervised Point-Based Crowd Counting (2025)
 # ========================================
 
-RUN_NAME: "jhu_p2rzip_final"
+RUN_NAME: "shha"
 SEED: 2024
 DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "jhu"                        # jhu, ucf, shha, nwpu
+DATASET: "shha"                        # jhu, ucf, shha, nwpu
 DATA:
-  ROOT: "/mnt/localstorage/datasets/jhu_crowd_v2"
+  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
   ZIP_BLOCK_SIZE: 16                  # stride del backbone VGG16-BN (1/16)
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train"
-  VAL_SPLIT: "val"
+  TRAIN_SPLIT: "train_data"
+  VAL_SPLIT: "test_data"
 
 # === MODELLO ===
 MODEL:

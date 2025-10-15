@@ -1,52 +1,53 @@
 # P2R_ZIP/datasets/base_dataset.py
-import os
-import numpy as np
-from torch.utils.data import Dataset
-from PIL import Image
 import torch
+from torch.utils.data import Dataset
+import numpy as np
+import cv2
 
 class BaseCrowdDataset(Dataset):
-    """
-    Classe base per dataset di crowd counting.
-    Ogni sottoclasse deve implementare:
-        - load_points(img_path): restituisce np.ndarray Nx2
-        - get_image_list(split): restituisce lista path immagini
-    """
-    def __init__(self, root, split="train", block_size=32, mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)):
+    def __init__(self, root, split, transforms=None, block_size=16):
         self.root = root
         self.split = split
-        self.block = block_size
-        self.mean = torch.tensor(mean).view(3,1,1)
-        self.std  = torch.tensor(std).view(3,1,1)
-        self.img_list = self.get_image_list(split)
-        assert len(self.img_list) > 0, f"Nessuna immagine trovata in {root}/{split}"
+        self.transforms = transforms
+        self.block_size = block_size
+        self.image_list = self.get_image_list(split)
 
     def __len__(self):
-        return len(self.img_list)
+        return len(self.image_list)
 
-    def __getitem__(self, idx):
-        img_path = self.img_list[idx]
-        img = Image.open(img_path).convert("RGB")
-        W, H = img.size
-
+    def __getitem__(self, i):
+        img_path = self.image_list[i]
         pts = self.load_points(img_path)
-        pts = np.array(pts, dtype=np.float32)
-        Hb, Wb = int(np.ceil(H / self.block)), int(np.ceil(W / self.block))
-        blocks = np.zeros((Hb, Wb), dtype=np.float32)
-        for (x, y) in pts:
-            xb = min(int(x // self.block), Wb - 1)
-            yb = min(int(y // self.block), Hb - 1)
-            blocks[yb, xb] += 1
+        img = self.load_image(img_path)
+        den = self.points_to_density(pts, img.shape[1:])
 
-        arr = np.asarray(img).astype(np.float32) / 255.0
-        if arr.ndim == 2:
-            arr = np.stack([arr, arr, arr], axis=-1)
-        timg = torch.from_numpy(arr).permute(2,0,1)
-        timg = (timg - self.mean) / self.std
+        if self.transforms:
+            # Assicurati che le trasformazioni restituiscano img, pts, den
+            img, pts, den = self.transforms(img, pts, den)
 
         return {
-            "image": timg,
-            "points": torch.from_numpy(pts),
-            "zip_blocks": torch.from_numpy(blocks).unsqueeze(0),
-            "img_path": img_path
+            "image": img,
+            "points": pts,
+            "density": den,
+            "img_path": img_path,
         }
+
+    def get_image_list(self, split):
+        raise NotImplementedError
+
+    def load_points(self, img_path):
+        raise NotImplementedError
+
+    def load_image(self, img_path):
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+    def points_to_density(self, points, shape):
+        h, w = shape
+        den = torch.zeros((1, h, w), dtype=torch.float32)
+        for x, y in points:
+            x, y = int(x), int(y)
+            if 0 <= y < h and 0 <= x < w:
+                den[0, y, x] = 1.0
+        return den

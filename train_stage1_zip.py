@@ -1,6 +1,7 @@
 # P2R_ZIP/train_stage1_zip.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # <-- MODIFICA: Aggiunto import
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
@@ -36,25 +37,43 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
         })
     return total_loss / len(dataloader)
 
+# --- FUNZIONE VALIDATE COMPLETAMENTE CORRETTA ---
+
 def validate(model, criterion, dataloader, device):
-    model.eval()
+    model.eval() # Imposta il modello in modalità eval di default
     total_loss, mae, mse = 0.0, 0.0, 0.0
+    
+    # Prendi la block_size dalla funzione criterion
+    block_size = criterion.zip_block_size
     
     with torch.no_grad():
         for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
             images, gt_density = images.to(device), gt_density.to(device)
 
+            # --- FIX 1: GESTIONE STATO MODELLO ---
+            # Dobbiamo mettere in .train() per ottenere il dizionario completo
+            # degli output di ZIP, come richiesto da criterion
+            model.train() 
             predictions = model(images)
-            loss, _ = criterion(predictions, gt_density)
+            model.eval() # Rimettiamo in .eval() subito dopo
+            # --- FINE FIX 1 ---
+
+            loss, loss_dict = criterion(predictions, gt_density)
             total_loss += loss.item()
 
-            # --- CORREZIONE DEL CALCOLO MAE/RMSE ---
-            # 1. Il conteggio predetto è la somma diretta della mappa a bassa risoluzione
+            # --- FIX 2: CALCOLO METRICHE CORRETTO (Metodo 1) ---
+            
+            # 1. Il conteggio predetto è la somma della mappa a bassa risoluzione
             pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
             
-            # 2. Il conteggio GT è la somma della mappa di densità ad alta risoluzione
-            gt_count = torch.sum(gt_density, dim=(1, 2, 3))
+            # 2. Downsample della GT density per ottenere i conteggi per blocco
+            #    Questo è lo stesso calcolo fatto in ZIPCompositeLoss
+            gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
             
+            # 3. Il conteggio GT è la somma della mappa dei conteggi a bassa risoluzione
+            gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
+            
+            # 4. Ora il confronto è corretto (bassa risoluzione vs. bassa risoluzione)
             mae += torch.abs(pred_count - gt_count).sum().item()
             mse += ((pred_count - gt_count) ** 2).sum().item()
 
@@ -83,6 +102,7 @@ def main():
         upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
     ).to(device)
 
+    # Congela la testa P2R, addestriamo solo ZIP
     for param in model.p2r_head.parameters():
         param.requires_grad = False
 
@@ -104,11 +124,10 @@ def main():
     epochs_stage1 = config['OPTIM'].get('EPOCHS_STAGE1', 1300)
     scheduler = get_scheduler(optimizer, config, max_epochs=epochs_stage1)
 
-    best_mae = float('inf')
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
     os.makedirs(output_dir, exist_ok=True)
     
-    start_epoch, best_mae_val = resume_if_exists(model, optimizer, output_dir, device) # best_mae_val per evitare conflitto di nomi
+    start_epoch, best_mae_val = resume_if_exists(model, optimizer, output_dir, device)
     
     for epoch in range(start_epoch, epochs_stage1 + 1):
         print(f"--- Epoch {epoch}/{epochs_stage1} ---")

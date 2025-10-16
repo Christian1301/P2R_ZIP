@@ -50,13 +50,14 @@ class P2R_ZIP_Model(nn.Module):
 
         pred_density_zip = pi_not_zero * lambda_maps
         
-        if self.training:
-            return {
-                "logit_pi_maps": logit_pi_maps,
-                "logit_bin_maps": zip_outputs["logit_bin_maps"],
-                "lambda_maps": lambda_maps,
-                "pred_density_zip": pred_density_zip,
-                "p2r_density": dens
-            }
-        else:
-            return {"density": dens}
+        # --- MODIFICA CHIAVE ---
+        # Restituisci sempre il dizionario completo.
+        # La logica su quale output usare (es. 'p2r_density' per l'inferenza)
+        # sarà gestita dagli script di training/validazione.
+        return {
+            "logit_pi_maps": logit_pi_maps,
+            "logit_bin_maps": zip_outputs["logit_bin_maps"],
+            "lambda_maps": lambda_maps,
+            "pred_density_zip": pred_density_zip,
+            "p2r_density": dens
+        }

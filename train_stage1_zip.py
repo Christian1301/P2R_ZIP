@@ -1,24 +1,17 @@
-# -*- coding: utf-8 -*-
-# ============================================================
-# P2R-ZIP: Stage 1 — ZIP Pre-training (config ottimizzato)
-# ============================================================
-
+# P2R_ZIP/train_stage1_zip.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml, os
+import yaml
+import os
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn
 
-
-# ------------------------------------------------------------
-# TRAIN
-# ------------------------------------------------------------
 def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
     model.train()
     total_loss = 0.0
@@ -26,122 +19,123 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
 
     for images, gt_density, _ in progress_bar:
         images, gt_density = images.to(device), gt_density.to(device)
-        optimizer.zero_grad()
 
+        optimizer.zero_grad()
         predictions = model(images)
         loss, loss_dict = criterion(predictions, gt_density)
 
         loss.backward()
         optimizer.step()
+        if scheduler:
+            scheduler.step()
 
         total_loss += loss.item()
         progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'nll': f"{loss_dict['zip_nll_loss']:.4f}",
-            'ce': f"{loss_dict['zip_ce_loss']:.4f}",
-            'count': f"{loss_dict['zip_count_loss']:.4f}",
+            'loss': f"{loss.item():.4f}", 'nll': f"{loss_dict['zip_nll_loss']:.4f}",
+            'ce': f"{loss_dict['zip_ce_loss']:.4f}", 'count': f"{loss_dict['zip_count_loss']:.4f}",
             'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
         })
-
-    if scheduler:
-        scheduler.step()
-
     return total_loss / len(dataloader)
 
-
-# ------------------------------------------------------------
-# VALIDATE
-# ------------------------------------------------------------
-@torch.no_grad()
 def validate(model, criterion, dataloader, device):
-    model.eval()
+    model.eval() # Imposta il modello in modalità eval di default
     total_loss, mae, mse = 0.0, 0.0, 0.0
+    
+    # Prendi la block_size dalla funzione criterion
     block_size = criterion.zip_block_size
+    
+    with torch.no_grad():
+        for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
+            images, gt_density = images.to(device), gt_density.to(device)
 
-    for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
-        images, gt_density = images.to(device), gt_density.to(device)
-        predictions = model(images)
-        loss, _ = criterion(predictions, gt_density)
-        total_loss += loss.item()
+            # --- FIX 1: GESTIONE STATO MODELLO ---
+            model.train() 
+            predictions = model(images)
+            model.eval() 
+            # --- FINE FIX 1 ---
 
-        # Conteggio atteso corretto: Σ(1−π)*λ
-        pred_count = torch.sum((1.0 - predictions["logit_pi_maps"].softmax(dim=1)[:, 0:1]) * predictions["lambda_maps"], dim=(1, 2, 3))
-        gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size ** 2)
-        gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
+            loss, loss_dict = criterion(predictions, gt_density)
+            total_loss += loss.item()
 
-        mae += torch.abs(pred_count - gt_count).sum().item()
-        mse += ((pred_count - gt_count) ** 2).sum().item()
+            # --- FIX 2: CALCOLO METRICHE CORRETTO (Metodo 1) ---
+            pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
+            gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
+            gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
+            
+            mae += torch.abs(pred_count - gt_count).sum().item()
+            mse += ((pred_count - gt_count) ** 2).sum().item()
 
     avg_loss = total_loss / len(dataloader)
     avg_mae = mae / len(dataloader.dataset)
     avg_mse = (mse / len(dataloader.dataset)) ** 0.5
     return avg_loss, avg_mae, avg_mse
 
-
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
 def main():
     with open("config.yaml", 'r') as f:
-        cfg = yaml.safe_load(f)
+        config = yaml.safe_load(f)
 
-    device = torch.device(cfg["DEVICE"])
-    init_seeds(cfg["SEED"])
+    device = torch.device(config['DEVICE'])
+    init_seeds(config['SEED'])
 
-    optim_cfg = cfg["OPTIM_ZIP"]
-    dataset_name = cfg["DATASET"]
-    bin_config = cfg["BINS_CONFIG"][dataset_name]
-    bins, bin_centers = bin_config["bins"], bin_config["bin_centers"]
+    dataset_name = config['DATASET']
+    bin_config = config['BINS_CONFIG'][dataset_name]
+    bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
 
+    # --- MODIFICA QUI ---
+    # Nomi corretti: 'bins' e 'bin_centers' come da definizione del modello
     model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
-        upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"],
-        zip_bins=bin_centers
+        bins=bins,
+        bin_centers=bin_centers,
+        backbone_name=config['MODEL']['BACKBONE'],
+        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
+        gate=config['MODEL']['GATE'],
+        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
     ).to(device)
+    # --- FINE MODIFICA ---
 
-    # Congela testa P2R
+    # Congela la testa P2R, addestriamo solo ZIP
     for param in model.p2r_head.parameters():
         param.requires_grad = False
 
     criterion = ZIPCompositeLoss(
         bins=bins,
-        weight_ce=cfg["ZIP_LOSS"]["WEIGHT_CE"],
-        zip_block_size=cfg["DATA"]["ZIP_BLOCK_SIZE"]
+        weight_ce=config['ZIP_LOSS']['WEIGHT_CE'],
+        zip_block_size=config['DATA']['ZIP_BLOCK_SIZE']
     ).to(device)
+    
+    optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), config)
+    
+    DatasetClass = get_dataset(config['DATASET'])
+    train_dataset = DatasetClass(root=config['DATA']['ROOT'], split=config['DATA']['TRAIN_SPLIT'])
+    val_dataset = DatasetClass(root=config['DATA']['ROOT'], split=config['DATA']['VAL_SPLIT'])
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['OPTIM']['BATCH_SIZE'], shuffle=True, num_workers=config['OPTIM']['NUM_WORKERS'], collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=config['OPTIM']['NUM_WORKERS'], collate_fn=collate_fn)
 
-    optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), {"OPTIM": optim_cfg})
-    scheduler = get_scheduler(optimizer, {"OPTIM": optim_cfg}, max_epochs=optim_cfg["EPOCHS"])
+    epochs_stage1 = config['OPTIM'].get('EPOCHS_STAGE1', config['OPTIM']['EPOCHS']) # Fallback su EPOCHS
+    scheduler = get_scheduler(optimizer, config, max_epochs=epochs_stage1)
 
-    DatasetClass = get_dataset(cfg["DATASET"])
-    train_dataset = DatasetClass(root=cfg["DATA"]["ROOT"], split=cfg["DATA"]["TRAIN_SPLIT"])
-    val_dataset = DatasetClass(root=cfg["DATA"]["ROOT"], split=cfg["DATA"]["VAL_SPLIT"])
+    output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
+    os.makedirs(output_dir, exist_ok=True)
+    
+    start_epoch, best_mae_val = resume_if_exists(model, optimizer, output_dir, device)
+    
+    for epoch in range(start_epoch, epochs_stage1 + 1):
+        print(f"--- Epoch {epoch}/{epochs_stage1} ---")
+        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device)
+        
+        if (epoch) % config['OPTIM']['VAL_INTERVAL'] == 0:
+            val_loss, val_mae, val_mse = validate(model, criterion, val_loader, device)
+            print(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.2f}, Val RMSE: {val_mse:.2f}")
 
-    dl_train = DataLoader(train_dataset, batch_size=optim_cfg["BATCH_SIZE"], shuffle=True, num_workers=optim_cfg["NUM_WORKERS"], collate_fn=collate_fn)
-    dl_val = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=optim_cfg["NUM_WORKERS"], collate_fn=collate_fn)
-
-    exp_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    os.makedirs(exp_dir, exist_ok=True)
-
-    start_ep, best_val = resume_if_exists(model, optimizer, exp_dir, device)
-
-    for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
-        print(f"--- Epoch {ep}/{optim_cfg['EPOCHS']} ---")
-        train_loss = train_one_epoch(model, criterion, dl_train, optimizer, scheduler, device)
-
-        if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:
-            val_loss, mae, rmse = validate(model, criterion, dl_val, device)
-            print(f"Epoch {ep}: Train {train_loss:.4f} | Val {val_loss:.4f} | MAE {mae:.2f} | RMSE {rmse:.2f}")
-
-            is_best = mae < best_val
+            is_best = val_mae < best_mae_val
             if is_best:
-                best_val = mae
-
-            if cfg["EXP"]["SAVE_BEST"]:
-                save_checkpoint(model, optimizer, ep, mae, best_val, exp_dir, is_best=is_best)
+                best_mae_val = val_mae
+            
+            if config['EXP']['SAVE_BEST']:
+                save_checkpoint(model, optimizer, epoch, val_mae, best_mae_val, output_dir, is_best=is_best)
                 if is_best:
-                    print(f"✅ Nuovo best model salvato (MAE={best_val:.2f})")
+                    print(f"✅ Saved new best model with MAE: {best_mae_val:.2f}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

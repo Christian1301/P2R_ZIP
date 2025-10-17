@@ -2,7 +2,7 @@
 # CONFIGURAZIONE FINALE P2R + ZIP
 # ========================================
 
-RUN_NAME: "shha_vgg19_multistep" # Aggiorna il nome per riflettere le modifiche
+RUN_NAME: "shha_vgg19" # Aggiorna il nome per riflettere le modifiche
 SEED: 2024
 DEVICE: "cuda"
 

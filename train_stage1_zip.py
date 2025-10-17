@@ -17,7 +17,8 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
 
-    for images, gt_density, _ in progress_bar:
+    # La collate_fn ora restituisce (images, densities, points_list)
+    for images, gt_density, _ in progress_bar: 
         images, gt_density = images.to(device), gt_density.to(device)
 
         optimizer.zero_grad()
@@ -33,31 +34,27 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
         progress_bar.set_postfix({
             'loss': f"{loss.item():.4f}", 'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}", 'count': f"{loss_dict['zip_count_loss']:.4f}",
-            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+            'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}" # Legge LR dell'ultimo gruppo (head)
         })
     return total_loss / len(dataloader)
 
 def validate(model, criterion, dataloader, device):
-    model.eval() # Imposta il modello in modalità eval di default
+    model.eval() 
     total_loss, mae, mse = 0.0, 0.0, 0.0
     
-    # Prendi la block_size dalla funzione criterion
     block_size = criterion.zip_block_size
     
     with torch.no_grad():
         for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
             images, gt_density = images.to(device), gt_density.to(device)
 
-            # --- FIX 1: GESTIONE STATO MODELLO ---
             model.train() 
             predictions = model(images)
             model.eval() 
-            # --- FINE FIX 1 ---
 
             loss, loss_dict = criterion(predictions, gt_density)
             total_loss += loss.item()
 
-            # --- FIX 2: CALCOLO METRICHE CORRETTO (Metodo 1) ---
             pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
             gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
             gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
@@ -81,8 +78,6 @@ def main():
     bin_config = config['BINS_CONFIG'][dataset_name]
     bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
 
-    # --- MODIFICA QUI ---
-    # Nomi corretti: 'bins' e 'bin_centers' come da definizione del modello
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
@@ -91,11 +86,11 @@ def main():
         gate=config['MODEL']['GATE'],
         upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
     ).to(device)
-    # --- FINE MODIFICA ---
 
-    # Congela la testa P2R, addestriamo solo ZIP
+    # --- MODIFICA: Spostato il congelamento PRIMA dell'ottimizzatore ---
     for param in model.p2r_head.parameters():
         param.requires_grad = False
+    # --- FINE MODIFICA ---
 
     criterion = ZIPCompositeLoss(
         bins=bins,
@@ -103,17 +98,55 @@ def main():
         zip_block_size=config['DATA']['ZIP_BLOCK_SIZE']
     ).to(device)
     
-    optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), config)
-    
-    DatasetClass = get_dataset(config['DATASET'])
-    train_dataset = DatasetClass(root=config['DATA']['ROOT'], split=config['DATA']['TRAIN_SPLIT'])
-    val_dataset = DatasetClass(root=config['DATA']['ROOT'], split=config['DATA']['VAL_SPLIT'])
-    
-    train_loader = DataLoader(train_dataset, batch_size=config['OPTIM']['BATCH_SIZE'], shuffle=True, num_workers=config['OPTIM']['NUM_WORKERS'], collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=config['OPTIM']['NUM_WORKERS'], collate_fn=collate_fn)
+    # --- MODIFICA: Creazione gruppi di parametri per LR differenziato ---
+    optim_config = config['OPTIM_ZIP']
+    lr_head = optim_config['LR']
+    lr_backbone = optim_config.get('LR_BACKBONE', lr_head)
 
-    epochs_stage1 = config['OPTIM'].get('EPOCHS_STAGE1', config['OPTIM']['EPOCHS']) # Fallback su EPOCHS
-    scheduler = get_scheduler(optimizer, config, max_epochs=epochs_stage1)
+    # Separa i parametri
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    other_params = [p for p in model.zip_head.parameters() if p.requires_grad] # Solo zip_head
+
+    param_groups = [
+        {'params': backbone_params, 'lr': lr_backbone},
+        {'params': other_params, 'lr': lr_head}
+    ]
+    
+    # Passa i gruppi di parametri all'ottimizzatore
+    optimizer = get_optimizer(param_groups, optim_config)
+    # --- FINE MODIFICA ---
+    
+    # Ora usiamo le classi dataset da datasets/
+    DatasetClass = get_dataset(config['DATASET'])
+    train_dataset = DatasetClass(
+        root=config['DATA']['ROOT'], 
+        split=config['DATA']['TRAIN_SPLIT'], 
+        block_size=config['DATA']['ZIP_BLOCK_SIZE'] # Passa block_size
+    )
+    val_dataset = DatasetClass(
+        root=config['DATA']['ROOT'], 
+        split=config['DATA']['VAL_SPLIT'], 
+        block_size=config['DATA']['ZIP_BLOCK_SIZE']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=optim_config['BATCH_SIZE'], 
+        shuffle=True, 
+        num_workers=optim_config['NUM_WORKERS'], 
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=optim_config['NUM_WORKERS'], 
+        collate_fn=collate_fn
+    )
+
+    epochs_stage1 = optim_config.get('EPOCHS', 1300) 
+    
+    scheduler = get_scheduler(optimizer, optim_config, max_epochs=epochs_stage1)
 
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
     os.makedirs(output_dir, exist_ok=True)
@@ -124,7 +157,7 @@ def main():
         print(f"--- Epoch {epoch}/{epochs_stage1} ---")
         train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device)
         
-        if (epoch) % config['OPTIM']['VAL_INTERVAL'] == 0:
+        if (epoch) % optim_config['VAL_INTERVAL'] == 0:
             val_loss, val_mae, val_mse = validate(model, criterion, val_loader, device)
             print(f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.2f}, Val RMSE: {val_mse:.2f}")
 

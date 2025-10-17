@@ -17,22 +17,30 @@ def init_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def get_optimizer(params, config):
-    optim_config = config['OPTIM']
-    lr = optim_config['LR']
+def get_optimizer(param_groups, optim_config): # <-- MODIFICA: Accetta param_groups
+    """
+    Crea un ottimizzatore.
+    'param_groups' deve essere una lista di dizionari (es. [{'params': ..., 'lr': ...}]).
+    'optim_config' è il dizionario di configurazione (es. config['OPTIM_ZIP']).
+    """
+    lr = optim_config['LR'] # LR di default, usato da AdamW se i gruppi non lo specificano
     wd = optim_config['WEIGHT_DECAY']
     optimizer_type = optim_config.get('TYPE', 'adamw').lower()
+
+    if not isinstance(param_groups, list) or not param_groups:
+        raise ValueError("get_optimizer si aspetta una lista non vuota di gruppi di parametri")
+
     if optimizer_type == 'adamw':
-        return optim.AdamW(params, lr=lr, weight_decay=wd)
+        return optim.AdamW(param_groups, lr=lr, weight_decay=wd)
     elif optimizer_type == 'adam':
-        return optim.Adam(params, lr=lr, weight_decay=wd)
+        return optim.Adam(param_groups, lr=lr, weight_decay=wd)
     else:
         raise ValueError(f"Optimizer '{optimizer_type}' non supportato.")
 
-def get_scheduler(optimizer, config, max_epochs):
-    optim_config = config['OPTIM']
+def get_scheduler(optimizer, optim_config, max_epochs):
     scheduler_type = optim_config.get('SCHEDULER', 'cosine').lower()
     warmup_epochs = optim_config.get('WARMUP_EPOCHS', 0)
+    
     if scheduler_type == 'cosine':
         if warmup_epochs > 0:
             def warmup_lambda(current_epoch):
@@ -46,36 +54,42 @@ def get_scheduler(optimizer, config, max_epochs):
     return None
 
 def collate_fn(batch):
-    """
-    Collate function per gestire un batch di dizionari con campioni di dimensioni diverse.
-    """
-    max_h = max(item['image'].shape[1] for item in batch)
-    max_w = max(item['image'].shape[2] for item in batch)
-
-    padded_images = []
-    padded_densities = []
-    points_list = []
+    # Prova a rilevare il formato del dataset (BaseCrowdDataset vs CrowdDataset)
+    item = batch[0]
     
-    for item in batch:
-        img = item['image']
-        den = item['density']
-        pts = item['points']
+    # Caso 1: Basato su BaseCrowdDataset (es. da datasets/shha.py)
+    #
+    if 'density' in item and isinstance(item['points'], np.ndarray):
+        max_h = max(item['image'].shape[1] for item in batch)
+        max_w = max(item['image'].shape[2] for item in batch)
 
-        pad_h = max_h - img.shape[1]
-        pad_w = max_w - img.shape[2]
+        padded_images = []
+        padded_densities = []
+        points_list = []
         
-        padded_img = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0)
-        padded_den = F.pad(den, (0, pad_w, 0, pad_h), mode='constant', value=0)
-        
-        padded_images.append(padded_img)
-        padded_densities.append(padded_den)
-        points_list.append(torch.from_numpy(pts)) # Converte i punti in tensori
-        
-    images_tensor = torch.stack(padded_images, 0)
-    densities_tensor = torch.stack(padded_densities, 0)
+        for item in batch:
+            img, den, pts = item['image'], item['density'], item['points']
+            pad_h, pad_w = max_h - img.shape[1], max_w - img.shape[2]
+            
+            padded_img = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0)
+            padded_den = F.pad(den, (0, pad_w, 0, pad_h), mode='constant', value=0)
+            
+            padded_images.append(padded_img)
+            padded_densities.append(padded_den)
+            points_list.append(torch.from_numpy(pts)) # Converte np.array in tensore
+            
+        return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
 
-    # Restituisce una tupla, come si aspetta il ciclo di training
-    return images_tensor, densities_tensor, points_list
+    # Caso 2: Basato su CrowdDataset (da data/adapters.py)
+    #
+    elif 'zip_blocks' in item and isinstance(item['points'], torch.Tensor):
+        imgs = torch.stack([b["image"] for b in batch], dim=0)
+        blocks = torch.stack([b["zip_blocks"] for b in batch], dim=0)
+        points = [b["points"] for b in batch]
+        return imgs, blocks, points # (images, zip_blocks, points_list)
+
+    raise TypeError(f"Formato batch non riconosciuto in collate_fn: {item.keys()}")
+
 
 def setup_experiment(exp_dir):
     os.makedirs(exp_dir, exist_ok=True)

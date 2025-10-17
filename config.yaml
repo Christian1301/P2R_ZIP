@@ -1,8 +1,5 @@
 # ========================================
 # CONFIGURAZIONE FINALE P2R + ZIP
-# Basata sui paper originali:
-# - ZIP: Scalable Crowd Counting via Zero-Inflated Poisson Modeling (2025)
-# - P2R: Point-to-Region Loss for Semi-Supervised Point-Based Crowd Counting (2025)
 # ========================================
 
 RUN_NAME: "shha"
@@ -10,10 +7,10 @@ SEED: 2024
 DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "shha"                        # jhu, ucf, shha, nwpu
+DATASET: "shha"
 DATA:
   ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
-  ZIP_BLOCK_SIZE: 16                  # stride del backbone VGG16-BN (1/16)
+  ZIP_BLOCK_SIZE: 16
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
@@ -22,51 +19,74 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"                # VGG16-BN -> stride 16
-  ZIP_PI_THRESH: 0.5                  # soglia di attivazione ZIP
-  GATE: "multiply"                    # 'multiply' o 'concat'
+  BACKBONE: "vgg16_bn"
+  ZIP_PI_THRESH: 0.5
+  GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 
-# === TRAINING ===
-OPTIM:
+# === STAGE 1: ZIP TRAINING ===
+OPTIM_ZIP:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
-  EPOCHS: 1300                        # come nel paper ZIP
-  WARMUP_EPOCHS: 25                   # warm-up lineare (1e-5 → 1e-4)
+  EPOCHS: 1300
+  WARMUP_EPOCHS: 25
   LR: 1.0e-4
-  LR_BACKBONE: 1.0e-5                 # come nel paper P2R
+  LR_BACKBONE: 1.0e-5
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"                 # Cosine Annealing Restart (T₀=5, Tmult=2)
-  VAL_INTERVAL: 10                    # validazione ogni 10 epoche
-  RESUME_LAST: true                   # resume automatico
+  SCHEDULER: "cosine"
+  VAL_INTERVAL: 10
+  RESUME_LAST: true
   SAVE_BEST: true
 
-# ... (tutta la tua configurazione esistente fino alla sezione LOSS)
-
-# === LOSS ===
-LOSS:
-  JOINT_ALPHA: 1.0
-  P2R_SIGMA: 4.0
-  COUNT_L1_W: 0.01
-
-# === NUOVA SEZIONE PER ZIP LOSS ===
 ZIP_LOSS:
-  WEIGHT_CE: 1.0  # Peso (omega) per la Cross-Entropy Loss, come nel paper
+  WEIGHT_CE: 1.0
 
-# === NUOVA SEZIONE PER LA CONFIGURAZIONE DEI BIN ===
+# === STAGE 2: P2R TRAINING ===
+OPTIM_P2R:
+  BATCH_SIZE: 16
+  NUM_WORKERS: 4
+  EPOCHS: 1500
+  LR: 5.0e-5
+  LR_BACKBONE: 1.0e-5
+  WEIGHT_DECAY: 1.0e-4
+  SCHEDULER: "cosine"
+  VAL_INTERVAL: 10
+  RESUME_LAST: true
+  SAVE_BEST: true
+
+P2R_LOSS:
+  MU: 128     # raggio regione (µ nel paper)
+  TAU: 8      # peso bilanciamento costi (τ nel paper)
+
+# === STAGE 3: JOINT TRAINING ===
+OPTIM_JOINT:
+  BATCH_SIZE: 8
+  NUM_WORKERS: 4
+  EPOCHS: 800
+  LR_HEADS: 5.0e-5        # learning rate per ZIP e P2R heads
+  LR_BACKBONE: 1.0e-6     # backbone fine-tuning lento
+  WEIGHT_DECAY: 1.0e-4
+  SCHEDULER: "cosine"
+  VAL_INTERVAL: 10
+  RESUME_LAST: true
+  SAVE_BEST: true
+
+JOINT_LOSS:
+  ALPHA: 1.0              # peso L_P2R
+  COUNT_L1_W: 0.01        # peso L_count (già presente sopra)
+
+# === BIN CONFIGURATION ===
 BINS_CONFIG:
   shha:
-    bins: [ [0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 12], [13, 14], [15, 9999] ]
-    bin_centers: [ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.38, 13.38, 16.26 ]
+    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 12], [13, 14], [15, 9999]]
+    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.38, 13.38, 16.26]
   shhb:
-    bins: [ [0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999] ]
-    bin_centers: [ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16 ]
+    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
+    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
   qnrf:
-    bins: [ [0,0], [1,1], [2,2], [3,3], [4,4], [5,5], [6,6], [7,7], [8,8], [9,9], [10,10], [11,12], [13,14], [15,16], [17,18], [19,20], [21,23], [24,26], [27,29], [30,33], [34,9999] ]
-    bin_centers: [ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.43, 13.43, 15.44, 17.44, 19.43, 21.83, 24.85, 27.87, 31.24, 38.86 ]
-  # Aggiungi qui le configurazioni per nwpu e jhu se necessario...
+    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
+    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
 
-# ... (il resto della tua configurazione)
 # === ESPERIMENTI ===
 EXP:
   OUT_DIR: "exp"

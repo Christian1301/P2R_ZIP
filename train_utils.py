@@ -5,7 +5,7 @@ import random
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR 
 import torch.nn.functional as F
 
 def init_seeds(seed=42):
@@ -17,13 +17,8 @@ def init_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def get_optimizer(param_groups, optim_config): # <-- MODIFICA: Accetta param_groups
-    """
-    Crea un ottimizzatore.
-    'param_groups' deve essere una lista di dizionari (es. [{'params': ..., 'lr': ...}]).
-    'optim_config' è il dizionario di configurazione (es. config['OPTIM_ZIP']).
-    """
-    lr = optim_config['LR'] # LR di default, usato da AdamW se i gruppi non lo specificano
+def get_optimizer(param_groups, optim_config):
+    lr = optim_config['LR']
     wd = optim_config['WEIGHT_DECAY']
     optimizer_type = optim_config.get('TYPE', 'adamw').lower()
 
@@ -39,55 +34,85 @@ def get_optimizer(param_groups, optim_config): # <-- MODIFICA: Accetta param_gro
 
 def get_scheduler(optimizer, optim_config, max_epochs):
     scheduler_type = optim_config.get('SCHEDULER', 'cosine').lower()
-    warmup_epochs = optim_config.get('WARMUP_EPOCHS', 0)
-    
-    if scheduler_type == 'cosine':
+    warmup_epochs = optim_config.get('WARMUP_EPOCHS', 0) # Utile per cosine
+
+    # --- MODIFICA: Aggiungi gestione 'multistep' ---
+    if scheduler_type == 'multistep':
         if warmup_epochs > 0:
-            def warmup_lambda(current_epoch):
+             print("Attenzione: Warmup non è tipicamente usato con MultiStepLR nel codice ZIP.")
+        # Legge i milestone e il gamma dalla configurazione
+        milestones = optim_config.get('SCHEDULER_STEPS', [max_epochs]) # Default a nessun decay se non specificato
+        gamma = optim_config.get('SCHEDULER_GAMMA', 0.1)
+        return MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
+    # --- FINE MODIFICA ---
+
+    elif scheduler_type == 'cosine':
+        # Gestione warmup per cosine (come prima)
+        if warmup_epochs > 0:
+            # Funzione lambda per warmup + cosine decay
+            def warmup_cosine_lambda(current_epoch):
                 if current_epoch < warmup_epochs:
-                    return float(current_epoch + 1) / float(warmup_epochs)
-                progress = float(current_epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
-                return 0.5 * (1.0 + np.cos(np.pi * progress))
-            return LambdaLR(optimizer, lr_lambda=warmup_lambda)
+                    # Warmup lineare da ~0 a 1
+                    return float(current_epoch + 1) / float(max(1, warmup_epochs))
+                else:
+                    # Cosine decay dopo il warmup
+                    progress = float(current_epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
+                    return 0.5 * (1.0 + np.cos(np.pi * progress))
+            return LambdaLR(optimizer, lr_lambda=warmup_cosine_lambda)
         else:
-            return CosineAnnealingLR(optimizer, T_max=max_epochs)
+            # Solo Cosine decay
+            return CosineAnnealingLR(optimizer, T_max=max_epochs - warmup_epochs) # T_max è il numero di epoche *dopo* il warmup
+
+    # Se nessun scheduler valido o 'none'
     return None
 
 def collate_fn(batch):
-    # Prova a rilevare il formato del dataset (BaseCrowdDataset vs CrowdDataset)
+    """
+    Collate function per gestire un batch di dizionari da BaseCrowdDataset
+    o dal vecchio CrowdDataset. Gestisce padding per immagini/densità.
+    """
     item = batch[0]
-    
-    # Caso 1: Basato su BaseCrowdDataset (es. da datasets/shha.py)
-    #
-    if 'density' in item and isinstance(item['points'], np.ndarray):
+
+    # --- MODIFICA QUI ---
+    # Caso 1: Basato su BaseCrowdDataset (output: {'image', 'points', 'density', 'img_path'})
+    # Controlla se 'points' è un Tensor, come restituito da __getitem__ dopo le transforms
+    if 'density' in item and isinstance(item['points'], torch.Tensor):
+    # --- FINE MODIFICA ---
         max_h = max(item['image'].shape[1] for item in batch)
         max_w = max(item['image'].shape[2] for item in batch)
 
         padded_images = []
         padded_densities = []
-        points_list = []
-        
+        points_list = [] # Mantiene i punti come lista di tensori
+
         for item in batch:
-            img, den, pts = item['image'], item['density'], item['points']
+            img, den, pts_tensor = item['image'], item['density'], item['points']
             pad_h, pad_w = max_h - img.shape[1], max_w - img.shape[2]
-            
+
+            # Padding a destra e in basso
             padded_img = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0)
             padded_den = F.pad(den, (0, pad_w, 0, pad_h), mode='constant', value=0)
-            
+
             padded_images.append(padded_img)
             padded_densities.append(padded_den)
-            points_list.append(torch.from_numpy(pts)) # Converte np.array in tensore
-            
+            points_list.append(pts_tensor) # Aggiunge il tensore dei punti alla lista
+
+        # Ritorna: Tensor[B, C, Hmax, Wmax], Tensor[B, 1, Hmax, Wmax], List[Tensor[Ni, 2]]
         return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
 
-    # Caso 2: Basato su CrowdDataset (da data/adapters.py)
-    #
+    # Caso 2: Basato sul vecchio CrowdDataset (da data/adapters.py)
+    # { 'image': Tensor, 'points': Tensor, 'zip_blocks': Tensor, ... }
     elif 'zip_blocks' in item and isinstance(item['points'], torch.Tensor):
         imgs = torch.stack([b["image"] for b in batch], dim=0)
         blocks = torch.stack([b["zip_blocks"] for b in batch], dim=0)
-        points = [b["points"] for b in batch]
-        return imgs, blocks, points # (images, zip_blocks, points_list)
+        points = [b["points"] for b in batch] # Già una lista di tensori
+        # Restituisce (images, zip_blocks, points_list) - Nota: qui il secondo elemento è diverso
+        # Questo caso potrebbe non essere più necessario se usi solo BaseCrowdDataset
+        # Ma lo manteniamo per compatibilità (anche se l'output è leggermente diverso)
+        print("Attenzione: collate_fn sta usando il formato 'zip_blocks'. Assicurati che sia intenzionale.")
+        return imgs, blocks, points
 
+    # Se nessuno dei formati noti viene riconosciuto
     raise TypeError(f"Formato batch non riconosciuto in collate_fn: {item.keys()}")
 
 

@@ -2,7 +2,7 @@
 # CONFIGURAZIONE FINALE P2R + ZIP
 # ========================================
 
-RUN_NAME: "shha"
+RUN_NAME: "shha_vgg19_multistep" # Aggiorna il nome per riflettere le modifiche
 SEED: 2024
 DEVICE: "cuda"
 
@@ -16,24 +16,27 @@ DATA:
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "test_data"
+  CROP_SIZE: 256 # Aggiunto per le transforms (puoi aggiustarlo)
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
+  BACKBONE: "vgg19_bn" # <-- MODIFICA: Cambiato backbone
   ZIP_PI_THRESH: 0.5
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 
-# === STAGE 1: ZIP TRAINING ===
+# === STAGE 1: ZIP TRAINING (Allineato a config ZIP ufficiale) ===
 OPTIM_ZIP:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
-  EPOCHS: 1300
-  WARMUP_EPOCHS: 25
-  LR: 1.0e-4
-  LR_BACKBONE: 1.0e-5
+  EPOCHS: 1200 # <-- MODIFICA: Allineato a ZIP ufficiale
+  # WARMUP_EPOCHS: 25 # <-- MODIFICA: Rimosso warmup
+  LR: 1.0e-4 # <-- MODIFICA: LR unico per tutto
+  # LR_BACKBONE: 1.0e-5 # <-- MODIFICA: Rimosso LR differenziato
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
+  SCHEDULER: "multistep" # <-- MODIFICA: Cambiato scheduler
+  SCHEDULER_STEPS: [800] # <-- MODIFICA: Step per MultiStepLR
+  SCHEDULER_GAMMA: 0.1   # <-- MODIFICA: Fattore di riduzione LR
   VAL_INTERVAL: 10
   RESUME_LAST: true
   SAVE_BEST: true
@@ -41,30 +44,30 @@ OPTIM_ZIP:
 ZIP_LOSS:
   WEIGHT_CE: 1.0
 
-# === STAGE 2: P2R TRAINING ===
+# === STAGE 2: P2R TRAINING (Mantiene Cosine, LR differenziato opzionale) ===
 OPTIM_P2R:
-  BATCH_SIZE: 16
+  BATCH_SIZE: 16 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 5.0e-5
-  LR_BACKBONE: 1.0e-5
+  LR: 5.0e-5          # LR per P2R head
+  # LR_BACKBONE: 1.0e-5 # LR per backbone (viene ignorato perché congelato)
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
+  SCHEDULER: "cosine" # P2R spesso usa cosine
   VAL_INTERVAL: 10
   RESUME_LAST: true
   SAVE_BEST: true
 
 P2R_LOSS:
-  MU: 128     # raggio regione (µ nel paper)
-  TAU: 8      # peso bilanciamento costi (τ nel paper)
+  MU: 128
+  TAU: 8
 
-# === STAGE 3: JOINT TRAINING ===
+# === STAGE 3: JOINT TRAINING (Mantiene Cosine, LR differenziati) ===
 OPTIM_JOINT:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 8 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 800
-  LR_HEADS: 5.0e-5        # learning rate per ZIP e P2R heads
-  LR_BACKBONE: 1.0e-6     # backbone fine-tuning lento
+  LR_HEADS: 5.0e-5
+  LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 10
@@ -72,10 +75,11 @@ OPTIM_JOINT:
   SAVE_BEST: true
 
 JOINT_LOSS:
-  ALPHA: 1.0              # peso L_P2R
-  COUNT_L1_W: 0.01        # peso L_count (già presente sopra)
+  ALPHA: 1.0
+  COUNT_L1_W: 0.01
 
 # === BIN CONFIGURATION ===
+# Assicurati che questi siano identici a configs/bin_config.json
 BINS_CONFIG:
   shha:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 12], [13, 14], [15, 9999]]

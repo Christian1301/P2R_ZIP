@@ -13,7 +13,7 @@ from datasets import get_dataset
 from train_utils import init_seeds, collate_fn
 
 @torch.no_grad()
-def validate_checkpoint(model, criterion, dataloader, device):
+def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path): # Passa anche config e path
     """
     Esegue la validazione su un modello caricato.
     Utilizza il Metodo 1 per il calcolo delle metriche (coerente con la loss).
@@ -21,7 +21,6 @@ def validate_checkpoint(model, criterion, dataloader, device):
     model.eval()
     total_loss, mae, mse = 0.0, 0.0, 0.0
     
-    # Prendi la block_size dalla funzione criterion
     block_size = criterion.zip_block_size
     
     progress_bar = tqdm(dataloader, desc="Validating Checkpoint")
@@ -29,26 +28,18 @@ def validate_checkpoint(model, criterion, dataloader, device):
     for images, gt_density, _ in progress_bar:
         images, gt_density = images.to(device), gt_density.to(device)
 
-        # Il modello deve essere in modalità 'training' anche durante la
-        # validazione per restituire tutti gli output di ZIP
         model.train() 
         predictions = model(images)
-        model.eval() # Rimetti in modalità eval subito dopo
+        model.eval() 
 
         loss, loss_dict = criterion(predictions, gt_density)
         total_loss += loss.item()
 
         # --- CALCOLO CORRETTO (METODO 1) ---
-            
-        # 1. Il conteggio predetto è la somma della mappa a bassa risoluzione
         pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
-            
-        # 2. Downsample della GT density per ottenere i conteggi per blocco
         gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
-            
-        # 3. Il conteggio GT è la somma della mappa dei conteggi a bassa risoluzione
         gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
-            
+        
         mae += torch.abs(pred_count - gt_count).sum().item()
         mse += ((pred_count - gt_count) ** 2).sum().item()
         
@@ -63,7 +54,7 @@ def validate_checkpoint(model, criterion, dataloader, device):
     avg_mse = (mse / len(dataloader.dataset)) ** 0.5
     
     print("\n--- Risultati della Valutazione ---")
-    print(f"  Checkpoint:   {CHECKPOINT_PATH}")
+    print(f"  Checkpoint:   {checkpoint_path}")
     print(f"  Dataset:      {config['DATASET']} (split: {config['DATA']['VAL_SPLIT']})")
     print(f"  Immagini:     {len(dataloader.dataset)}")
     print("-------------------------------------")
@@ -96,7 +87,6 @@ def main(config, checkpoint_path):
         return
 
     print(f"Caricamento checkpoint da {checkpoint_path}...")
-    # Carica solo i pesi del modello, non l'ottimizzatore ecc.
     state_dict = torch.load(checkpoint_path, map_location=device)
     if 'model' in state_dict:
         model.load_state_dict(state_dict['model'])
@@ -110,13 +100,27 @@ def main(config, checkpoint_path):
         zip_block_size=config['DATA']['ZIP_BLOCK_SIZE']
     ).to(device)
     
-    # Prepara il dataloader di validazione
+    # --- MODIFICHE PER NUOVO CONFIG E DATASET ---
+    data_config = config['DATA']
+    optim_config = config['OPTIM_ZIP'] # Legge la sezione corretta
+    
     DatasetClass = get_dataset(config['DATASET'])
-    val_dataset = DatasetClass(root=config['DATA']['ROOT'], split=config['DATA']['VAL_SPLIT'])
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=config['OPTIM']['NUM_WORKERS'], collate_fn=collate_fn)
+    val_dataset = DatasetClass(
+        root=data_config['ROOT'], 
+        split=data_config['VAL_SPLIT'], 
+        block_size=data_config['ZIP_BLOCK_SIZE'] # Passa il block_size
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=optim_config['NUM_WORKERS'], # Legge da optim_config
+        collate_fn=collate_fn
+    )
+    # --- FINE MODIFICHE ---
 
     # Lancia la validazione
-    validate_checkpoint(model, criterion, val_loader, device)
+    validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
 
 if __name__ == '__main__':
     with open("config.yaml", 'r') as f:
@@ -125,7 +129,6 @@ if __name__ == '__main__':
     # --- SPECIFICA QUALE CHECKPOINT USARE ---
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
     
-    # Modifica qui per scegliere il checkpoint
     CHECKPOINT_PATH = os.path.join(output_dir, "best_model.pth") 
     # CHECKPOINT_PATH = os.path.join(output_dir, "last.pth") 
 

@@ -24,7 +24,19 @@ class ZIPHead(nn.Module):
         h = self.shared(feat)
         logit_pi_maps = self.pi_head(h)
         logit_bin_maps = self.bin_head(h)
-        lambda_maps = (logit_bin_maps.softmax(dim=1) * bin_centers[:, 1:]).sum(dim=1, keepdim=True)
+        centers = bin_centers
+        if centers.dim() == 1:
+            centers = centers.view(1, -1, 1, 1)
+
+        # se i centers includono lo 0 (K+1), togli lo 0
+        if centers.shape[1] == logit_bin_maps.shape[1] + 1:
+            centers = centers[:, 1:, :, :]
+
+        assert centers.shape[1] == logit_bin_maps.shape[1], \
+            f"centers {centers.shape} vs logits {logit_bin_maps.shape}"
+
+        p_bins = logit_bin_maps.softmax(dim=1)
+        lambda_maps = (p_bins * centers).sum(dim=1, keepdim=True)
 
         return {
             "logit_pi_maps": logit_pi_maps,

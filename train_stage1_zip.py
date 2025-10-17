@@ -27,8 +27,6 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
 
         loss.backward()
         optimizer.step()
-        if scheduler:
-            scheduler.step()
 
         total_loss += loss.item()
         progress_bar.set_postfix({
@@ -36,6 +34,8 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device):
             'ce': f"{loss_dict['zip_ce_loss']:.4f}", 'count': f"{loss_dict['zip_count_loss']:.4f}",
             'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}" # Legge LR dell'ultimo gruppo (head)
         })
+    if scheduler:
+        scheduler.step()
     return total_loss / len(dataloader)
 
 def validate(model, criterion, dataloader, device):
@@ -55,7 +55,10 @@ def validate(model, criterion, dataloader, device):
             loss, loss_dict = criterion(predictions, gt_density)
             total_loss += loss.item()
 
-            pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
+            pi_soft   = predictions["logit_pi_maps"].softmax(dim=1)
+            pi_zero   = pi_soft[:, 0:1]
+            lam       = predictions["lambda_maps"]
+            pred_count = torch.sum((1.0 - pi_zero) * lam, dim=(1, 2, 3))
             gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
             gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
             
@@ -79,12 +82,12 @@ def main():
     bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
 
     model = P2R_ZIP_Model(
-        bins=bins,
-        bin_centers=bin_centers,
         backbone_name=config['MODEL']['BACKBONE'],
         pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
         gate=config['MODEL']['GATE'],
-        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
+        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
+        bins=bins,
+        bin_centers=bin_centers
     ).to(device)
 
     # --- MODIFICA: Spostato il congelamento PRIMA dell'ottimizzatore ---

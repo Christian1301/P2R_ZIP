@@ -29,7 +29,7 @@ MODEL:
 OPTIM_ZIP:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
-  EPOCHS: 1200 # <-- MODIFICA: Allineato a ZIP ufficiale
+  EPOCHS: 1300 
   # WARMUP_EPOCHS: 25 # <-- MODIFICA: Rimosso warmup
   LR: 1.0e-4 # <-- MODIFICA: LR unico per tutto
   # LR_BACKBONE: 1.0e-5 # <-- MODIFICA: Rimosso LR differenziato

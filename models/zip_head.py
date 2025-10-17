@@ -28,13 +28,6 @@ class ZIPHead(nn.Module):
         # Testa per i Bin (classificazione del conteggio > 0) -> N-1 classi
         self.bin_head = nn.Conv2d(inter, len(self.bins) - 1, 1)
 
-        # --- Aggiunta Opzionale: Testa diretta per Lambda ---
-        # A volte predire lambda direttamente (con Softplus) è più stabile
-        # che calcolarlo dai bin. Puoi sperimentare attivando questa.
-        # self.lambda_head = nn.Conv2d(inter, 1, 1)
-        # --- Fine Aggiunta Opzionale ---
-
-
     def forward(self, feat, bin_centers: torch.Tensor):
         h = self.shared(feat)
         logit_pi_maps = self.pi_head(h)     # [B, 2, Hb, Wb]
@@ -64,27 +57,11 @@ class ZIPHead(nn.Module):
         # Calcola lambda come somma pesata dei centri dei bin > 0
         lambda_maps_raw = (p_bins * centers_positive).sum(dim=1, keepdim=True) # [B, 1, Hb, Wb]
 
-        # --- PATCH: Applica Scaling e Clamp a Lambda ---
-        # 1. (Opzionale ma consigliato) Usa Softplus per garantire positività in modo smooth
-        #    Alternativa a usare direttamente lambda_maps_raw se i centers sono già > 0
-        # lambda_maps = F.softplus(lambda_maps_raw) # Applica Softplus
-
         # 2. Scala per mantenere i valori iniziali bassi
         lambda_maps = lambda_maps_raw * self.lambda_scale # Usa lambda_maps_raw se non usi Softplus sopra
 
         # 3. Clampa al valore massimo specifico per il dataset (es. 80 per SHHA)
         lambda_maps = torch.clamp(lambda_maps, min=1e-6, max=self.lambda_max) # Aggiunto min per evitare log(0)
-        # --- FINE PATCH ---
-
-
-        # --- Alternativa: Testa Lambda Diretta (se attivata nell'init) ---
-        # if hasattr(self, 'lambda_head'):
-        #     lambda_out = self.lambda_head(h)
-        #     lambda_maps = F.softplus(lambda_out) # Softplus per garantire positività
-        #     lambda_maps = lambda_maps * self.lambda_scale # Scaling
-        #     lambda_maps = torch.clamp(lambda_maps, min=1e-6, max=self.lambda_max) # Clamping
-        # --- Fine Alternativa ---
-
 
         return {
             "logit_pi_maps": logit_pi_maps,         # Logits per [Zero, NonZero]

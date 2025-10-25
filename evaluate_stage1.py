@@ -1,4 +1,4 @@
-# evaluate_stage1.py
+# evaluate_stage1_diagnostics.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,56 +12,78 @@ from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from train_utils import init_seeds, collate_fn
 
+
 @torch.no_grad()
-def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path): # Passa anche config e path
+def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path):
     """
-    Esegue la validazione su un modello caricato.
-    Utilizza il Metodo 1 per il calcolo delle metriche (coerente con la loss).
+    Validazione dettagliata Stage 1 (ZIP) con diagnostica su pi/lambda.
     """
     model.eval()
     total_loss, mae, mse = 0.0, 0.0, 0.0
-    
     block_size = criterion.zip_block_size
-    
-    progress_bar = tqdm(dataloader, desc="Validating Checkpoint")
-    
-    for images, gt_density, _ in progress_bar:
+
+    print("\n===== DEBUG ZIP HEAD =====")
+    print("Controllo range di pi (probabilità blocco occupato) e lambda (intensità Poisson)")
+    print("------------------------------------------------------")
+
+    progress_bar = tqdm(dataloader, desc="Validating ZIP Stage 1")
+
+    for idx, (images, gt_density, _) in enumerate(progress_bar):
         images, gt_density = images.to(device), gt_density.to(device)
 
-        model.train() 
-        predictions = model(images)
-        model.eval() 
-
-        loss, loss_dict = criterion(predictions, gt_density)
+        preds = model(images)
+        loss, loss_dict = criterion(preds, gt_density)
         total_loss += loss.item()
 
-        # --- CALCOLO CORRETTO (METODO 1) ---
-        pred_count = torch.sum(predictions["pred_density_zip"], dim=(1, 2, 3))
+        # Estrai le mappe principali
+        pi_logits = preds["logit_pi_maps"]       # [B, 2, H, W]
+        lam_maps  = preds["lambda_maps"]         # [B, 1, H, W]
+        pi_softmax = torch.softmax(pi_logits, dim=1)
+        pi_not_zero = pi_softmax[:, 1:]          # Probabilità di blocco occupato
+
+        # Diagnostica statistica
+        pi_mean = pi_not_zero.mean().item()
+        pi_min, pi_max = pi_not_zero.min().item(), pi_not_zero.max().item()
+        lam_mean = lam_maps.mean().item()
+        lam_min, lam_max = lam_maps.min().item(), lam_maps.max().item()
+        pct_over_01 = (pi_not_zero > 0.1).float().mean().item() * 100
+        pct_over_05 = (pi_not_zero > 0.5).float().mean().item() * 100
+
+        # Conteggio previsto totale (sommando ZIP density)
+        pred_density_zip = pi_not_zero * lam_maps
+        pred_count = torch.sum(pred_density_zip).item()
+
         gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
-        gt_count = torch.sum(gt_counts_per_block, dim=(1, 2, 3))
-        
-        mae += torch.abs(pred_count - gt_count).sum().item()
-        mse += ((pred_count - gt_count) ** 2).sum().item()
-        
+        gt_count = torch.sum(gt_counts_per_block).item()
+
+        mae += abs(pred_count - gt_count)
+        mse += (pred_count - gt_count) ** 2
+
+        # Stampa di debug ogni 10 immagini
+        if idx % 10 == 0:
+            print(f"[IMG {idx:03d}] pi:[{pi_min:.3f},{pi_max:.3f}] mean={pi_mean:.3f} "
+                  f"| λ:[{lam_min:.3f},{lam_max:.3f}] mean={lam_mean:.3f} "
+                  f"| >0.1={pct_over_01:.2f}% >0.5={pct_over_05:.2f}% "
+                  f"| pred={pred_count:.1f}, gt={gt_count:.1f}")
+
         progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}", 
+            'loss': f"{loss.item():.4f}",
             'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}"
         })
 
     avg_loss = total_loss / len(dataloader)
     avg_mae = mae / len(dataloader.dataset)
-    avg_mse = (mse / len(dataloader.dataset)) ** 0.5
-    
-    print("\n--- Risultati della Valutazione ---")
-    print(f"  Checkpoint:   {checkpoint_path}")
-    print(f"  Dataset:      {config['DATASET']} (split: {config['DATA']['VAL_SPLIT']})")
-    print(f"  Immagini:     {len(dataloader.dataset)}")
+    avg_rmse = (mse / len(dataloader.dataset)) ** 0.5
+
+    print("\n--- RISULTATI VALIDAZIONE ZIP ---")
+    print(f"Checkpoint:   {checkpoint_path}")
+    print(f"Dataset:      {config['DATASET']} (split: {config['DATA']['VAL_SPLIT']})")
     print("-------------------------------------")
-    print(f"  Validation Loss: {avg_loss:.4f}")
-    print(f"  MAE:             {avg_mae:.2f}")
-    print(f"  RMSE:            {avg_mse:.2f}")
-    print("-------------------------------------")
+    print(f"Validation Loss: {avg_loss:.4f}")
+    print(f"MAE:             {avg_mae:.2f}")
+    print(f"RMSE:            {avg_rmse:.2f}")
+    print("-------------------------------------\n")
 
 
 def main(config, checkpoint_path):
@@ -81,55 +103,47 @@ def main(config, checkpoint_path):
         upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
     ).to(device)
 
-    # Carica il checkpoint specificato
     if not os.path.isfile(checkpoint_path):
-        print(f"Errore: Checkpoint non trovato in {checkpoint_path}")
+        print(f"❌ Errore: Checkpoint non trovato in {checkpoint_path}")
         return
 
-    print(f"Caricamento checkpoint da {checkpoint_path}...")
+    print(f"✅ Caricamento checkpoint da {checkpoint_path}...")
     state_dict = torch.load(checkpoint_path, map_location=device)
     if 'model' in state_dict:
         model.load_state_dict(state_dict['model'])
     else:
         model.load_state_dict(state_dict)
-    print("Caricamento completato.")
+    print("✅ Caricamento completato.\n")
 
     criterion = ZIPCompositeLoss(
         bins=bins,
         weight_ce=config['ZIP_LOSS']['WEIGHT_CE'],
         zip_block_size=config['DATA']['ZIP_BLOCK_SIZE']
     ).to(device)
-    
-    # --- MODIFICHE PER NUOVO CONFIG E DATASET ---
-    data_config = config['DATA']
-    optim_config = config['OPTIM_ZIP'] # Legge la sezione corretta
-    
+
     DatasetClass = get_dataset(config['DATASET'])
     val_dataset = DatasetClass(
-        root=data_config['ROOT'], 
-        split=data_config['VAL_SPLIT'], 
-        block_size=data_config['ZIP_BLOCK_SIZE'] # Passa il block_size
+        root=config['DATA']['ROOT'],
+        split=config['DATA']['VAL_SPLIT'],
+        block_size=config['DATA']['ZIP_BLOCK_SIZE']
     )
+
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=optim_config['NUM_WORKERS'], # Legge da optim_config
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=config['OPTIM_ZIP']['NUM_WORKERS'],
         collate_fn=collate_fn
     )
-    # --- FINE MODIFICHE ---
 
-    # Lancia la validazione
     validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
+
 
 if __name__ == '__main__':
     with open("config.yaml", 'r') as f:
         config = yaml.safe_load(f)
 
-    # --- SPECIFICA QUALE CHECKPOINT USARE ---
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
-    
-    CHECKPOINT_PATH = os.path.join(output_dir, "best_model.pth") 
-    # CHECKPOINT_PATH = os.path.join(output_dir, "last.pth") 
+    CHECKPOINT_PATH = os.path.join(output_dir, "best_model.pth")
 
     main(config, CHECKPOINT_PATH)

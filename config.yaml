@@ -30,9 +30,6 @@ OPTIM_ZIP:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
   EPOCHS: 1300 
-  # WARMUP_EPOCHS: 25 # <-- MODIFICA: Rimosso warmup
-  LR: 1.0e-4 # <-- MODIFICA: LR unico per tutto
-  # LR_BACKBONE: 1.0e-5 # <-- MODIFICA: Rimosso LR differenziato
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "multistep" # <-- MODIFICA: Cambiato scheduler
   SCHEDULER_STEPS: [800] # <-- MODIFICA: Step per MultiStepLR
@@ -40,16 +37,20 @@ OPTIM_ZIP:
   VAL_INTERVAL: 10
   RESUME_LAST: true
   SAVE_BEST: true
+  BASE_LR: 5.0e-5
+  LR_BACKBONE: 2.5e-5
 
 ZIP_LOSS:
-  WEIGHT_CE: 1.0
+  WEIGHT_CE: 5.0
+  WEIGHT_NLL: 1.0
+  WEIGHT_COUNT: 0.1
 
 # === STAGE 2: P2R TRAINING (Mantiene Cosine, LR differenziato opzionale) ===
 OPTIM_P2R:
   BATCH_SIZE: 16 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 5.0e-5          # LR per P2R head
+  LR: 1.0e-4
   # LR_BACKBONE: 1.0e-5 # LR per backbone (viene ignorato perché congelato)
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine" # P2R spesso usa cosine

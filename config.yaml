@@ -50,7 +50,7 @@ OPTIM_P2R:
   BATCH_SIZE: 16 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 1.0e-4
+  LR: 5.0e-4
   # LR_BACKBONE: 1.0e-5 # LR per backbone (viene ignorato perché congelato)
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine" # P2R spesso usa cosine

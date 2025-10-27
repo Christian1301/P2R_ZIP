@@ -1,6 +1,7 @@
 # P2R_ZIP/datasets/base_dataset.py
 import torch
 from torch.utils.data import Dataset
+from torchvision.transforms import functional as TF
 import numpy as np
 import cv2
 from PIL import Image # Usiamo PIL per compatibilità con torchvision.transforms
@@ -57,7 +58,7 @@ class BaseCrowdDataset(Dataset):
 
         else:
              # Se non ci sono transforms, converti manualmente
-             img_tensor = F.to_tensor(img)
+             img_tensor = TF.to_tensor(img)
              # Normalizza manualmente (se non fatto dalle transforms)
              # mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
              # std = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)

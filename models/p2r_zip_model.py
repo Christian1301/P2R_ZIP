@@ -17,7 +17,8 @@ class P2R_ZIP_Model(nn.Module):
         backbone_name="vgg16_bn",
         pi_thresh=0.5,
         gate="multiply",
-        upsample_to_input=True
+        upsample_to_input=True,
+        debug=False
     ):
         super().__init__()
         self.bins = bins
@@ -27,36 +28,47 @@ class P2R_ZIP_Model(nn.Module):
         )
 
         self.backbone = BackboneWrapper(backbone_name)
-        # ✅ Qui passiamo anche self.bins
         self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins)
-        self.p2r_head = P2RHead(self.backbone.out_channels, gate=gate)
+        self.p2r_head = P2RHead(in_channel=512, fea_channel=64, up_scale=2)
+
+        # ✅ ora rispetta il valore da config
         self.pi_thresh = pi_thresh
         self.gate = gate
         self.upsample_to_input = upsample_to_input
+        self.debug = debug
 
     def forward(self, x):
         B, C, H, W = x.shape
         feat = self.backbone(x)
 
-        # ZIP head
+        # --- ZIP head ---
         zip_outputs = self.zip_head(feat, self.bin_centers)
         logit_pi_maps = zip_outputs["logit_pi_maps"]
         lambda_maps = zip_outputs["lambda_maps"]
 
-        # maschera da pi > thresh
+        # --- Maschera occupazione ---
         pi_softmax = logit_pi_maps.softmax(dim=1)
-        pi_not_zero = pi_softmax[:, 1:]
+        pi_not_zero = pi_softmax[:, 1:]  # probabilità che il blocco sia occupato
         mask = (pi_not_zero > self.pi_thresh).float()
 
+        # ✅ Allinea la maschera alla risoluzione delle feature
+        if mask.shape[-2:] != feat.shape[-2:]:
+            mask = F.interpolate(mask, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+
+        # --- Debug: percentuale blocchi attivi ---
+        if self.debug:
+            active_ratio = mask.mean().item() * 100
+            print(f"[DEBUG] Active blocks ratio: {active_ratio:.2f}% (th={self.pi_thresh})")
+
+        # --- Gating ---
         if self.gate == "multiply":
             gated = feat * mask
         elif self.gate == "concat":
-            if mask.shape[-2:] != feat.shape[-2:]:
-                mask = F.interpolate(mask, size=feat.shape[-2:], mode="nearest")
-            gated = torch.cat([feat, mask], dim=1)
+            gated = torch.cat([feat, mask.expand_as(feat[:, :1, :, :])], dim=1)
         else:
             raise ValueError("gate deve essere 'multiply' o 'concat'")
 
+        # --- P2R head ---
         dens = self.p2r_head(gated)
         if self.upsample_to_input:
             dens = F.interpolate(dens, size=(H, W), mode="bilinear", align_corners=False)

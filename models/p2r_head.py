@@ -1,40 +1,80 @@
-# P2R_ZIP/models/p2r_head.py
+# -*- coding: utf-8 -*-
+# ============================================================
+# P2RHead — versione finale conforme al paper
+# "Point-to-Region Supervision for Crowd Counting" (2023)
+# ============================================================
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 
-class ConvBlock(nn.Module):
-    def __init__(self, c_in, c_out):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(c_in, c_out, 3, padding=1),
-            nn.BatchNorm2d(c_out),
-            nn.ReLU(True),
-            nn.Conv2d(c_out, c_out, 3, padding=1),
-            nn.BatchNorm2d(c_out),
-            nn.ReLU(True),
+# ------------------------------------------------------------
+# Blocco conv 3×3 come nel paper (senza BatchNorm)
+# ------------------------------------------------------------
+def conv_3x3(in_channels, out_channels, bn=False):
+    padding = 1
+    layers = [
+        nn.Conv2d(
+            in_channels, out_channels,
+            kernel_size=3, stride=1, padding=padding,
+            bias=not bn
         )
-    def forward(self, x):
-        return self.block(x)
+    ]
+    if bn:
+        layers.append(nn.BatchNorm2d(out_channels))
+    layers.append(nn.ReLU(inplace=True))
+    block = nn.Sequential(*layers)
 
+    # Inizializzazione come nel paper
+    if not bn:
+        init.constant_(block[0].bias, 0.)
+    return block
+
+
+# ------------------------------------------------------------
+# Decoder originale P2R con diagnostica opzionale
+# ------------------------------------------------------------
 class P2RHead(nn.Module):
     """
-    Decoder leggero per densità (o logit punti).
+    Decoder P2R conforme al paper:
+    - PixelShuffle per l'upsampling
+    - Sigmoid finale per produrre mappa di densità normalizzata [0,1]
     """
-    def __init__(self, in_ch: int, gate: str = "multiply"):
+    def __init__(self, in_channel=128, fea_channel=64, up_scale=1, out_channel=1, debug=False):
         super().__init__()
-        add = 1 if gate == "concat" else 0
-        c = in_ch + add
-        self.dec = nn.Sequential(
-            ConvBlock(c, 256),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            ConvBlock(256, 128),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            ConvBlock(128, 64),
+        self.debug = debug
+        self.up_scale = up_scale
+        self.base_stride = 8  # stride effettivo del backbone (es. VGG stride=8)
+        self.log_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=True)
+        self.layer1 = conv_3x3(in_channel, fea_channel, bn=False)
+        self.layer2 = conv_3x3(fea_channel, fea_channel, bn=False)
+        self.conv_out = nn.Conv2d(
+            fea_channel,
+            out_channel * (up_scale ** 2),
+            kernel_size=3, stride=1, padding=1
         )
-        self.out = nn.Conv2d(64, 1, 1)
+        self.pixel_shuffle = nn.PixelShuffle(up_scale)
+
+        # Inizializzazione identica al paper
+        init.constant_(self.conv_out.bias, 0.)
 
     def forward(self, x):
-        h = self.dec(x)
-        den = torch.relu(self.out(h))
-        return den
+        if self.debug:
+            print(f"[P2RHead] Input shape: {tuple(x.shape)}")
+
+        h = self.layer1(x)
+        h = self.layer2(h)
+        out = self.conv_out(h)
+        out = self.pixel_shuffle(out)
+
+        # ✅ Converte il log-scale in scala positiva
+        scale = torch.exp(self.log_scale)
+        out = torch.relu(out) * scale
+
+        if self.debug:
+            print(f"[P2RHead] Output shape: {tuple(out.shape)} (upscale x{self.up_scale})")
+            print(f"[P2RHead] Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
+            print(f"[P2RHead] Density scale (relu): {scale.item():.6f}")
+            print(f"[P2RHead] Density scale (exp): {scale.item():.6f}")
+
+        return out

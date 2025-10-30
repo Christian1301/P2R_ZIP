@@ -16,23 +16,35 @@ from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exis
 
 # ============================================================
 # 🔧 Funzione di regolarizzazione extra per ZIP Head
-# Penalizza pi saturato (vicino a 0 o 1) e lambda troppo costante
+# Spinge π verso un target basso e penalizza λ eccessivamente alti
 # ============================================================
-def zip_regularization(preds, lam_weight=1e-3, pi_weight=1e-3):
-    logit_pi = preds["logit_pi_maps"]
-    lam = preds["lambda_maps"]
+def zip_regularization(
+    preds,
+    pi_target: float = 0.12,
+    pi_weight: float = 1e-3,
+    lambda_target: float = 3.0,
+    lambda_weight: float = 5e-4,
+):
+    device = preds["lambda_maps"].device
+    reg_loss = preds["lambda_maps"].new_tensor(0.0, device=device)
 
-    pi_soft = logit_pi.softmax(dim=1)[:, 1:]  # prob blocco occupato
-    pi_reg = ((pi_soft - 0.5) ** 2).mean()  # penalizza saturazione (vicino a 0 o 1)
-    lam_reg = lam.std()  # incoraggia variazione spaziale
+    if pi_weight > 0:
+        pi_soft = preds["logit_pi_maps"].softmax(dim=1)[:, 1:]
+        pi_reg = ((pi_soft - pi_target) ** 2).mean()
+        reg_loss = reg_loss + pi_weight * pi_reg
 
-    return pi_weight * pi_reg - lam_weight * lam_reg  # lam_reg con segno - per favorire varianza
+    if lambda_weight > 0:
+        lam = preds["lambda_maps"]
+        lambda_reg = torch.relu(lam - lambda_target).mean()
+        reg_loss = reg_loss + lambda_weight * lambda_reg
+
+    return reg_loss
 
 
 # ============================================================
 # 🔹 Training loop con diagnostica
 # ============================================================
-def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, clip_grad_norm=1.0):
+def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, reg_params, clip_grad_norm=1.0):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
@@ -45,7 +57,7 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         loss, loss_dict = criterion(predictions, gt_density)
 
         # Regolarizzazione extra
-        reg_loss = zip_regularization(predictions)
+        reg_loss = zip_regularization(predictions, **reg_params)
         total = loss + reg_loss
 
         total.backward()
@@ -60,6 +72,7 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
             'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}",
             'count': f"{loss_dict['zip_count_loss']:.4f}",
+            'reg': f"{reg_loss.item():.4f}",
             'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
         })
 
@@ -117,6 +130,14 @@ def main():
     bin_cfg = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
+    zip_head_cfg = config.get("ZIP_HEAD", {})
+    zip_head_kwargs = {
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
+        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+    }
+
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
@@ -124,16 +145,16 @@ def main():
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
         upsample_to_input=config["MODEL"]["UPSAMPLE_TO_INPUT"],
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     # Congela la P2R Head
     for p in model.p2r_head.parameters():
         p.requires_grad = False
 
-    # Per Stage 1: rinforza il CE loss
     criterion = ZIPCompositeLoss(
         bins=bins,
-        weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"] * 2.0,  # 🔥 CE più pesante
+        weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
         zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
     ).to(device)
 
@@ -196,11 +217,27 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
 
+    zip_reg_cfg = config.get("ZIP_REG", {})
+    zip_reg_params = {
+        "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),
+        "pi_weight": zip_reg_cfg.get("PI_WEIGHT", 1e-3),
+        "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
+        "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
+    }
+
     print(f"🚀 Inizio addestramento Stage 1 per {optim_cfg['EPOCHS']} epoche...")
 
     for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         print(f"\n--- Epoch {epoch}/{optim_cfg['EPOCHS']} ---")
-        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device)
+        train_loss = train_one_epoch(
+            model,
+            criterion,
+            train_loader,
+            optimizer,
+            scheduler,
+            device,
+            zip_reg_params,
+        )
 
         if epoch % optim_cfg["VAL_INTERVAL"] == 0 or epoch == optim_cfg["EPOCHS"]:
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)

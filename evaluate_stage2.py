@@ -27,6 +27,7 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
     """
     model.eval()
     total_loss, mae_errors, mse_errors = 0.0, 0.0, 0.0
+    total_pred, total_gt = 0.0, 0.0
 
     # --- Recupera downsample del training (default 8) ---
     default_down = cfg["DATA"].get("P2R_DOWNSAMPLE", 8)
@@ -46,13 +47,21 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
         # --- Determina il fattore di scala effettivo ---
         if H_out == H_in and W_out == W_in:
-            # Il modello ha upsamplato fino all'input → correggiamo
-            down = default_down
+            # Il modello ha upsamplato fino all'input → usa il downsampling del training
+            down_h = down_w = float(default_down)
         else:
-            down = int(round(H_in / H_out))
+            down_h = H_in / max(H_out, 1)
+            down_w = W_in / max(W_out, 1)
+
+        if (abs(H_in - down_h * H_out) > 1.0 or abs(W_in - down_w * W_out) > 1.0) and not hasattr(evaluate_p2r, "_shape_warned"):
+            print(f"⚠️ Downsample non intero rilevato: input {H_in}x{W_in}, output {H_out}x{W_out}, "
+                  f"down_h={down_h:.4f}, down_w={down_w:.4f}")
+            evaluate_p2r._shape_warned = True
+
+        down_tuple = (down_h, down_w)
 
         # --- Calcolo loss coerente col training ---
-        loss = loss_fn(pred_density, points_list, down=down)
+        loss = loss_fn(pred_density, points_list, down=down_tuple)
         total_loss += loss.item()
 
         if H_out == H_in and W_out == W_in:
@@ -60,7 +69,8 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
             pred_count = torch.sum(pred_density, dim=(1, 2, 3))
         else:
             # Output ridotto → ogni cella rappresenta (down×down) pixel
-            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) * (down ** 2)
+            cell_area = down_h * down_w
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
 
         gt_count = torch.tensor([len(p) for p in points_list], dtype=torch.float32, device=device)
 
@@ -69,15 +79,18 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
             print("===== DEBUG STAGE 2 =====")
             print(f"Input size: {H_in}x{W_in}")
             print(f"Output size: {H_out}x{W_out}")
-            print(f"Downsampling factor: {down}x")
+            print(f"Downsampling factor: ({down_h:.2f}x, {down_w:.2f}x)")
             print(f"Density map range: [{pred_density.min().item():.4f}, {pred_density.max().item():.4f}]")
             print(f"Mean density: {pred_density.mean().item():.6f}")
             print(f"[DEBUG] Pred count (scaled): {pred_count[0].item():.2f}, GT count: {gt_count[0].item():.2f}")
             print("=========================")
             evaluate_p2r._debug_done = True
 
-        mae_errors += torch.abs(pred_count - gt_count).sum().item()
+        abs_diff = torch.abs(pred_count - gt_count)
+        mae_errors += abs_diff.sum().item()
         mse_errors += ((pred_count - gt_count) ** 2).sum().item()
+        total_pred += pred_count.sum().item()
+        total_gt += gt_count.sum().item()
 
     # --- Metriche finali ---
     n = len(loader.dataset)
@@ -89,9 +102,12 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
     print(f"Validation Loss: {avg_loss:.4f}")
     print(f"MAE: {mae:.2f}")
     print(f"RMSE: {rmse:.2f}")
+    if total_gt > 0:
+        bias = total_pred / total_gt
+        print(f"Pred / GT ratio: {bias:.3f} (tot_pred={total_pred:.1f}, tot_gt={total_gt:.1f})")
     print("=====================================\n")
 
-    return avg_loss, mae, rmse
+    return avg_loss, mae, rmse, total_pred, total_gt
 
 
 def main():
@@ -125,6 +141,14 @@ def main():
     # --- Modello ---
     dataset_name = cfg["DATASET"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
+    zip_head_cfg = cfg.get("ZIP_HEAD", {})
+    zip_head_kwargs = {
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
+        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+    }
+
     model = P2R_ZIP_Model(
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
@@ -132,6 +156,7 @@ def main():
         upsample_to_input=False,  # <<< come nel training!
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     # --- Carica checkpoint Stage 2 ---
@@ -151,7 +176,17 @@ def main():
         model.load_state_dict(state_dict, strict=False)
 
     # --- Loss ---
-    loss_fn = P2RLoss().to(device)
+    loss_cfg = cfg.get("P2R_LOSS", {})
+    loss_kwargs = {}
+    if "SCALE_WEIGHT" in loss_cfg:
+        loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
+    if "CHUNK_SIZE" in loss_cfg:
+        loss_kwargs["chunk_size"] = int(loss_cfg["CHUNK_SIZE"])
+    if "MIN_RADIUS" in loss_cfg:
+        loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
+    if "MAX_RADIUS" in loss_cfg:
+        loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
+    loss_fn = P2RLoss(**loss_kwargs).to(device)
 
     # --- Valutazione ---
     evaluate_p2r(model, val_loader, loss_fn, device, cfg)

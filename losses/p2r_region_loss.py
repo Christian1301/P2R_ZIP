@@ -159,22 +159,33 @@ class P2RLoss(nn.Module):
         self,
         dens: torch.Tensor,                  # [B, 1, H_out, W_out] (ReLU/(upscale^2))
         points,                              # lista di B tensori [Ni, >=2] (x,y,[...]) in coord spazio input
-        down: int = 16,                      # fattore di downsampling: input/H_out
+        down = 16,                           # fattore di downsampling: input/H_out (scalar o tuple)
         masks: Optional[torch.Tensor] = None,
         crop_den_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Calcola la P2R loss.
 
-        Note importanti:
-        - Le coordinate dei punti devono essere nello spazio input (H_in x W_in).
-        - Le mappe di densità sono nello spazio ridotto (H_out x W_out).
-        - Per allineare i due spazi, generiamo A_coord (pixel center) nello spazio input:
-              A_coord = pixel_center(H_out, W_out) * down + (down-1)/2
-        - T (target binario) si ottiene confrontando la distanza minima con min_radius (in pixel input).
+                Note importanti:
+                - Le coordinate dei punti devono essere nello spazio input (H_in x W_in).
+                - Le mappe di densità sono nello spazio ridotto (H_out x W_out).
+                - Per allineare i due spazi, generiamo i centri pixel nello spazio input con:
+                            rr_in = rr * down_h + (down_h - 1) / 2
+                            cc_in = cc * down_w + (down_w - 1) / 2
+                - T (target binario) si ottiene confrontando la distanza minima con min_radius (in pixel input).
         """
         device = dens.device
         _check_no_nan_inf(dens, "dens")
+
+        if isinstance(down, (list, tuple)):
+            if len(down) != 2:
+                raise ValueError(f"down come sequenza deve avere due elementi, trovato {down}")
+            down_h, down_w = float(down[0]), float(down[1])
+        else:
+            down_h = down_w = float(down)
+
+        if down_h <= 0 or down_w <= 0:
+            raise ValueError(f"down deve essere positivo, trovato down_h={down_h}, down_w={down_w}")
 
         B = len(points)
         assert dens.ndim == 4 and dens.shape[1] == 1, f"dens deve essere [B,1,H,W], trovato {tuple(dens.shape)}"
@@ -195,7 +206,7 @@ class P2RLoss(nn.Module):
             # Debug lightweight
             if ENABLE_LIGHT_DEBUG_LOG and i == 0:
                 with torch.no_grad():
-                    print(f"[P2R DEBUG] B={B}, HxW={H}x{W}, down={down}, "
+                    print(f"[P2R DEBUG] B={B}, HxW={H}x{W}, down=({down_h:.3f},{down_w:.3f}), "
                           f"den_range=[{den.min().item():.4e},{den.max().item():.4e}], "
                           f"den_mean={den.mean().item():.6f}")
 
@@ -225,7 +236,7 @@ class P2RLoss(nn.Module):
                     reduction="mean",
                 )
                 total_loss = total_loss + loss_empty
-                pred_counts.append(dens[i].sum() / (down ** 2))
+                pred_counts.append(dens[i].sum() / (down_h * down_w))
                 gt_counts.append(dens.new_tensor(0.0))
                 if ENABLE_LIGHT_DEBUG_LOG:
                     print(f"[P2R DEBUG] i={i} senza punti → loss_empty={loss_empty.item():.6f}")
@@ -235,8 +246,8 @@ class P2RLoss(nn.Module):
             _check_no_nan_inf(seq, f"points[{i}]")
 
             # Clamp dei punti nel dominio input (HxW nello spazio input = H*down, W*down)
-            H_in = H * down
-            W_in = W * down
+            H_in = H * down_h
+            W_in = W * down_w
             # seq: [N, >=2], coordinate [x, y] in seq[:, :2]
             # Convenzione comune: seq[:,0]=x (colonna), seq[:,1]=y (riga). Qui NON le scambiamo,
             # usiamo coerenza interna: A_coord = (row, col) nello spazio input, B_coord = (y, x).
@@ -254,9 +265,10 @@ class P2RLoss(nn.Module):
             rr, cc = torch.meshgrid(rows, cols, indexing="ij")  # [H,W], [H,W]
             # Centro del pixel in input-space:
             #   rr_in = rr*down + (down-1)/2,  cc_in = cc*down + (down-1)/2
-            center_offset = (down - 1) / 2.0
-            rr_in = rr * down + center_offset
-            cc_in = cc * down + center_offset
+            center_offset_h = (down_h - 1.0) / 2.0
+            center_offset_w = (down_w - 1.0) / 2.0
+            rr_in = rr * down_h + center_offset_h
+            cc_in = cc * down_w + center_offset_w
             A_coord = torch.stack([rr_in, cc_in], dim=-1).view(1, -1, 2)  # [1, HW, 2]
 
             # Coordinate dei punti nello spazio input (B_coord usa [y, x] coerente con rr/cc)
@@ -284,8 +296,8 @@ class P2RLoss(nn.Module):
             total_loss = total_loss + loss_i
 
             # Penalità di scala sui conteggi (entrambe le quantità in "count di persone")
-            # dens è nello spazio ridotto: somma(dens) ≈ count*(1/down^2) → riportiamo a count dividendo di (down^2)
-            pred_counts.append(dens[i].sum() / (down ** 2))
+            # dens è nello spazio ridotto: somma(dens) ≈ count*(1/(down_h*down_w)) → riportiamo a count dividendo di (down_h*down_w)
+            pred_counts.append(dens[i].sum() / (down_h * down_w))
             gt_counts.append(dens.new_tensor(float(seq.shape[0])))
 
             if ENABLE_LIGHT_DEBUG_LOG and i == 0:
@@ -295,7 +307,7 @@ class P2RLoss(nn.Module):
                           f"A_norm_range=[{A_norm.min().item():.4e},{A_norm.max().item():.4e}]")
 
             # cleanup chunk
-            del A_norm, A_coord, B_coord, minC, mcidx, T, Wt, rr, cc, rr_in, cc_in
+            del A_norm, A_coord, B_coord, minC, mcidx, T, Wt, rr, cc, rr_in, cc_in, center_offset_h, center_offset_w
 
         # Penalità globale sui conteggi
         if len(pred_counts) > 0:

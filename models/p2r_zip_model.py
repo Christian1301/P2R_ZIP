@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from .backbone import BackboneWrapper
 from .zip_head import ZIPHead
@@ -18,7 +18,9 @@ class P2R_ZIP_Model(nn.Module):
         pi_thresh=0.5,
         gate="multiply",
         upsample_to_input=True,
-        debug=False
+        debug=False,
+    zip_head_kwargs: Optional[dict] = None,
+    p2r_head_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.bins = bins
@@ -28,8 +30,16 @@ class P2R_ZIP_Model(nn.Module):
         )
 
         self.backbone = BackboneWrapper(backbone_name)
-        self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins)
-        self.p2r_head = P2RHead(in_channel=512, fea_channel=64, up_scale=2)
+        zip_head_kwargs = zip_head_kwargs or {}
+        self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins, **zip_head_kwargs)
+        p2r_head_kwargs = p2r_head_kwargs or {}
+        if "in_channel" not in p2r_head_kwargs:
+            p2r_head_kwargs["in_channel"] = 512
+        if "fea_channel" not in p2r_head_kwargs:
+            p2r_head_kwargs["fea_channel"] = 64
+        if "up_scale" not in p2r_head_kwargs:
+            p2r_head_kwargs["up_scale"] = 2
+        self.p2r_head = P2RHead(**p2r_head_kwargs)
 
         # ✅ ora rispetta il valore da config
         self.pi_thresh = pi_thresh

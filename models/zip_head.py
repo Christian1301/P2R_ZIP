@@ -1,4 +1,5 @@
 # P2R_ZIP/models/zip_head.py
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,10 +17,11 @@ class ZIPHead(nn.Module):
         self,
         in_ch: int,
         bins: List[Tuple[float, float]],
-        lambda_scale: float = 1.0,       # ✅ scala iniziale aumentata
-        lambda_max: float = 10.0,        # ✅ range massimo realistico per SHHA
+        lambda_scale: float = 0.5,       # scala iniziale più conservativa
+        lambda_max: float = 8.0,         # tetto realistico per densità di blocco
         use_softplus: bool = True,
         epsilon: float = 1e-6,
+        lambda_noise_std: float = 0.0,
     ):
         super().__init__()
         if not all(len(b) == 2 for b in bins):
@@ -32,6 +34,8 @@ class ZIPHead(nn.Module):
         self.lambda_max = lambda_max
         self.use_softplus = use_softplus
         self.epsilon = epsilon
+        self.lambda_noise_std = lambda_noise_std
+        self._softplus_offset = math.log(2.0)  # softplus(0)
 
         inter = max(64, in_ch // 4)
 
@@ -48,8 +52,11 @@ class ZIPHead(nn.Module):
         # Testa per bin > 0 (distribuzione del conteggio)
         self.bin_head = nn.Conv2d(inter, len(bins) - 1, 1)
 
-        # Parametro di bilanciamento (usato opzionalmente in loss)
-        self.class_weights = torch.tensor([1.0, 3.0])  # ⬆️ peso maggiore ai blocchi vuoti
+        # Bias iniziale: favorisce blocchi vuoti all'inizio del training
+        if self.pi_head.bias is not None and self.pi_head.bias.numel() == 2:
+            with torch.no_grad():
+                self.pi_head.bias[0] = 1.5
+                self.pi_head.bias[1] = -1.5
 
     def forward(self, feat: torch.Tensor, bin_centers: torch.Tensor):
         # Feature estratte dal backbone
@@ -80,17 +87,21 @@ class ZIPHead(nn.Module):
         lambda_raw = (p_bins * centers_positive).sum(dim=1, keepdim=True)
 
         # ✅ nuova formula per lambda
+        lambda_pre = lambda_raw * self.lambda_scale
         if self.use_softplus:
-            lambda_maps = F.softplus(lambda_raw * self.lambda_scale)
+            lambda_maps = F.softplus(lambda_pre) - self._softplus_offset
         else:
-            lambda_maps = F.relu(lambda_raw * self.lambda_scale)
+            lambda_maps = F.relu(lambda_pre)
+
+        # Evita valori negativi dopo la sottrazione dell'offset
+        lambda_maps = torch.clamp(lambda_maps, min=self.epsilon)
 
         # Clamp finale per sicurezza
         lambda_maps = torch.clamp(lambda_maps, min=self.epsilon, max=self.lambda_max)
 
-        # ✅ Aggiunta leggera regolarizzazione stocastica
-        if self.training:
-            noise = torch.randn_like(lambda_maps) * 0.01
+        # Rumore opzionale per stabilizzare il training
+        if self.training and self.lambda_noise_std > 0.0:
+            noise = torch.randn_like(lambda_maps) * self.lambda_noise_std
             lambda_maps = torch.clamp(lambda_maps + noise, min=self.epsilon, max=self.lambda_max)
 
         # Diagnostica (solo se necessario)

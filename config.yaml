@@ -25,6 +25,12 @@ MODEL:
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 
+ZIP_HEAD:
+  LAMBDA_SCALE: 0.5
+  LAMBDA_MAX: 8.0
+  USE_SOFTPLUS: true
+  LAMBDA_NOISE_STD: 0.0
+
 # === STAGE 1: ZIP TRAINING (Allineato a config ZIP ufficiale) ===
 OPTIM_ZIP:
   BATCH_SIZE: 4
@@ -45,6 +51,12 @@ ZIP_LOSS:
   WEIGHT_NLL: 1.0
   WEIGHT_COUNT: 0.1
 
+ZIP_REG:
+  PI_TARGET: 0.12
+  PI_WEIGHT: 1.0e-3
+  LAMBDA_TARGET: 3.0
+  LAMBDA_WEIGHT: 5.0e-4
+
 # === STAGE 2: P2R TRAINING (Mantiene Cosine, LR differenziato opzionale) ===
 OPTIM_P2R:
   BATCH_SIZE: 16 # Potresti dover ridurre se VGG19 usa più memoria
@@ -61,6 +73,10 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
+  SCALE_WEIGHT: 0.08
+  LOG_SCALE_INIT: -2.5
+  LOG_SCALE_LR_FACTOR: 0.1
+  LOG_SCALE_CLAMP: [-3.5, -0.2]
 
 # === STAGE 3: JOINT TRAINING (Mantiene Cosine, LR differenziati) ===
 OPTIM_JOINT:

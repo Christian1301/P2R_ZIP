@@ -94,13 +94,22 @@ def main(config, checkpoint_path):
     bin_config = config['BINS_CONFIG'][dataset_name]
     bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
 
+    zip_head_cfg = config.get("ZIP_HEAD", {})
+    zip_head_kwargs = {
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
+        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+    }
+
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
         backbone_name=config['MODEL']['BACKBONE'],
         pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
         gate=config['MODEL']['GATE'],
-        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT']
+        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     if not os.path.isfile(checkpoint_path):
@@ -108,11 +117,22 @@ def main(config, checkpoint_path):
         return
 
     print(f"✅ Caricamento checkpoint da {checkpoint_path}...")
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    if 'model' in state_dict:
-        model.load_state_dict(state_dict['model'])
-    else:
-        model.load_state_dict(state_dict)
+    raw_state = torch.load(checkpoint_path, map_location=device)
+    state_dict = raw_state.get('model', raw_state)
+
+    # Compatibilità con vecchi checkpoint che usavano 'density_scale'
+    density_key = 'p2r_head.density_scale'
+    log_scale_key = 'p2r_head.log_scale'
+    if density_key in state_dict and log_scale_key not in state_dict:
+        density_scale = state_dict.pop(density_key)
+        # Evita log(0)
+        state_dict[log_scale_key] = torch.log(density_scale.clamp(min=1e-8))
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"ℹ️ Parametri mancanti ignorati: {missing}")
+    if unexpected:
+        print(f"ℹ️ Parametri extra ignorati: {unexpected}")
     print("✅ Caricamento completato.\n")
 
     criterion = ZIPCompositeLoss(

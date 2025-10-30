@@ -101,7 +101,7 @@ def collate_val(batch):
     return torch.stack(imgs_out), torch.stack(dens_out), dummy_pts
 
 
-def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, optimizer, scheduler, device):
+def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, optimizer, scheduler, device, default_down):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 3 (Joint)")
@@ -117,7 +117,17 @@ def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, opti
         loss_zip, loss_dict_zip = criterion_zip(outputs, gt_density)
 
         # --- P2R Loss ---
-        loss_p2r = criterion_p2r(outputs["p2r_density"], points)
+        pred_density = outputs["p2r_density"]
+        _, _, h_out, w_out = pred_density.shape
+        _, _, h_in, w_in = images.shape
+        down_h = h_in / max(h_out, 1)
+        down_w = w_in / max(w_out, 1)
+        if abs(h_in - down_h * h_out) <= 1 and abs(w_in - down_w * w_out) <= 1:
+            down_tuple = (down_h, down_w)
+        else:
+            down_tuple = (float(default_down), float(default_down))
+
+        loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
 
         # --- Combined Loss ---
         combined_loss = loss_zip + alpha * loss_p2r
@@ -152,7 +162,14 @@ def validate(model, dataloader, device):
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
-        pred_count = torch.sum(pred_density, dim=(1, 2, 3))
+        _, _, h_out, w_out = pred_density.shape
+        _, _, h_in, w_in = images.shape
+        down_h = h_in / max(h_out, 1)
+        down_w = w_in / max(w_out, 1)
+        cell_area = down_h * down_w
+        cell_area_tensor = pred_density.new_tensor(cell_area)
+
+        pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
         gt_count = torch.sum(gt_density, dim=(1, 2, 3))
 
         mae += torch.abs(pred_count - gt_count).sum().item()
@@ -174,10 +191,25 @@ def main():
     init_seeds(config["SEED"])
     print(f"✅ Avvio Stage 3 (Joint ZIP + P2R) su {device}")
 
+    default_down = config["DATA"].get("P2R_DOWNSAMPLE", 8)
+
     # === MODEL SETUP ===
     dataset_name = config["DATASET"]
     bin_config = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_config["bins"], bin_config["bin_centers"]
+
+    upsample_to_input = config["MODEL"].get("UPSAMPLE_TO_INPUT", False)
+    if upsample_to_input:
+        print("ℹ️ Stage 3: disattivo temporaneamente UPSAMPLE_TO_INPUT per mantenere la stessa scala di Stage 2.")
+        upsample_to_input = False
+
+    zip_head_cfg = config.get("ZIP_HEAD", {})
+    zip_head_kwargs = {
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
+        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+    }
 
     model = P2R_ZIP_Model(
         bins=bins,
@@ -185,7 +217,8 @@ def main():
         backbone_name=config["MODEL"]["BACKBONE"],
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
-        upsample_to_input=config["MODEL"]["UPSAMPLE_TO_INPUT"]
+        upsample_to_input=upsample_to_input,
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     # === CARICA CHECKPOINT STAGE 2 ===
@@ -212,7 +245,17 @@ def main():
         zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"]
     ).to(device)
 
-    criterion_p2r = P2RLoss().to(device)
+    loss_cfg = config.get("P2R_LOSS", {})
+    loss_kwargs = {}
+    if "SCALE_WEIGHT" in loss_cfg:
+        loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
+    if "CHUNK_SIZE" in loss_cfg:
+        loss_kwargs["chunk_size"] = int(loss_cfg["CHUNK_SIZE"])
+    if "MIN_RADIUS" in loss_cfg:
+        loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
+    if "MAX_RADIUS" in loss_cfg:
+        loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
+    criterion_p2r = P2RLoss(**loss_kwargs).to(device)
     alpha = config["JOINT_LOSS"]["ALPHA"]
 
     # === OPTIMIZER E SCHEDULER ===
@@ -272,7 +315,7 @@ def main():
         print(f"\n--- Epoch {epoch + 1}/{epochs_stage3} ---")
         train_loss = train_one_epoch(
             model, criterion_zip, criterion_p2r, alpha,
-            train_loader, optimizer, scheduler, device
+            train_loader, optimizer, scheduler, device, default_down
         )
 
         if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:

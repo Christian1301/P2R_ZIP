@@ -31,20 +31,32 @@ def main():
     t = (t - mean) / std
     t = t.unsqueeze(0).to(device)
 
-    # model
+    dataset_name = cfg["DATASET"]
+    bin_cfg = cfg["BINS_CONFIG"][dataset_name]
+    zip_head_cfg = cfg.get("ZIP_HEAD", {})
+    zip_head_kwargs = {
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
+        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+    }
+
     model = P2R_ZIP_Model(
+        bins=bin_cfg["bins"],
+        bin_centers=bin_cfg["bin_centers"],
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
-        upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"]
+        upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"],
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
     model.load_state_dict(torch.load(args.ckpt, map_location="cpu"), strict=False)
     model.eval()
 
     with torch.no_grad():
         out = model(t)
-        pi = out["pi"]
-        dens = out["density"]
+        pi = out["logit_pi_maps"].softmax(dim=1)[:, 1:]
+        dens = out["p2r_density"]
         count = dens.sum().item()
 
     os.makedirs(args.out_dir, exist_ok=True)

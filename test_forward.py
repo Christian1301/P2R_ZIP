@@ -17,13 +17,21 @@ if __name__ == "__main__":
     ZIP_BLOCK_SIZE = 16
 
     # 2. Creare il modello con la nuova firma
+    zip_head_kwargs = {
+        "lambda_scale": 0.5,
+        "lambda_max": 8.0,
+        "use_softplus": True,
+        "lambda_noise_std": 0.0,
+    }
+
     model = P2R_ZIP_Model(
         bins=dummy_bins,
         bin_centers=dummy_bin_centers,
         backbone_name="vgg16_bn",
         pi_thresh=0.5,
         gate="multiply",
-        upsample_to_input=True
+        upsample_to_input=True,
+        zip_head_kwargs=zip_head_kwargs,
     ).to(device)
     
     # Per ottenere tutti gli output, mettiamo il modello in modalità training

@@ -17,6 +17,61 @@ from train_utils import (
     resume_if_exists, save_checkpoint, setup_experiment, collate_fn
 )
 
+@torch.no_grad()
+def calibrate_density_scale(model, loader, device, default_down, max_batches=8):
+    """
+    Stima il bias iniziale del conteggio P2R e aggiusta log_scale di conseguenza
+    prima dell'addestramento vero e proprio. In questo modo il training parte già
+    con conteggi vicini al ground truth anche se Stage 1 non è perfetto.
+    """
+    if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
+        return
+
+    model.eval()
+    total_pred, total_gt = 0.0, 0.0
+
+    for idx, (images, _, points) in enumerate(loader):
+        if idx >= max_batches:
+            break
+
+        images = images.to(device)
+        points_list = [p.to(device) for p in points]
+
+        outputs = model(images)
+        pred_density = outputs.get("p2r_density", outputs.get("density"))
+        if pred_density is None:
+            continue
+
+        B, _, H_out, W_out = pred_density.shape
+        _, _, H_in, W_in = images.shape
+
+        if H_out == H_in and W_out == W_in:
+            down_h = down_w = float(default_down)
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3))
+        else:
+            down_h = H_in / max(H_out, 1)
+            down_w = W_in / max(W_out, 1)
+            cell_area = down_h * down_w
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
+
+        gt_count = torch.tensor([len(p) for p in points_list], dtype=torch.float32, device=device)
+
+        total_pred += pred_count.sum().item()
+        total_gt += gt_count.sum().item()
+
+    if total_gt <= 0 or total_pred <= 0:
+        return
+
+    bias = total_pred / total_gt
+    if bias <= 0:
+        return
+
+    adjust = float(np.log(bias))
+    adjust_tensor = torch.tensor(adjust, device=device, dtype=model.p2r_head.log_scale.dtype)
+    model.p2r_head.log_scale.data -= adjust_tensor
+    new_scale = torch.exp(model.p2r_head.log_scale.detach()).item()
+    print(f"🔧 Calibrazione densità P2R: bias iniziale={bias:.3f} → aggiorno log_scale di {-adjust:.3f} (scala={new_scale:.4f})")
+
 # -----------------------------------------------------------
 @torch.no_grad()
 def evaluate_p2r(model, loader, loss_fn, device, cfg):
@@ -259,6 +314,11 @@ def main():
             start_ep, best_mae = 1, float("inf")
     else:
         start_ep, best_mae = 1, float("inf")
+
+    # --- Calibrazione iniziale del conteggio ---
+    calibrate_batches = int(p2r_loss_cfg.get("CALIBRATE_BATCHES", 6))
+    if start_ep == 1:
+        calibrate_density_scale(model, dl_val, device, default_down, max_batches=calibrate_batches)
 
     # --- Training loop ---
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")

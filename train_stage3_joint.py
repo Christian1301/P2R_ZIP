@@ -15,6 +15,7 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from losses.p2r_region_loss import P2RLoss
 from datasets import get_dataset
+from datasets.transforms import build_transforms
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
     save_checkpoint
@@ -272,18 +273,22 @@ def main():
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
     # === DATASET ===
+    data_cfg = config["DATA"]
+    # Stage 3 usa le immagini a piena risoluzione, ma serve mantenere la normalizzazione
+    shared_transforms = build_transforms(data_cfg, is_train=False)
+
     DatasetClass = get_dataset(config["DATASET"])
     train_dataset = DatasetClass(
-        root=config["DATA"]["ROOT"],
-        split=config["DATA"]["TRAIN_SPLIT"],
-        block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
-        transforms=None
+        root=data_cfg["ROOT"],
+        split=data_cfg["TRAIN_SPLIT"],
+        block_size=data_cfg["ZIP_BLOCK_SIZE"],
+        transforms=shared_transforms,
     )
     val_dataset = DatasetClass(
-        root=config["DATA"]["ROOT"],
-        split=config["DATA"]["VAL_SPLIT"],
-        block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
-        transforms=None
+        root=data_cfg["ROOT"],
+        split=data_cfg["VAL_SPLIT"],
+        block_size=data_cfg["ZIP_BLOCK_SIZE"],
+        transforms=shared_transforms,
     )
 
     train_loader = DataLoader(

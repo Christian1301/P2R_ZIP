@@ -62,8 +62,8 @@ OPTIM_P2R:
   BATCH_SIZE: 16 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 5.0e-4
-  # LR_BACKBONE: 1.0e-5 # LR per backbone (viene ignorato perché congelato)
+  LR: 3.0e-4
+  LR_BACKBONE: 5.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine" # P2R spesso usa cosine
   VAL_INTERVAL: 10
@@ -73,29 +73,30 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.12
-  POS_WEIGHT: 2.2
+  SCALE_WEIGHT: 0.09
+  POS_WEIGHT: 1.8
   LOG_SCALE_INIT: -2.5
   LOG_SCALE_LR_FACTOR: 0.1
   LOG_SCALE_CLAMP: [-5.0, 8.0]
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 5.0
+  LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
+  CALIBRATE_BATCHES: 10
 
 # === STAGE 3: JOINT TRAINING (Mantiene Cosine, LR differenziati) ===
 OPTIM_JOINT:
   BATCH_SIZE: 8 # Potresti dover ridurre se VGG19 usa più memoria
   NUM_WORKERS: 4
   EPOCHS: 800
-  LR_HEADS: 5.0e-5
+  LR_HEADS: 7.5e-5
   LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 10
-  RESUME_LAST: true
+  RESUME_LAST: false
   SAVE_BEST: true
 
 JOINT_LOSS:
-  ALPHA: 1.5
-  COUNT_L1_W: 0.01
+  ALPHA: 1.2
+  COUNT_L1_W: 0.02
 
 # === BIN CONFIGURATION ===
 # Assicurati che questi siano identici a configs/bin_config.json

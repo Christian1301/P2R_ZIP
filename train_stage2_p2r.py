@@ -284,14 +284,22 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print(f"✅ Checkpoint Stage1 caricato da {zip_ckpt}")
 
-    # --- Congela Backbone + ZIPHead ---
-    print("🧊 Congelamento pesi di Backbone e ZIPHead...")
-    for p in model.backbone.parameters():
-        p.requires_grad = False
+    # --- Congela ZIPHead e sblocca l'ultimo blocco del backbone ---
+    print("🧊 Congelamento ZIPHead e sblocco parziale del backbone...")
     for p in model.zip_head.parameters():
         p.requires_grad = False
+
+    # Fissa tutto il backbone e poi riattiva l'ultimo blocco conv (layer >=34)
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    if hasattr(model.backbone, "body"):
+        for idx, module in enumerate(model.backbone.body):
+            if idx >= 34:
+                for param in module.parameters():
+                    param.requires_grad = True
+
     for p in model.p2r_head.parameters():
-        p.requires_grad = True  # Solo P2RHead addestrabile
+        p.requires_grad = True  # P2RHead sempre addestrabile
 
     # Reinizializza il log_scale per contenere la scala iniziale se richiesto
     log_scale_init = p2r_loss_cfg.get("LOG_SCALE_INIT")
@@ -316,6 +324,13 @@ def main():
         lr_factor = float(p2r_loss_cfg.get("LOG_SCALE_LR_FACTOR", 0.1))
         params_to_train.append({'params': log_scale_params, 'lr': optim_cfg['LR'] * lr_factor})
         print(f"ℹ️ LR log_scale ridotto di un fattore {lr_factor:.2f}")
+
+    backbone_lr = optim_cfg.get("LR_BACKBONE")
+    if backbone_lr is not None:
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+        if backbone_params:
+            params_to_train.append({'params': backbone_params, 'lr': float(backbone_lr)})
+            print(f"ℹ️ Backbone fine-tuning attivo con LR {float(backbone_lr):.2e}")
 
     opt = get_optimizer(params_to_train, optim_cfg)
     scheduler = get_scheduler(opt, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
@@ -410,7 +425,8 @@ def main():
 
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.p2r_head.parameters(), 1.0)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
 
             total_loss += loss.item()
@@ -442,6 +458,8 @@ def main():
         if writer:
             writer.add_scalar("train/loss_p2r", avg_train, ep)
             writer.add_scalar("lr/p2r_head", opt.param_groups[0]["lr"], ep)
+            if len(opt.param_groups) > 2:
+                writer.add_scalar("lr/backbone", opt.param_groups[-1]["lr"], ep)
 
         # --- Validazione periodica ---
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:

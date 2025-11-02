@@ -18,20 +18,29 @@ from train_utils import (
 )
 
 @torch.no_grad()
-def calibrate_density_scale(model, loader, device, default_down, max_batches=8):
+def calibrate_density_scale(
+    model,
+    loader,
+    device,
+    default_down,
+    max_batches=8,
+    clamp_range=None,
+    max_adjust=None,
+    bias_eps=1e-3,
+):
     """
     Stima il bias iniziale del conteggio P2R e aggiusta log_scale di conseguenza
     prima dell'addestramento vero e proprio. In questo modo il training parte già
     con conteggi vicini al ground truth anche se Stage 1 non è perfetto.
     """
     if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
-        return
+        return None
 
     model.eval()
     total_pred, total_gt = 0.0, 0.0
 
-    for idx, (images, _, points) in enumerate(loader):
-        if idx >= max_batches:
+    for batch_idx, (images, _, points) in enumerate(loader, start=1):
+        if max_batches is not None and batch_idx > max_batches:
             break
 
         images = images.to(device)
@@ -60,24 +69,55 @@ def calibrate_density_scale(model, loader, device, default_down, max_batches=8):
         total_gt += gt_count.sum().item()
 
     if total_gt <= 0 or total_pred <= 0:
-        return
+        print("ℹ️ Calibrazione densità P2R saltata: conteggi non positivi.")
+        return None
 
     bias = total_pred / total_gt
-    if bias <= 0:
-        return
+    if not np.isfinite(bias) or bias <= 0:
+        print("ℹ️ Calibrazione densità P2R saltata: bias non finito.")
+        return None
+    if abs(bias - 1.0) < bias_eps:
+        print(f"ℹ️ Calibrazione densità P2R: bias già unitario ({bias:.3f}).")
+        return bias
 
-    adjust = float(np.log(bias))
+    prev_log_scale = float(model.p2r_head.log_scale.detach().item())
+    raw_adjust = float(np.log(bias))
+    adjust = raw_adjust
+    clipped_adjust = False
+    if max_adjust is not None:
+        max_adjust_val = float(max_adjust)
+        if max_adjust_val <= 0:
+            raise ValueError("LOG_SCALE_CALIBRATION_MAX_DELTA deve essere positivo.")
+        adjust = float(np.clip(adjust, -max_adjust_val, max_adjust_val))
+        clipped_adjust = abs(adjust - raw_adjust) > 1e-6
     adjust_tensor = torch.tensor(adjust, device=device, dtype=model.p2r_head.log_scale.dtype)
     model.p2r_head.log_scale.data -= adjust_tensor
+    if clamp_range is not None:
+        if len(clamp_range) != 2:
+            raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
+        min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
+        model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+    new_log_scale = float(model.p2r_head.log_scale.detach().item())
     new_scale = torch.exp(model.p2r_head.log_scale.detach()).item()
-    print(f"🔧 Calibrazione densità P2R: bias iniziale={bias:.3f} → aggiorno log_scale di {-adjust:.3f} (scala={new_scale:.4f})")
+    print(
+        "🔧 Calibrazione densità P2R: bias={:.3f} → log_scale {:.4f}→{:.4f} "
+        "(scala={:.4f})".format(bias, prev_log_scale, new_log_scale, new_scale)
+    )
+    if clipped_adjust:
+        print("ℹ️ Calibrazione limitata da LOG_SCALE_CALIBRATION_MAX_DELTA: valutare un delta più alto se necessario.")
+    if clamp_range is not None:
+        min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
+        if abs(new_log_scale - min_val) < 1e-6 or abs(new_log_scale - max_val) < 1e-6:
+            print("⚠️ Calibrazione limitata da LOG_SCALE_CLAMP: valuta di allargare il range se necessario.")
+
+    return bias
 
 # -----------------------------------------------------------
 @torch.no_grad()
 def evaluate_p2r(model, loader, loss_fn, device, cfg):
     """
     Valutazione P2R coerente con la P2RHead (densità ReLU/(upscale²)):
-    - Applica correzione * (down^2)
+    - Applica correzione / (down^2)
     - Calcola MAE, RMSE e loss media
     - Mostra range e media delle mappe
     """
@@ -284,6 +324,8 @@ def main():
     loss_kwargs = {}
     if "SCALE_WEIGHT" in p2r_loss_cfg:
         loss_kwargs["scale_weight"] = float(p2r_loss_cfg["SCALE_WEIGHT"])
+    if "POS_WEIGHT" in p2r_loss_cfg:
+        loss_kwargs["pos_weight"] = float(p2r_loss_cfg["POS_WEIGHT"])
     if "CHUNK_SIZE" in p2r_loss_cfg:
         loss_kwargs["chunk_size"] = int(p2r_loss_cfg["CHUNK_SIZE"])
     if "MIN_RADIUS" in p2r_loss_cfg:
@@ -316,9 +358,27 @@ def main():
         start_ep, best_mae = 1, float("inf")
 
     # --- Calibrazione iniziale del conteggio ---
-    calibrate_batches = int(p2r_loss_cfg.get("CALIBRATE_BATCHES", 6))
+    calibrate_batches_cfg = p2r_loss_cfg.get("CALIBRATE_BATCHES", 6)
+    calibrate_max_batches = None
+    if calibrate_batches_cfg is not None:
+        try:
+            calibrate_batches_val = int(calibrate_batches_cfg)
+            if calibrate_batches_val > 0:
+                calibrate_max_batches = calibrate_batches_val
+        except (TypeError, ValueError):
+            calibrate_max_batches = None
+    clamp_cfg = p2r_loss_cfg.get("LOG_SCALE_CLAMP")
+    max_adjust = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
     if start_ep == 1:
-        calibrate_density_scale(model, dl_val, device, default_down, max_batches=calibrate_batches)
+        calibrate_density_scale(
+            model,
+            dl_val,
+            device,
+            default_down,
+            max_batches=calibrate_max_batches,
+            clamp_range=clamp_cfg,
+            max_adjust=max_adjust,
+        )
 
     # --- Training loop ---
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
@@ -357,7 +417,6 @@ def main():
 
             ds_val = None
             with torch.no_grad():
-                clamp_cfg = p2r_loss_cfg.get("LOG_SCALE_CLAMP")
                 if clamp_cfg and hasattr(model.p2r_head, "log_scale"):
                     if len(clamp_cfg) != 2:
                         raise ValueError("LOG_SCALE_CLAMP deve essere una lista o tupla di due valori [min, max].")
@@ -387,26 +446,74 @@ def main():
         # --- Validazione periodica ---
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:
             val_loss, mae, mse, tot_pred, tot_gt = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
+            orig_bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
             if writer:
                 writer.add_scalar("val/loss_p2r", val_loss, ep)
                 writer.add_scalar("val/MAE", mae, ep)
                 writer.add_scalar("val/MSE", mse, ep)
                 if tot_gt > 0:
-                    writer.add_scalar("val/pred_gt_ratio", tot_pred / tot_gt, ep)
+                    writer.add_scalar("val/pred_gt_ratio", orig_bias, ep)
 
             # --- Best model ---
             is_best = mae < best_mae
+            best_candidate = best_mae
+            calibrated_metrics = None
+
             if is_best:
-                best_mae = mae
+                best_candidate = mae
+                if cfg["EXP"].get("SAVE_BEST", False):
+                    best_path = os.path.join(stage1_dir, "stage2_best.pth")
+                    saved_with_calibration = False
+                    if hasattr(model.p2r_head, "log_scale"):
+                        backup_log_scale = model.p2r_head.log_scale.detach().clone()
+                        calibrate_density_scale(
+                            model,
+                            dl_val,
+                            device,
+                            default_down,
+                            max_batches=None,
+                            clamp_range=clamp_cfg,
+                            max_adjust=max_adjust,
+                        )
+                        calibrated_metrics = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
+                        cal_loss, cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = calibrated_metrics
+                        best_candidate = cal_mae
+                        torch.save(model.state_dict(), best_path)
+                        cal_bias = (cal_tot_pred / cal_tot_gt) if cal_tot_gt > 0 else float("nan")
+                        print(
+                            f"💾 Nuovo best Stage 2 salvato in {best_path} "
+                            f"(MAE={cal_mae:.2f}, Pred/GT={cal_bias:.3f})"
+                        )
+                        if writer:
+                            writer.add_scalar("val/loss_p2r_calibrated", cal_loss, ep)
+                            writer.add_scalar("val/MAE_calibrated", cal_mae, ep)
+                            writer.add_scalar("val/MSE_calibrated", cal_rmse, ep)
+                            if cal_tot_gt > 0:
+                                writer.add_scalar("val/pred_gt_ratio_calibrated", cal_bias, ep)
+                        model.p2r_head.log_scale.data.copy_(backup_log_scale)
+                        saved_with_calibration = True
+                    if not saved_with_calibration:
+                        torch.save(model.state_dict(), best_path)
+                        print(f"💾 Nuovo best Stage 2 salvato in {best_path} (MAE={mae:.2f})")
 
-            save_checkpoint(model, opt, ep, mae, best_mae, exp_dir, is_best=False)
+            # Aggiorna il tracker del best MAE con il candidato (calibrato se disponibile)
+            if is_best:
+                best_mae = min(best_mae, best_candidate)
 
-            if is_best and cfg["EXP"]["SAVE_BEST"]:
-                best_path = os.path.join(stage1_dir, "stage2_best.pth")
-                torch.save(model.state_dict(), best_path)
-                print(f"💾 Nuovo best Stage 2 salvato in {best_path} (MAE={mae:.2f})")
+            save_checkpoint(model, opt, ep, mae, best_mae, exp_dir, is_best=is_best)
 
-            print(f"Epoch {ep}: Train Loss {avg_train:.4f} | Val Loss {val_loss:.4f} | MAE {mae:.2f} | MSE {mse:.2f} | Best MAE {best_mae:.2f}")
+            print(
+                f"Epoch {ep}: Train Loss {avg_train:.4f} | Val Loss {val_loss:.4f} | MAE {mae:.2f} | "
+                f"MSE {mse:.2f} | Pred/GT {orig_bias:.3f} | Best MAE {best_mae:.2f}"
+            )
+            if calibrated_metrics is not None:
+                cal_loss, cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = calibrated_metrics
+                cal_bias = (cal_tot_pred / cal_tot_gt) if cal_tot_gt > 0 else float("nan")
+                print(
+                    "         ↳ dopo calibrazione best: Val Loss {:.4f} | MAE {:.2f} | MSE {:.2f} | Pred/GT {:.3f}".format(
+                        cal_loss, cal_mae, cal_rmse, cal_bias
+                    )
+                )
 
             # --- Debug ogni 50 epoche ---
             if ep % 50 == 0:

@@ -20,6 +20,7 @@ from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
     save_checkpoint
 )
+from train_stage2_p2r import calibrate_density_scale
 import torch.nn.functional as F
 
 # --- utility per arrotondare a multipli di 8 ---
@@ -102,7 +103,18 @@ def collate_val(batch):
     return torch.stack(imgs_out), torch.stack(dens_out), dummy_pts
 
 
-def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, optimizer, scheduler, device, default_down):
+def train_one_epoch(
+    model,
+    criterion_zip,
+    criterion_p2r,
+    alpha,
+    dataloader,
+    optimizer,
+    scheduler,
+    device,
+    default_down,
+    clamp_cfg=None,
+):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 3 (Joint)")
@@ -140,6 +152,12 @@ def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, opti
         if scheduler:
             scheduler.step()
 
+        if clamp_cfg and hasattr(model.p2r_head, "log_scale"):
+            if len(clamp_cfg) != 2:
+                raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
+            min_val, max_val = float(clamp_cfg[0]), float(clamp_cfg[1])
+            model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+
         total_loss += combined_loss.item()
         progress_bar.set_postfix({
             "total": f"{combined_loss.item():.4f}",
@@ -153,9 +171,10 @@ def train_one_epoch(model, criterion_zip, criterion_p2r, alpha, dataloader, opti
 
 # -----------------------------------------------------------
 @torch.no_grad()
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, default_down):
     model.eval()
     mae, mse = 0.0, 0.0
+    total_pred, total_gt = 0.0, 0.0
 
     for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 3"):
         images, gt_density = images.to(device), gt_density.to(device)
@@ -167,6 +186,8 @@ def validate(model, dataloader, device):
         _, _, h_in, w_in = images.shape
         down_h = h_in / max(h_out, 1)
         down_w = w_in / max(w_out, 1)
+        if abs(h_in - down_h * h_out) > 1.0 or abs(w_in - down_w * w_out) > 1.0:
+            down_h = down_w = float(default_down)
         cell_area = down_h * down_w
         cell_area_tensor = pred_density.new_tensor(cell_area)
 
@@ -175,11 +196,13 @@ def validate(model, dataloader, device):
 
         mae += torch.abs(pred_count - gt_count).sum().item()
         mse += ((pred_count - gt_count) ** 2).sum().item()
+        total_pred += pred_count.sum().item()
+        total_gt += gt_count.sum().item()
 
     n = len(dataloader.dataset)
     mae /= n
     rmse = np.sqrt(mse / n)
-    return mae, rmse
+    return mae, rmse, total_pred, total_gt
 
 
 # -----------------------------------------------------------
@@ -193,6 +216,9 @@ def main():
     print(f"✅ Avvio Stage 3 (Joint ZIP + P2R) su {device}")
 
     default_down = config["DATA"].get("P2R_DOWNSAMPLE", 8)
+    loss_cfg = config.get("P2R_LOSS", {})
+    clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
+    max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
 
     # === MODEL SETUP ===
     dataset_name = config["DATASET"]
@@ -246,10 +272,11 @@ def main():
         zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"]
     ).to(device)
 
-    loss_cfg = config.get("P2R_LOSS", {})
     loss_kwargs = {}
     if "SCALE_WEIGHT" in loss_cfg:
         loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
+    if "POS_WEIGHT" in loss_cfg:
+        loss_kwargs["pos_weight"] = float(loss_cfg["POS_WEIGHT"])
     if "CHUNK_SIZE" in loss_cfg:
         loss_kwargs["chunk_size"] = int(loss_cfg["CHUNK_SIZE"])
     if "MIN_RADIUS" in loss_cfg:
@@ -310,6 +337,15 @@ def main():
         collate_fn=collate_val,   # <--- aggiungi questo
     )
 
+    calibrate_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=optim_cfg["NUM_WORKERS"],
+        pin_memory=True,
+        collate_fn=collate_joint,
+    )
+
     # === TRAINING LOOP ===
     best_mae = float("inf")
     epochs_stage3 = optim_cfg["EPOCHS"]
@@ -319,21 +355,60 @@ def main():
     for epoch in range(epochs_stage3):
         print(f"\n--- Epoch {epoch + 1}/{epochs_stage3} ---")
         train_loss = train_one_epoch(
-            model, criterion_zip, criterion_p2r, alpha,
-            train_loader, optimizer, scheduler, device, default_down
+            model,
+            criterion_zip,
+            criterion_p2r,
+            alpha,
+            train_loader,
+            optimizer,
+            scheduler,
+            device,
+            default_down,
+            clamp_cfg=clamp_cfg,
         )
 
         if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:
-            val_mae, val_rmse = validate(model, val_loader, device)
-            print(f"Epoch {epoch + 1}: Train Loss {train_loss:.4f} | Val MAE {val_mae:.2f} | RMSE {val_rmse:.2f}")
+            val_mae, val_rmse, tot_pred, tot_gt = validate(model, val_loader, device, default_down)
+            bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
+            print(
+                f"Epoch {epoch + 1}: Train Loss {train_loss:.4f} | Val MAE {val_mae:.2f} | "
+                f"RMSE {val_rmse:.2f} | Pred/GT {bias:.3f}"
+            )
 
             # === SALVATAGGIO BEST MODEL ===
             if val_mae < best_mae:
-                best_mae = val_mae
-                if config["EXP"]["SAVE_BEST"]:
+                best_candidate = val_mae
+                if config["EXP"].get("SAVE_BEST", False) and hasattr(model, "p2r_head"):
                     best_path = os.path.join(output_dir, "stage3_best.pth")
-                    torch.save(model.state_dict(), best_path)
-                    print(f"💾 Nuovo best Stage 3 salvato ({best_path}) — MAE={best_mae:.2f}")
+                    backup_log_scale = None
+                    if hasattr(model.p2r_head, "log_scale"):
+                        backup_log_scale = model.p2r_head.log_scale.detach().clone()
+                        calibrate_density_scale(
+                            model,
+                            calibrate_loader,
+                            device,
+                            default_down,
+                            max_batches=None,
+                            clamp_range=clamp_cfg,
+                            max_adjust=max_adjust,
+                        )
+                        cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = validate(
+                            model, val_loader, device, default_down
+                        )
+                        cal_bias = (cal_tot_pred / cal_tot_gt) if cal_tot_gt > 0 else float("nan")
+                        best_candidate = cal_mae
+                        torch.save(model.state_dict(), best_path)
+                        print(
+                            f"💾 Nuovo best Stage 3 salvato ({best_path}) — "
+                            f"MAE={cal_mae:.2f}, RMSE={cal_rmse:.2f}, Pred/GT={cal_bias:.3f}"
+                        )
+                        if backup_log_scale is not None:
+                            model.p2r_head.log_scale.data.copy_(backup_log_scale)
+                    else:
+                        torch.save(model.state_dict(), best_path)
+                        print(f"💾 Nuovo best Stage 3 salvato ({best_path}) — MAE={best_candidate:.2f}")
+
+                best_mae = min(best_mae, best_candidate)
 
     print("✅ Stage 3 completato con successo!")
 

@@ -100,6 +100,7 @@ class P2RLoss(nn.Module):
         reduction: str = "mean",
         chunk_size: int = 4096,
         scale_weight: float = 0.02,
+        pos_weight: float = 2.0,
         min_radius: float = 8.0,
         max_radius: float = 96.0,
         cost_point: float = 8.0,
@@ -114,6 +115,7 @@ class P2RLoss(nn.Module):
         self.reduction = reduction
         self.chunk_size = int(chunk_size)
         self.scale_weight = float(scale_weight)
+        self.pos_weight = float(pos_weight)
 
     @torch.no_grad()
     def _min_distances_streaming(
@@ -281,8 +283,10 @@ class P2RLoss(nn.Module):
 
             # Target binario T: pixel positivo se vicino a un punto (< min_radius nel dominio input)
             T = (minC < self.min_radius).float().view_as(A)  # [1, HW, 1]
-            # Pesi (semplici): 1 su positivi, 1 su negativi (o 2 su pos se vuoi)
-            Wt = T + 1.0  # enfatizza i positivi (pos=2, neg=1)
+            # Pesi: negativi=1, positivi=pos_weight (default 2.0 per retro-compatibilità)
+            Wt = torch.ones_like(T)
+            if self.pos_weight != 1.0:
+                Wt = torch.where(T > 0, Wt * self.pos_weight, Wt)
             if crop_den_masks is not None:
                 Wt = Wt * crop_den_masks[i].view_as(Wt)
 

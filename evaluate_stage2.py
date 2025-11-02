@@ -15,6 +15,7 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLoss
 from train_utils import collate_fn, init_seeds
+from train_stage2_p2r import calibrate_density_scale
 
 
 @torch.no_grad()
@@ -180,6 +181,8 @@ def main():
     loss_kwargs = {}
     if "SCALE_WEIGHT" in loss_cfg:
         loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
+    if "POS_WEIGHT" in loss_cfg:
+        loss_kwargs["pos_weight"] = float(loss_cfg["POS_WEIGHT"])
     if "CHUNK_SIZE" in loss_cfg:
         loss_kwargs["chunk_size"] = int(loss_cfg["CHUNK_SIZE"])
     if "MIN_RADIUS" in loss_cfg:
@@ -187,6 +190,20 @@ def main():
     if "MAX_RADIUS" in loss_cfg:
         loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
     loss_fn = P2RLoss(**loss_kwargs).to(device)
+
+    # --- Calibrazione opzionale prima della valutazione ---
+    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
+    max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
+    calibrate_density_scale(
+        model,
+        val_loader,
+        device,
+        default_down,
+        max_batches=None,
+        clamp_range=clamp_cfg,
+        max_adjust=max_adjust,
+    )
 
     # --- Valutazione ---
     evaluate_p2r(model, val_loader, loss_fn, device, cfg)

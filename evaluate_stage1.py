@@ -10,6 +10,7 @@ import os
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
+from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
 
 
@@ -142,10 +143,13 @@ def main(config, checkpoint_path):
     ).to(device)
 
     DatasetClass = get_dataset(config['DATASET'])
+    data_cfg = config['DATA']
+    val_tf = build_transforms(data_cfg, is_train=False)
     val_dataset = DatasetClass(
-        root=config['DATA']['ROOT'],
-        split=config['DATA']['VAL_SPLIT'],
-        block_size=config['DATA']['ZIP_BLOCK_SIZE']
+        root=data_cfg['ROOT'],
+        split=data_cfg['VAL_SPLIT'],
+        block_size=data_cfg['ZIP_BLOCK_SIZE'],
+        transforms=val_tf,
     )
 
     val_loader = DataLoader(

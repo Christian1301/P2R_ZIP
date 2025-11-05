@@ -269,7 +269,11 @@ def main():
     criterion_zip = ZIPCompositeLoss(
         bins=bins,
         weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
-        zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"]
+        zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
+        count_weight=config["JOINT_LOSS"].get(
+            "COUNT_L1_W",
+            config["ZIP_LOSS"].get("WEIGHT_COUNT", 1.0),
+        ),
     ).to(device)
 
     loss_kwargs = {}

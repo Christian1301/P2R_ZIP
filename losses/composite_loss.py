@@ -37,18 +37,25 @@ def _bin_count(gt_den_maps: torch.Tensor, bins: List[Tuple[float, float]]) -> to
 
 
 class ZIPCompositeLoss(nn.Module):
-    def __init__(self, bins: List[Tuple[float, float]], weight_ce: float = 1.0, zip_block_size: int = 16):
+    def __init__(
+        self,
+        bins: List[Tuple[float, float]],
+        weight_ce: float = 1.0,
+        zip_block_size: int = 16,
+        count_weight: float = 1.0,
+    ):
         super().__init__()
         if not bins or bins[0][0] != 0 or bins[0][1] != 0:
-             raise ValueError("Bins must start with [[0, 0]] for ZIP loss.")
+            raise ValueError("Bins must start with [[0, 0]] for ZIP loss.")
         self.bins = bins
         self.num_bins = len(bins)
         # Number of classes for CE loss is the number of bins excluding the [0,0] bin
         self.num_ce_classes = self.num_bins - 1
         if self.num_ce_classes <= 0:
-             raise ValueError("At least two bins (including [[0, 0]]) are required for CE loss.")
+            raise ValueError("At least two bins (including [[0, 0]]) are required for CE loss.")
         self.weight_ce = weight_ce
         self.zip_block_size = zip_block_size
+        self.count_weight = float(count_weight)
         # reduction='none' allows manual masking and averaging
         self.ce_loss_fn = nn.CrossEntropyLoss(reduction="none")
 
@@ -125,7 +132,7 @@ class ZIPCompositeLoss(nn.Module):
         count_loss = F.l1_loss(pred_total_count, gt_total_count)
 
         # --- Loss Totale ---
-        total_loss = nll_loss + self.weight_ce * ce_loss + count_loss
+        total_loss = nll_loss + self.weight_ce * ce_loss + self.count_weight * count_loss
 
         loss_dict = {
             "zip_total_loss": total_loss.detach(),

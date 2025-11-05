@@ -156,6 +156,7 @@ def main():
         bins=bins,
         weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
         zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
+        count_weight=config["ZIP_LOSS"].get("WEIGHT_COUNT", 1.0),
     ).to(device)
 
     optim_cfg = config["OPTIM_ZIP"]

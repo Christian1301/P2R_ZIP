@@ -149,11 +149,16 @@ def build_transforms(cfg_data, is_train=True):
 
     if is_train:
         crop_size = cfg_data.get('CROP_SIZE', 256)
+        crop_scale_cfg = cfg_data.get('CROP_SCALE', (0.3, 1.0))
+        try:
+            crop_scale = (float(crop_scale_cfg[0]), float(crop_scale_cfg[1]))
+        except (TypeError, ValueError, IndexError):
+            crop_scale = (0.3, 1.0)
 
         # Ordine corretto delle trasformazioni
         return Compose([
             # 1. Geometriche (Input: PIL img, numpy pts, numpy den)
-            RandomResizedCrop(size=crop_size, scale=(0.3, 1.0)),
+            RandomResizedCrop(size=crop_size, scale=crop_scale),
             RandomHorizontalFlip(p=0.5),
 
             # 2. Colore/Qualità (Input: PIL img - usiamo il wrapper)

@@ -74,7 +74,7 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.02
+  SCALE_WEIGHT: 0.01
   POS_WEIGHT: 3.2
   CHUNK_SIZE: 2048
   MIN_RADIUS: 6.0
@@ -100,7 +100,7 @@ OPTIM_JOINT:
 
 JOINT_LOSS:
   ALPHA: 1.2
-  COUNT_L1_W: 0.02
+  COUNT_L1_W: 0.01
 
 # === BIN CONFIGURATION ===
 # Assicurati che questi siano identici a configs/bin_config.json

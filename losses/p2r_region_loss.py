@@ -99,7 +99,7 @@ class P2RLoss(nn.Module):
         self,
         reduction: str = "mean",
         chunk_size: int = 4096,
-        scale_weight: float = 0.02,
+    scale_weight: float = 0.01,
         pos_weight: float = 2.0,
         min_radius: float = 8.0,
         max_radius: float = 96.0,

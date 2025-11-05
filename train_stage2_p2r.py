@@ -14,7 +14,8 @@ from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLoss
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
-    resume_if_exists, save_checkpoint, setup_experiment, collate_fn
+    resume_if_exists, save_checkpoint, setup_experiment, collate_fn,
+    canonicalize_p2r_grid,
 )
 
 @torch.no_grad()
@@ -51,15 +52,16 @@ def calibrate_density_scale(
         if pred_density is None:
             continue
 
-        B, _, H_out, W_out = pred_density.shape
         _, _, H_in, W_in = images.shape
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (H_in, W_in), default_down, warn_tag="stage2_calib"
+        )
+        _, _, H_eff, W_eff = pred_density.shape
+        down_h, down_w = down_tuple
 
-        if H_out == H_in and W_out == W_in:
-            down_h = down_w = float(default_down)
+        if H_eff == H_in and W_eff == W_in:
             pred_count = torch.sum(pred_density, dim=(1, 2, 3))
         else:
-            down_h = H_in / max(H_out, 1)
-            down_w = W_in / max(W_out, 1)
             cell_area = down_h * down_w
             pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
 
@@ -138,24 +140,12 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
         if pred_density is None:
             raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
 
-        B, _, H_out, W_out = pred_density.shape
         _, _, H_in, W_in = images.shape
-
-        if H_out == H_in and W_out == W_in:
-            down_h = down_w = float(default_down)
-        else:
-            down_h = H_in / max(H_out, 1)
-            down_w = W_in / max(W_out, 1)
-
-        # Avvisa solo alla prima anomalia, senza interrompere il training
-        resid_h = abs(H_in - down_h * H_out)
-        resid_w = abs(W_in - down_w * W_out)
-        if (resid_h > 1.0 or resid_w > 1.0) and not hasattr(evaluate_p2r, "_shape_warned"):
-            print(f"⚠️ Downsample non intero rilevato: input {H_in}x{W_in}, output {H_out}x{W_out}, "
-                  f"down_h={down_h:.4f}, down_w={down_w:.4f}")
-            evaluate_p2r._shape_warned = True
-
-        down_tuple = (down_h, down_w)
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (H_in, W_in), default_down, warn_tag="stage2_eval"
+        )
+        down_h, down_w = down_tuple
+        H_out, W_out = pred_density.shape[-2:]
 
         # --- Loss (uguale al training) ---
         loss = loss_fn(pred_density, points_list, down=down_tuple)
@@ -413,12 +403,9 @@ def main():
 
             B, _, H_out, W_out = pred_density.shape
             _, _, H_in, W_in = images.shape
-            if H_out == H_in and W_out == W_in:
-                down_h = down_w = float(default_down)
-            else:
-                down_h = H_in / max(H_out, 1)
-                down_w = W_in / max(W_out, 1)
-            down_tuple = (down_h, down_w)
+            pred_density, down_tuple, _ = canonicalize_p2r_grid(
+                pred_density, (H_in, W_in), default_down, warn_tag="stage2_train"
+            )
 
             # ✅ ORA loss coerente con ReLU/(upscale²) — niente più logit
             loss = p2r_loss_fn(pred_density, points_list, down=down_tuple)

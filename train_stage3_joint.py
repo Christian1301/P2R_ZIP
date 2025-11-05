@@ -18,7 +18,7 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
-    save_checkpoint
+    save_checkpoint, canonicalize_p2r_grid
 )
 from train_stage2_p2r import calibrate_density_scale
 import torch.nn.functional as F
@@ -131,14 +131,10 @@ def train_one_epoch(
 
         # --- P2R Loss ---
         pred_density = outputs["p2r_density"]
-        _, _, h_out, w_out = pred_density.shape
         _, _, h_in, w_in = images.shape
-        down_h = h_in / max(h_out, 1)
-        down_w = w_in / max(w_out, 1)
-        if abs(h_in - down_h * h_out) <= 1 and abs(w_in - down_w * w_out) <= 1:
-            down_tuple = (down_h, down_w)
-        else:
-            down_tuple = (float(default_down), float(default_down))
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (h_in, w_in), default_down, warn_tag="stage3_train"
+        )
 
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
 
@@ -182,12 +178,11 @@ def validate(model, dataloader, device, default_down):
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
-        _, _, h_out, w_out = pred_density.shape
         _, _, h_in, w_in = images.shape
-        down_h = h_in / max(h_out, 1)
-        down_w = w_in / max(w_out, 1)
-        if abs(h_in - down_h * h_out) > 1.0 or abs(w_in - down_w * w_out) > 1.0:
-            down_h = down_w = float(default_down)
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (h_in, w_in), default_down, warn_tag="stage3_val"
+        )
+        down_h, down_w = down_tuple
         cell_area = down_h * down_w
         cell_area_tensor = pred_density.new_tensor(cell_area)
 

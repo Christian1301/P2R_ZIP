@@ -13,3 +13,15 @@ echo "✅ Stage 2 completato!"
 echo "🚀 Avvio Stage 3 (JOINT)..."
 python3 train_stage3_joint.py  > logs/stage3.log 2>&1
 echo "✅ Tutti gli stadi completati!"
+
+python3 evaluate_stage1.py > logs/ev_stage1.log 2>&1
+echo "✅ Valutazione 1 completata!"
+
+python3 evaluate_stage2.py > logs/ev_stage2.log 2>&1
+echo "✅ Valutazione 2 completata!"
+
+python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
+echo "✅ Valutazione 3 completata!"
+
+python3 visualize_gating.py > logs/visualize_gating.log 2>&1
+echo "✅ Visualizzazione completata!"

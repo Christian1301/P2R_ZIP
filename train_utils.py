@@ -4,7 +4,7 @@ import random
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR
+from torch.optim.lr_scheduler import LambdaLR, MultiStepLR
 import torch.nn.functional as F
 import warnings
 
@@ -48,6 +48,8 @@ def get_optimizer(param_groups, optim_config):
 def get_scheduler(optimizer, optim_config, max_epochs):
     scheduler_type = optim_config.get('SCHEDULER', 'cosine').lower()
     warmup_epochs = optim_config.get('WARMUP_EPOCHS', 0)
+    min_factor = float(optim_config.get('LR_MIN_FACTOR', 0.0))
+    min_factor = max(0.0, min(1.0, min_factor))
 
     print(f"📉 Scheduler attivo: {scheduler_type.upper()} (max_epochs={max_epochs})")
 
@@ -59,16 +61,27 @@ def get_scheduler(optimizer, optim_config, max_epochs):
         return MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
 
     elif scheduler_type == 'cosine':
+        def cosine_factor(step_idx):
+            progress = float(step_idx + 1) / float(max(1, max_epochs))
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine
+
         if warmup_epochs > 0:
             def warmup_cosine_lambda(current_epoch):
                 if current_epoch < warmup_epochs:
-                    return float(current_epoch + 1) / float(max(1, warmup_epochs))
-                else:
-                    progress = float(current_epoch - warmup_epochs) / float(max(1, max_epochs - warmup_epochs))
-                    return 0.5 * (1.0 + np.cos(np.pi * progress))
+                    warmup_ratio = float(current_epoch + 1) / float(max(1, warmup_epochs))
+                    return min_factor + (1.0 - min_factor) * warmup_ratio
+                effective_epoch = current_epoch - warmup_epochs
+                effective_max = max(1, max_epochs - warmup_epochs)
+                progress = float(effective_epoch + 1) / float(effective_max)
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+                return min_factor + (1.0 - min_factor) * cosine
+
             return LambdaLR(optimizer, lr_lambda=warmup_cosine_lambda)
-        else:
-            return CosineAnnealingLR(optimizer, T_max=max_epochs - warmup_epochs)
+
+        return LambdaLR(optimizer, lr_lambda=cosine_factor)
 
     return None
 
@@ -101,8 +114,8 @@ def collate_fn(batch):
     raise TypeError(f"Formato batch non riconosciuto in collate_fn: {item.keys()}")
 
 
-def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None):
-    """Forza fattori di downsampling interi e ritaglia le mappe P2R se necessario."""
+def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, warn_tol=0.15):
+    """Restituisce i fattori di downsampling senza ritagliare le mappe."""
     if not isinstance(input_hw, (tuple, list)) or len(input_hw) != 2:
         raise ValueError(f"input_hw deve essere una coppia (H_in, W_in), trovato {input_hw}")
 
@@ -113,41 +126,39 @@ def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None):
     if h_in <= 0 or w_in <= 0:
         raise ValueError(f"Dimensioni input non valide: H_in={h_in}, W_in={w_in}")
 
+    if pred_density.ndim != 4:
+        raise ValueError(f"pred_density deve avere 4 dimensioni [B,1,H_out,W_out], trovato shape={tuple(pred_density.shape)}")
+
     _, _, h_out, w_out = pred_density.shape
+    if h_out <= 0 or w_out <= 0:
+        raise ValueError(f"Dimensioni output non valide: H_out={h_out}, W_out={w_out}")
 
-    # Caso 1: mappa già upsamplata all'input (es: Stage 1) → mantieni scala configurata
+    # Gestione base: output già nellos tesso spazio dell'input → down=1
     if h_out == h_in and w_out == w_in:
-        down_val = float(default_down)
-        return pred_density, (down_val, down_val), False
+        return pred_density, (1.0, 1.0), False
 
-    down_h = h_in / max(h_out, 1)
-    down_w = w_in / max(w_out, 1)
-    down_h_int = max(1, int(round(down_h)))
-    down_w_int = max(1, int(round(down_w)))
+    down_h = float(h_in) / float(h_out)
+    down_w = float(w_in) / float(w_out)
 
-    mismatch_h = abs(h_in - down_h_int * h_out)
-    mismatch_w = abs(w_in - down_w_int * w_out)
+    # Default down potrebbe essere scalare o tuple
+    if isinstance(default_down, (tuple, list)) and len(default_down) == 2:
+        ref_down_h, ref_down_w = float(default_down[0]), float(default_down[1])
+    else:
+        ref_val = float(default_down) if default_down else 1.0
+        ref_down_h = ref_down_w = ref_val
 
-    if warn_tag and (mismatch_h > 1.0 or mismatch_w > 1.0):
-        key = (warn_tag, down_h_int, down_w_int)
-        if key not in canonicalize_p2r_grid._warned_tags:
+    if warn_tag:
+        mismatch_h = abs(down_h - ref_down_h) / max(ref_down_h, 1e-6)
+        mismatch_w = abs(down_w - ref_down_w) / max(ref_down_w, 1e-6)
+        if (mismatch_h > warn_tol or mismatch_w > warn_tol) and (warn_tag not in canonicalize_p2r_grid._warned_tags):
             print(
-                "⚠️ P2R downsampling non allineato '{}': H_in={}, W_in={}, H_out={}, W_out={}, down≈({:.3f},{:.3f}) → ({},{})".format(
-                    warn_tag, h_in, w_in, h_out, w_out, down_h, down_w, down_h_int, down_w_int
+                "⚠️ P2R downsampling atipico '{}': H_in={}, W_in={}, H_out={}, W_out={}, down=({:.3f},{:.3f}) vs ref=({:.3f},{:.3f})".format(
+                    warn_tag, h_in, w_in, h_out, w_out, down_h, down_w, ref_down_h, ref_down_w
                 )
             )
-            canonicalize_p2r_grid._warned_tags.add(key)
+            canonicalize_p2r_grid._warned_tags.add(warn_tag)
 
-    target_h = max(1, int(round(h_in / down_h_int)))
-    target_w = max(1, int(round(w_in / down_w_int)))
-
-    trim_h = min(h_out, target_h)
-    trim_w = min(w_out, target_w)
-    trimmed = (trim_h != h_out) or (trim_w != w_out)
-    if trimmed:
-        pred_density = pred_density[..., :trim_h, :trim_w]
-
-    return pred_density, (float(down_h_int), float(down_w_int)), trimmed
+    return pred_density, (down_h, down_w), False
 
 
 def setup_experiment(exp_dir):

@@ -111,6 +111,7 @@ def train_one_epoch(
     dataloader,
     optimizer,
     scheduler,
+    schedule_step_mode,
     device,
     default_down,
     clamp_cfg=None,
@@ -145,7 +146,7 @@ def train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        if scheduler:
+        if scheduler and schedule_step_mode == "iteration":
             scheduler.step()
 
         if clamp_cfg and hasattr(model.p2r_head, "log_scale"):
@@ -243,18 +244,34 @@ def main():
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
-    # === CARICA CHECKPOINT STAGE 2 ===
+    optim_cfg = config["OPTIM_JOINT"]
+
+    # === CARICA CHECKPOINT ===
     output_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     stage2_checkpoint_path = os.path.join(output_dir, "stage2_best.pth")
+    stage3_checkpoint_path = os.path.join(output_dir, "stage3_best.pth")
+    load_stage3_best = bool(optim_cfg.get("LOAD_STAGE3_BEST", False))
+    resume_source = None
 
-    try:
-        state_dict = torch.load(stage2_checkpoint_path, map_location=device)
+    if load_stage3_best and os.path.isfile(stage3_checkpoint_path):
+        state_dict = torch.load(stage3_checkpoint_path, map_location=device)
         if "model" in state_dict:
             state_dict = state_dict["model"]
         model.load_state_dict(state_dict, strict=False)
-        print(f"✅ Caricati i pesi dallo Stage 2: {stage2_checkpoint_path}")
-    except FileNotFoundError:
-        print(f"⚠️ Checkpoint Stage 2 non trovato in {stage2_checkpoint_path}.")
+        resume_source = stage3_checkpoint_path
+        print(f"✅ Ripreso Stage 3 dal best precedente: {stage3_checkpoint_path}")
+    else:
+        if load_stage3_best:
+            print("ℹ️ Stage3_best mancante: utilizzo comunque lo Stage 2 best.")
+        try:
+            state_dict = torch.load(stage2_checkpoint_path, map_location=device)
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+            model.load_state_dict(state_dict, strict=False)
+            resume_source = stage2_checkpoint_path
+            print(f"✅ Caricati i pesi dallo Stage 2: {stage2_checkpoint_path}")
+        except FileNotFoundError:
+            print(f"⚠️ Checkpoint Stage 2 non trovato in {stage2_checkpoint_path}.")
 
     # === SBLOCCA TUTTI I PARAMETRI PER IL FINE-TUNING ===
     for p in model.parameters():
@@ -287,13 +304,25 @@ def main():
 
     # === OPTIMIZER E SCHEDULER ===
     # --- Costruzione gruppi di parametri per LR differenziati ---
-    optim_cfg = config["OPTIM_JOINT"]
 
     param_groups = [
         {'params': model.backbone.parameters(), 'lr': optim_cfg["LR_BACKBONE"]},
         {'params': list(model.zip_head.parameters()) + list(model.p2r_head.parameters()),
         'lr': optim_cfg["LR_HEADS"]}
     ]
+
+    fine_tune_factor = float(optim_cfg.get("FINE_TUNE_LR_SCALE", 1.0))
+    if fine_tune_factor <= 0:
+        raise ValueError("FINE_TUNE_LR_SCALE deve essere positivo.")
+    if abs(fine_tune_factor - 1.0) > 1e-6:
+        for group in param_groups:
+            group['lr'] *= fine_tune_factor
+        print(f"ℹ️ Scala i learning rate per il fine-tuning di un fattore {fine_tune_factor:.3f}.")
+
+    schedule_step_mode = str(optim_cfg.get("SCHEDULER_STEP", "iteration")).lower()
+    if schedule_step_mode not in {"iteration", "epoch"}:
+        print(f"⚠️ Modalità scheduler '{schedule_step_mode}' non riconosciuta: uso 'iteration'.")
+        schedule_step_mode = "iteration"
 
     optimizer = get_optimizer(param_groups, optim_cfg)
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
@@ -347,7 +376,11 @@ def main():
 
     # === TRAINING LOOP ===
     best_mae = float("inf")
+    best_epoch = 0
     epochs_stage3 = optim_cfg["EPOCHS"]
+    patience = max(0, int(optim_cfg.get("EARLY_STOPPING_PATIENCE", 0)))
+    early_delta = max(0.0, float(optim_cfg.get("EARLY_STOPPING_DELTA", 0.0)))
+    no_improve_rounds = 0
 
     print(f"🚀 Inizio Stage 3 — Fine-tuning congiunto per {epochs_stage3} epoche...")
 
@@ -361,10 +394,14 @@ def main():
             train_loader,
             optimizer,
             scheduler,
+            schedule_step_mode,
             device,
             default_down,
             clamp_cfg=clamp_cfg,
         )
+
+        if scheduler and schedule_step_mode == "epoch":
+            scheduler.step()
 
         if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:
             val_mae, val_rmse, tot_pred, tot_gt = validate(model, val_loader, device, default_down)
@@ -374,8 +411,11 @@ def main():
                 f"RMSE {val_rmse:.2f} | Pred/GT {bias:.3f}"
             )
 
-            # === SALVATAGGIO BEST MODEL ===
-            if val_mae < best_mae:
+            improvement_margin = best_mae - val_mae
+            is_best = (improvement_margin > early_delta) or not np.isfinite(best_mae)
+            best_candidate = best_mae
+
+            if is_best:
                 best_candidate = val_mae
                 if config["EXP"].get("SAVE_BEST", False) and hasattr(model, "p2r_head"):
                     best_path = os.path.join(output_dir, "stage3_best.pth")
@@ -408,8 +448,19 @@ def main():
                         print(f"💾 Nuovo best Stage 3 salvato ({best_path}) — MAE={best_candidate:.2f}")
 
                 best_mae = min(best_mae, best_candidate)
+                best_epoch = epoch + 1
+                no_improve_rounds = 0
+            else:
+                no_improve_rounds += 1
 
-    print("✅ Stage 3 completato con successo!")
+            if patience > 0 and no_improve_rounds >= patience:
+                print(
+                    f"⛔ Early stopping: nessun miglioramento MAE per {no_improve_rounds} "
+                    "valutazioni consecutive."
+                )
+                break
+
+    print(f"✅ Stage 3 completato con successo! Miglior MAE {best_mae:.2f} (epoch {best_epoch}).")
 
 
 # -----------------------------------------------------------

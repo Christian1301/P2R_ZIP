@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds
+from train_utils import init_seeds, canonicalize_p2r_grid
 
 
 def _round_up_8(x: int) -> int:
@@ -24,20 +24,24 @@ def _round_up_8(x: int) -> int:
 
 
 def collate_val(batch):
-    """Collate identico a quello usato in Stage 3 (senza punti)."""
+    """Collate identico a quello usato in Stage 3 (MA CON I PUNTI)."""
 
     if isinstance(batch[0], dict):
         imgs = [b["image"] for b in batch]
         dens = [b["density"] for b in batch]
+        # FIX: Carica i punti
+        pts = [b.get("points", torch.zeros((0,2))) for b in batch]
     else:
-        imgs, dens = zip(*[(s[0], s[1]) for s in batch])
+        # FIX: Carica i punti
+        imgs, dens, pts = zip(*[(s[0], s[1], s[2]) for s in batch])
 
     H_max = max(im.shape[-2] for im in imgs)
     W_max = max(im.shape[-1] for im in imgs)
     H_tgt, W_tgt = _round_up_8(H_max), _round_up_8(W_max)
 
-    imgs_out, dens_out = [], []
-    for im, den in zip(imgs, dens):
+    # FIX: Aggiungi pts_out
+    imgs_out, dens_out, pts_out = [], [], []
+    for im, den, p in zip(imgs, dens, pts): # FIX: Itera su p
         _, H, W = im.shape
         im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
                                mode="bilinear", align_corners=False).squeeze(0)
@@ -46,10 +50,11 @@ def collate_val(batch):
         den_res *= (H * W) / (H_tgt * W_tgt)
         imgs_out.append(im_res)
         dens_out.append(den_res)
+        # FIX: Aggiungi i punti originali (non serve scalarli per il conteggio)
+        pts_out.append(p if p is not None else torch.zeros((0,2)))
 
-    dummy_pts = [None] * len(imgs_out)
-    return torch.stack(imgs_out), torch.stack(dens_out), dummy_pts
-
+    # FIX: Ritorna i punti
+    return torch.stack(imgs_out), torch.stack(dens_out), pts_out
 
 @torch.no_grad()
 def evaluate_joint(model, dataloader, device, default_down):
@@ -59,25 +64,30 @@ def evaluate_joint(model, dataloader, device, default_down):
 
     pi_means, lambda_means = [], []
 
-    for idx, (images, gt_density, _) in enumerate(tqdm(dataloader, desc="[Validate Stage 3]")):
+    # FIX: Accetta 'points'
+    for idx, (images, gt_density, points) in enumerate(tqdm(dataloader, desc="[Validate Stage 3]")):
         images, gt_density = images.to(device), gt_density.to(device)
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
-        _, _, h_out, w_out = pred_density.shape
         _, _, h_in, w_in = images.shape
-
-        if h_out == 0 or w_out == 0:
-            raise ValueError("Output density map has zero spatial dimension.")
-
-        down_h = h_in / max(h_out, 1)
-        down_w = w_in / max(w_out, 1)
-        if abs(h_in - down_h * h_out) > 1.0 or abs(w_in - down_w * w_out) > 1.0:
-            down_h = down_w = float(default_down)
-
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (h_in, w_in), default_down, warn_tag="stage3_eval"
+        )
+        down_h, down_w = down_tuple
         cell_area = down_h * down_w
-        pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
-        gt_count = torch.sum(gt_density, dim=(1, 2, 3))
+        cell_area_tensor = pred_density.new_tensor(cell_area)
+        pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
+
+        gt_count_list = []
+        for p in points:
+            if p is None:
+                gt_count_list.append(0)
+            else:
+                gt_count_list.append(int(p.shape[0]))
+        if not gt_count_list:
+            gt_count_list = [0]
+        gt_count = torch.tensor(gt_count_list, dtype=torch.float32, device=device)
 
         abs_diff = torch.abs(pred_count - gt_count)
         mae += abs_diff.sum().item()
@@ -86,9 +96,18 @@ def evaluate_joint(model, dataloader, device, default_down):
         total_pred += pred_count.sum().item()
         total_gt += gt_count.sum().item()
 
+        logit_pi = outputs.get("logit_pi_maps")
+        if logit_pi is not None:
+            pi_soft = logit_pi.softmax(dim=1)[:, 1:]
+            pi_means.append(pi_soft.mean().item())
+        lambda_maps = outputs.get("lambda_maps")
+        if lambda_maps is not None:
+            lambda_means.append(lambda_maps.mean().item())
+
         if idx == 0:
             print("===== DEBUG STAGE 3 =====")
             print(f"Input size: {h_in}x{w_in}")
+            h_out, w_out = pred_density.shape[-2], pred_density.shape[-1]
             print(f"Output size: {h_out}x{w_out}")
             print(f"Downsampling factor: ({down_h:.2f}x, {down_w:.2f}x)")
             print(f"Density map range: [{pred_density.min().item():.4f}, {pred_density.max().item():.4f}]")
@@ -96,17 +115,9 @@ def evaluate_joint(model, dataloader, device, default_down):
             print(f"[DEBUG] Pred count (scaled): {pred_count[0].item():.2f}, GT count: {gt_count[0].item():.2f}")
             print("=========================")
 
-        # --- Diagnostica opzionale sulla ZIP head ---
-        if "logit_pi_maps" in outputs and "lambda_maps" in outputs:
-            pi_logits = outputs["logit_pi_maps"]
-            pi_prob = torch.softmax(pi_logits, dim=1)[:, 1:]
-            lambda_map = outputs["lambda_maps"]
-            pi_means.append(pi_prob.mean().item())
-            lambda_means.append(lambda_map.mean().item())
-
-    n = len(dataloader.dataset)
-    mae /= n
-    rmse = np.sqrt(mse / n)
+    num_samples = max(1, len(dataloader.dataset))
+    mae /= num_samples
+    rmse = np.sqrt(mse / num_samples)
 
     print("\n===== RISULTATI FINALI STAGE 3 =====")
     print(f"MAE:  {mae:.2f}")

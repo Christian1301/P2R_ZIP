@@ -21,7 +21,7 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg19_bn" 
+  BACKBONE: "vgg16_bn" 
   ZIP_PI_THRESH: 0.5
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true

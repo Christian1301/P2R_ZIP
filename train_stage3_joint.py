@@ -74,35 +74,6 @@ def collate_joint(batch):
 
     return torch.stack(imgs_out), torch.stack(dens_out), pts_out
 
-def collate_val(batch):
-    """
-    Collate function per la validazione (senza punti).
-    """
-    if isinstance(batch[0], dict):
-        imgs = [b["image"] for b in batch]
-        dens = [b["density"] for b in batch]
-    else:
-        imgs, dens = zip(*[(s[0], s[1]) for s in batch])
-
-    H_max = max(im.shape[-2] for im in imgs)
-    W_max = max(im.shape[-1] for im in imgs)
-    H_tgt, W_tgt = _round_up_8(H_max), _round_up_8(W_max)
-
-    imgs_out, dens_out = [], []
-    for im, den in zip(imgs, dens):
-        _, H, W = im.shape
-        im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
-                               mode='bilinear', align_corners=False).squeeze(0)
-        den_res = F.interpolate(den.unsqueeze(0), size=(H_tgt, W_tgt),
-                                mode='bilinear', align_corners=False).squeeze(0)
-        den_res *= (H * W) / (H_tgt * W_tgt)
-        imgs_out.append(im_res)
-        dens_out.append(den_res)
-
-    dummy_pts = [None] * len(imgs_out)
-    return torch.stack(imgs_out), torch.stack(dens_out), dummy_pts
-
-
 def train_one_epoch(
     model,
     criterion_zip,
@@ -173,8 +144,10 @@ def validate(model, dataloader, device, default_down):
     mae, mse = 0.0, 0.0
     total_pred, total_gt = 0.0, 0.0
 
-    for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 3"):
+    # FIX: Accetta 'points' (terzo elemento) invece di '_'
+    for images, gt_density, points in tqdm(dataloader, desc="Validate Stage 3"):
         images, gt_density = images.to(device), gt_density.to(device)
+        # 'points' è una lista di tensori
 
         outputs = model(images)
         pred_density = outputs["p2r_density"]
@@ -188,18 +161,25 @@ def validate(model, dataloader, device, default_down):
         cell_area_tensor = pred_density.new_tensor(cell_area)
 
         pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
-        gt_count = torch.sum(gt_density, dim=(1, 2, 3))
+        
+        # FIX: Calcola gt_count dal numero di punti (come in Stage 2)
+        # Invece di: gt_count = torch.sum(gt_density, dim=(1, 2, 3))
+        gt_count_list = [len(p) for p in points if p is not None]
+        if not gt_count_list:
+             gt_count_list = [0] # Gestisce batch senza punti
+        gt_count = torch.tensor(gt_count_list, dtype=torch.float32, device=device)
 
         mae += torch.abs(pred_count - gt_count).sum().item()
         mse += ((pred_count - gt_count) ** 2).sum().item()
         total_pred += pred_count.sum().item()
+        
+        # FIX: Assicura che il total_gt sia corretto
         total_gt += gt_count.sum().item()
 
     n = len(dataloader.dataset)
     mae /= n
     rmse = np.sqrt(mse / n)
     return mae, rmse, total_pred, total_gt
-
 
 # -----------------------------------------------------------
 def main():
@@ -362,7 +342,7 @@ def main():
         shuffle=False,
         num_workers=optim_cfg["NUM_WORKERS"],
         pin_memory=True,
-        collate_fn=collate_val,   # <--- aggiungi questo
+        collate_fn=collate_joint,   # <--- aggiungi questo
     )
 
     calibrate_loader = DataLoader(

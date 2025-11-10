@@ -5,9 +5,7 @@ import torch
 import torchvision.transforms.functional as F
 from torchvision import transforms
 import cv2
-from PIL import Image # Assicurati che PIL sia importato
-
-# === CLASSI DI TRASFORMAZIONE ===
+from PIL import Image
 
 class Compose(object):
     """Applica una sequenza di trasformazioni."""
@@ -84,7 +82,6 @@ class RandomResizedCrop(object):
                 i = random.randint(0, height - h)
                 j = random.randint(0, width - w)
                 return i, j, h, w
-        # Fallback
         in_ratio = float(width) / float(height)
         if in_ratio < min(ratio):
             w = width
@@ -128,19 +125,14 @@ class RandomResizedCrop(object):
 
         return img, new_pts, new_den
 
-# --- MODIFICA: SPOSTATA LA DEFINIZIONE QUI ---
 class ImageOnlyTransform(object):
     """Wrapper per trasformazioni torchvision che operano solo sull'immagine."""
     def __init__(self, transform):
         self.transform = transform
 
     def __call__(self, img, pts=None, den=None):
-        # Applica solo all'immagine (che deve essere PIL o Tensor a seconda della transform)
         img = self.transform(img)
         return img, pts, den
-# --- FINE MODIFICA ---
-
-# === FUNZIONE PER COSTRUIRE LA PIPELINE ===
 
 def build_transforms(cfg_data, is_train=True):
     """Costruisce la pipeline di trasformazioni con l'ordine corretto."""
@@ -155,25 +147,17 @@ def build_transforms(cfg_data, is_train=True):
         except (TypeError, ValueError, IndexError):
             crop_scale = (0.3, 1.0)
 
-        # Ordine corretto delle trasformazioni
         return Compose([
-            # 1. Geometriche (Input: PIL img, numpy pts, numpy den)
             RandomResizedCrop(size=crop_size, scale=crop_scale),
             RandomHorizontalFlip(p=0.5),
 
-            # 2. Colore/Qualità (Input: PIL img - usiamo il wrapper)
             ImageOnlyTransform(transforms.TrivialAugmentWide()),
-            # ImageOnlyTransform(transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)), # Alternativa
-            # ImageOnlyTransform(transforms.GaussianBlur(kernel_size=3)), # Opzionale
 
-            # 3. Conversione a Tensor (Input: PIL img, Output: Tensor img; Input: numpy den, Output: Tensor den)
             ToTensor(),
 
-            # 4. Normalizzazione (Input: Tensor img)
             Normalize(mean=mean, std=std),
         ])
     else:
-        # Validazione/Test: solo ToTensor e Normalize
         return Compose([
             ToTensor(),
             Normalize(mean=mean, std=std),

@@ -9,7 +9,6 @@ class SHHA(BaseCrowdDataset):
         - Dataset originale (.mat)
         - Versione ZIP o P2R (.npy)
         """
-        # Supporta nomi tipo 'train', 'train_data', 'val', 'test_data'
         if split in ["train", "train_data"]:
             split_dir = "train_data"
         elif split in ["val", "test", "test_data"]:
@@ -17,7 +16,6 @@ class SHHA(BaseCrowdDataset):
         else:
             split_dir = split
 
-        # Cerca immagini in diverse strutture note
         candidates = [
             os.path.join(self.root, split_dir, "images"),
             os.path.join(self.root, split_dir, "img"),
@@ -38,20 +36,17 @@ class SHHA(BaseCrowdDataset):
         img_name = os.path.basename(img_path)
         base_name = os.path.splitext(img_name)[0]
 
-        # Candidati possibili
         mat_path = os.path.join(base_dir, "ground_truth", f"GT_{base_name}.mat")
         mat_path2 = os.path.join(base_dir, "ground-truth", f"GT_{base_name}.mat")
         npy_path_zip = os.path.join(base_dir, "labels", f"{base_name}.npy")
         npy_path_p2r = os.path.join(base_dir, "new-anno", f"GT_{base_name}.npy")
 
-        # === Caso 1: .mat originale ===
         if os.path.isfile(mat_path) or os.path.isfile(mat_path2):
             mpath = mat_path if os.path.isfile(mat_path) else mat_path2
             mat = sio.loadmat(mpath)
             pts = mat["image_info"][0, 0][0, 0][0]
             return np.array(pts, dtype=np.float32)
 
-        # === Caso 2: .npy P2R o ZIP ===
         elif os.path.isfile(npy_path_zip):
             pts = np.load(npy_path_zip)
             return np.array(pts[:, :2], dtype=np.float32)

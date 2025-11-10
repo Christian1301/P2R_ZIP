@@ -30,16 +30,12 @@ GT_CANDIDATES: Tuple[Tuple[str, str], ...] = (
     ("new-anno", "GT_{name}.npy"),
 )
 
-
 def ensure_parent(path: Path) -> None:
     """Crea la cartella padre se non esiste."""
-
     path.parent.mkdir(parents=True, exist_ok=True)
-
 
 def move_file(src: Path, dst: Path, dry_run: bool) -> None:
     """Sposta un file gestendo overwrite e modalità dry-run."""
-
     if not src.exists():
         return
     ensure_parent(dst)
@@ -50,17 +46,13 @@ def move_file(src: Path, dst: Path, dry_run: bool) -> None:
         dst.unlink()
     shutil.move(str(src), str(dst))
 
-
 def iter_items(directory: Path) -> Iterable[Path]:
     """Restituisce i file nella directory se esiste."""
-
     if directory.exists():
         yield from sorted(directory.iterdir())
 
-
 def merge_val_into_train(root: Path, dry_run: bool) -> None:
     """Riporta tutti i file da val_data a train_data (utile per ricominciare)."""
-
     val_root = root / "val_data"
     if not val_root.exists():
         return
@@ -72,7 +64,6 @@ def merge_val_into_train(root: Path, dry_run: bool) -> None:
         for item in iter_items(src_dir):
             move_file(item, dst_dir / item.name, dry_run)
         if not dry_run and src_dir.exists():
-            # Rimuove cartelle vuote per evitare confusione
             try:
                 src_dir.rmdir()
             except OSError:
@@ -83,17 +74,14 @@ def merge_val_into_train(root: Path, dry_run: bool) -> None:
         except OSError:
             pass
 
-
 def collect_images(img_dir: Path) -> List[Path]:
     images = sorted(img_dir.glob("*.jpg"))
     if not images:
         raise FileNotFoundError(f"Nessuna immagine trovata in {img_dir}")
     return images
 
-
 def gather_ground_truths(base_dir: Path, name: str) -> List[Tuple[Path, Path]]:
     """Trova tutte le annotazioni disponibili per una data immagine."""
-
     pairs: List[Tuple[Path, Path]] = []
     for subdir, pattern in GT_CANDIDATES:
         src = base_dir / subdir / pattern.format(name=name)
@@ -101,10 +89,8 @@ def gather_ground_truths(base_dir: Path, name: str) -> List[Tuple[Path, Path]]:
             pairs.append((src, Path(subdir) / src.name))
     return pairs
 
-
 def move_sample(img_path: Path, train_root: Path, val_root: Path, dry_run: bool) -> None:
     """Sposta immagine e annotazioni corrispondenti da train a val."""
-
     name = img_path.stem
     gts = gather_ground_truths(train_root, name)
     if not gts:
@@ -119,17 +105,14 @@ def split_train_val(root: Path, fraction: float, seed: int, dry_run: bool) -> No
     val_root = root / "val_data"
     val_root.mkdir(parents=True, exist_ok=True)
     (val_root / "images").mkdir(parents=True, exist_ok=True)
-
     images = collect_images(train_root / "images")
     num_val = max(1, int(len(images) * fraction))
     rng = random.Random(seed)
     rng.shuffle(images)
     val_images = images[:num_val]
-
     print(f"[INFO] Sposto {len(val_images)} su {len(images)} immagini in val_data")
     for img in val_images:
         move_sample(img, train_root, val_root, dry_run)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ricrea split train/val per ShanghaiTech A")
@@ -144,18 +127,15 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def main() -> None:
     args = parse_args()
     root: Path = args.root
     if not root.exists():
         raise FileNotFoundError(f"Root dataset non trovata: {root}")
-
     if not args.skip_merge:
         merge_val_into_train(root, args.dry_run)
     split_train_val(root, args.fraction, args.seed, args.dry_run)
     print("[DONE] Split ricostruito" + (" (dry-run)" if args.dry_run else ""))
-
 
 if __name__ == "__main__":
     main()

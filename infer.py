@@ -21,11 +21,9 @@ def main():
     cfg = yaml.safe_load(open("config.yaml"))
     device = torch.device(cfg["DEVICE"] if torch.cuda.is_available() else "cpu")
 
-    # load img
     img = Image.open(args.img).convert("RGB")
     W, H = img.size
     t = _to_tensor(img)
-    # normalizza come training
     mean = torch.tensor(cfg["DATA"]["NORM_MEAN"]).view(3,1,1)
     std  = torch.tensor(cfg["DATA"]["NORM_STD"]).view(3,1,1)
     t = (t - mean) / std
@@ -60,9 +58,7 @@ def main():
         count = dens.sum().item()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    # salva heatmap densità come npy per precisione
     np.save(os.path.join(args.out_dir, "density.npy"), to_numpy(dens[0,0]))
-    # salva pi (griglia) come npy
     np.save(os.path.join(args.out_dir, "pi.npy"), to_numpy(pi[0,0]))
 
     print(f"Predicted count: {count:.2f}")

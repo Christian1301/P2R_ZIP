@@ -7,43 +7,27 @@ import matplotlib.pyplot as plt
 from models.p2r_zip_model import P2RZIPModel 
 from utils import load_checkpoint
 
-# ===============================
-# PARAMETRI DI BASE
-# ===============================
 IMG_PATH = "demo/example.jpg"     
 CHECKPOINT = "checkpoints/best.pth"
 TAU_VALUES = [0.2, 0.4, 0.6, 0.8]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ===============================
-# CARICAMENTO MODELLO
-# ===============================
 model = P2RZIPModel()
 ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
 model.load_state_dict(ckpt['model'])
 model.to(DEVICE).eval()
 
-# ===============================
-# CARICAMENTO IMMAGINE
-# ===============================
 img = cv2.imread(IMG_PATH)
 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.
 img_tensor = img_tensor.to(DEVICE)
 
-# ===============================
-# FORWARD PASS
-# ===============================
 with torch.no_grad():
     pi_map, density_map = model(img_tensor)
 
-# pi_map, density_map ∈ [B,1,H,W]
 pi_map = pi_map.squeeze().cpu().numpy()
 density_map = density_map.squeeze().cpu().numpy()
 
-# ===============================
-# POST-PROCESSING & VISUALIZZAZIONE
-# ===============================
 results = []
 for tau in TAU_VALUES:
     mask = (pi_map < tau).astype(np.float32)
@@ -54,7 +38,6 @@ for tau in TAU_VALUES:
 cols = len(results) + 1
 fig, axes = plt.subplots(2, cols, figsize=(4 * cols, 8))
 
-# Colonna iniziale: immagine e π-map
 axes[0, 0].imshow(img_rgb)
 axes[0, 0].set_title("Input Image")
 axes[0, 0].axis("off")

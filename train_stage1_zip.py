@@ -13,11 +13,6 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn
 
-
-# ============================================================
-# 🔧 Funzione di regolarizzazione extra per ZIP Head
-# Spinge π verso un target basso e penalizza λ eccessivamente alti
-# ============================================================
 def zip_regularization(
     preds,
     pi_target: float = 0.12,
@@ -40,10 +35,6 @@ def zip_regularization(
 
     return reg_loss
 
-
-# ============================================================
-# 🔹 Training loop con diagnostica
-# ============================================================
 def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, reg_params, clip_grad_norm=1.0):
     model.train()
     total_loss = 0.0
@@ -56,7 +47,6 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         predictions = model(images)
         loss, loss_dict = criterion(predictions, gt_density)
 
-        # Regolarizzazione extra
         reg_loss = zip_regularization(predictions, **reg_params)
         total = loss + reg_loss
 
@@ -80,10 +70,6 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         scheduler.step()
     return total_loss / len(dataloader)
 
-
-# ============================================================
-# 🔹 Validazione
-# ============================================================
 def validate(model, criterion, dataloader, device):
     model.eval()
     total_loss, mae, mse = 0.0, 0.0, 0.0
@@ -115,10 +101,6 @@ def validate(model, criterion, dataloader, device):
     avg_rmse = (mse / len(dataloader.dataset)) ** 0.5
     return avg_loss, avg_mae, avg_rmse
 
-
-# ============================================================
-# 🔹 Main training loop
-# ============================================================
 def main():
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -148,7 +130,6 @@ def main():
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
-    # Congela la P2R Head
     for p in model.p2r_head.parameters():
         p.requires_grad = False
 
@@ -160,7 +141,6 @@ def main():
     ).to(device)
 
     optim_cfg = config["OPTIM_ZIP"]
-    # Compatibilità con diversi nomi di chiave nel config
     lr_head = optim_cfg.get("LR", optim_cfg.get("BASE_LR", 5e-5))
     lr_backbone = optim_cfg.get("LR_BACKBONE", optim_cfg.get("BACKBONE_LR", lr_head * 0.5))
 
@@ -174,15 +154,11 @@ def main():
         ],
         optim_cfg,
     )
-
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg.get("EPOCHS", 1300))
-
-    # Datasets e DataLoader
     data_cfg = config["DATA"]
     train_tf = build_transforms(data_cfg, is_train=True)
     val_tf = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(config["DATASET"])
-
     train_set = DatasetClass(
         root=data_cfg["ROOT"],
         split=data_cfg["TRAIN_SPLIT"],
@@ -195,7 +171,6 @@ def main():
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
         transforms=val_tf,
     )
-
     train_loader = DataLoader(
         train_set,
         batch_size=optim_cfg["BATCH_SIZE"],
@@ -213,11 +188,9 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
     )
-
     out_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(out_dir, exist_ok=True)
     start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
-
     zip_reg_cfg = config.get("ZIP_REG", {})
     zip_reg_params = {
         "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),

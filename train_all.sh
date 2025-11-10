@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e  # interrompe lo script se un comando fallisce
+set -e  
 mkdir -p logs
 
 echo "🚀 Avvio Stage 1 (ZIP)..."

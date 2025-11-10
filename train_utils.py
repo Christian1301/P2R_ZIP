@@ -26,7 +26,6 @@ def get_optimizer(param_groups, optim_config):
     if not isinstance(param_groups, (list, tuple)):
         param_groups = [{'params': param_groups}]
 
-    # ✅ Leggi LR in modo flessibile
     lr = (
         optim_config.get("LR")
         or optim_config.get("BASE_LR")
@@ -133,14 +132,12 @@ def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, w
     if h_out <= 0 or w_out <= 0:
         raise ValueError(f"Dimensioni output non valide: H_out={h_out}, W_out={w_out}")
 
-    # Gestione base: output già nellos tesso spazio dell'input → down=1
     if h_out == h_in and w_out == w_in:
         return pred_density, (1.0, 1.0), False
 
     down_h = float(h_in) / float(h_out)
     down_w = float(w_in) / float(w_out)
 
-    # Default down potrebbe essere scalare o tuple
     if isinstance(default_down, (tuple, list)) and len(default_down) == 2:
         ref_down_h, ref_down_w = float(default_down[0]), float(default_down[1])
     else:
@@ -160,14 +157,12 @@ def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, w
 
     return pred_density, (down_h, down_w), False
 
-
 def setup_experiment(exp_dir):
     os.makedirs(exp_dir, exist_ok=True)
     log_dir = os.path.join(exp_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     print(f"🧾 Directory esperimento: {exp_dir}")
     return SummaryWriter(log_dir=log_dir)
-
 
 def resume_if_exists(model, optimizer, exp_dir, device):
     last_ck = os.path.join(exp_dir, "last.pth")
@@ -181,7 +176,6 @@ def resume_if_exists(model, optimizer, exp_dir, device):
         return start_epoch, best_val
     print("ℹ️ Nessun checkpoint precedente trovato, partenza da zero.")
     return 1, float("inf")
-
 
 def save_checkpoint(model, optimizer, epoch, val_metric, best_metric, exp_dir, is_best=False):
     os.makedirs(exp_dir, exist_ok=True)

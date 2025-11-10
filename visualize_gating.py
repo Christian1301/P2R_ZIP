@@ -11,12 +11,10 @@ import numpy as np
 import torch
 import yaml
 
-# Importa i componenti necessari dal tuo repository
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 
-# --- Impostazioni ---
 CONFIG_PATH = "config.yaml"
 
 DEFAULT_STAGE_FILES = {
@@ -26,8 +24,6 @@ DEFAULT_STAGE_FILES = {
 }
 
 DEFAULT_TAU_VALUES: List[float] = [0.2, 0.4, 0.6, 0.8]
-# --------------------
-
 
 def normalize_stage(label: Optional[str]) -> str:
     """Normalizza la dicitura dello stage (accetta anche 1/2/3)."""
@@ -96,7 +92,6 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
 
     return model
 
-
 def load_checkpoint(model: P2R_ZIP_Model, checkpoint_path: Path, device: torch.device):
     """Carica i pesi del checkpoint nel modello."""
     if not checkpoint_path.is_file():
@@ -116,7 +111,6 @@ def load_checkpoint(model: P2R_ZIP_Model, checkpoint_path: Path, device: torch.d
 
     model.eval()
     print("Modello caricato in modalità valutazione (eval).")
-
 
 def get_random_sample(
     config: dict,
@@ -192,17 +186,14 @@ def denormalize_tensor(tensor: torch.Tensor) -> np.ndarray:
 @torch.no_grad()
 def get_predictions(model: P2R_ZIP_Model, img_tensor: torch.Tensor) -> dict:
     """Esegue il forward del modello e restituisce le mappe di interesse."""
-    # Aggiungi la dimensione del batch
     img_batch = img_tensor.unsqueeze(0)
     
     outputs = model(img_batch)
-    
-    # Estrai la probabilità che un blocco NON sia uno zero strutturale
+
     pi_softmax = outputs["logit_pi_maps"].softmax(dim=1)
-    pi_not_zero = pi_softmax[:, 1:]  # [B, 1, Hb, Wb]
-    
-    # Estrai la densità P2R finale
-    p2r_density = outputs["p2r_density"] # [B, 1, Hp, Wp]
+    pi_not_zero = pi_softmax[:, 1:]  
+
+    p2r_density = outputs["p2r_density"] 
     
     pred_zip_density = outputs.get("pred_density_zip")
 
@@ -243,7 +234,6 @@ def visualize_results(
     down_h, down_w = downsample
     fig.suptitle(f"Visualizzazione Gating P2R-ZIP — {stage_label.upper()}", fontsize=16)
 
-    # --- Riga superiore ---
     axes[0, 0].imshow(original_rgb)
     axes[0, 0].set_title("Immagine Originale")
     axes[0, 0].axis("off")
@@ -258,7 +248,6 @@ def visualize_results(
         axes[0, idx].set_title(f"Maschera τ = {res['tau']:.1f}")
         axes[0, idx].axis("off")
 
-    # --- Riga inferiore ---
     im_p2r = axes[1, 0].imshow(p2r_linear_norm, cmap="jet")
     axes[1, 0].set_title(f"Densità P2R (lineare)\nCount tot = {pred_count:.1f} | GT = {gt_count:.1f}")
     axes[1, 0].axis("off")
@@ -301,7 +290,7 @@ def visualize_results(
     plt.close(fig)
 
 if __name__ == "__main__":
-    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE" # Per evitare crash di Matplotlib su alcuni sistemi
+    os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE" 
 
     parser = argparse.ArgumentParser(description="Visualizza le mappe di gating P2R-ZIP.")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -330,31 +319,18 @@ if __name__ == "__main__":
         random.seed(args.seed)
         torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Carica Config
     config = load_config(CONFIG_PATH)
-
-    # 2. Risolvi checkpoint in base allo stage
     checkpoint_path = resolve_checkpoint_path(config, args.checkpoint, stage_label)
-
-    # 3. Carica Modello
     model = get_model(config, device, stage_label)
-
-    # 4. Carica Pesi
     try:
         load_checkpoint(model, checkpoint_path, device)
     except FileNotFoundError as exc:
         print(f"ERRORE: {exc}")
         exit(1)
 
-    # 5. Carica Dati
-    # Nota: potresti dover modificare il tuo BaseDataset per supportare 'return_original=True'
     img_tensor, original_img, original_shape, points_tensor, img_path = get_random_sample(config, args.index)
-
-    # 6. Esegui Predizione
     maps = get_predictions(model, img_tensor.to(device))
 
-    # 7. Conteggi diagnostici
     p2r_map = maps["p2r_density_map"]
     H_in, W_in = img_tensor.shape[-2:]
     H_out, W_out = p2r_map.shape[-2:]
@@ -406,7 +382,6 @@ if __name__ == "__main__":
         for res in tau_results:
             print(f"  τ = {res['tau']:.1f}: {res['count']:.2f} persone")
 
-    # 8. Visualizza
     visualize_results(
         original_img,
         zip_map,

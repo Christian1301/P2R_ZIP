@@ -41,7 +41,6 @@ class P2R_ZIP_Model(nn.Module):
             p2r_head_kwargs["up_scale"] = 2
         self.p2r_head = P2RHead(**p2r_head_kwargs)
 
-        # ✅ ora rispetta il valore da config
         self.pi_thresh = pi_thresh
         self.gate = gate
         self.upsample_to_input = upsample_to_input
@@ -51,26 +50,20 @@ class P2R_ZIP_Model(nn.Module):
         B, C, H, W = x.shape
         feat = self.backbone(x)
 
-        # --- ZIP head ---
         zip_outputs = self.zip_head(feat, self.bin_centers)
         logit_pi_maps = zip_outputs["logit_pi_maps"]
         lambda_maps = zip_outputs["lambda_maps"]
-
-        # --- Maschera occupazione ---
         pi_softmax = logit_pi_maps.softmax(dim=1)
-        pi_not_zero = pi_softmax[:, 1:]  # probabilità che il blocco sia occupato
+        pi_not_zero = pi_softmax[:, 1:] 
         mask = (pi_not_zero > self.pi_thresh).float()
 
-        # ✅ Allinea la maschera alla risoluzione delle feature
         if mask.shape[-2:] != feat.shape[-2:]:
             mask = F.interpolate(mask, size=feat.shape[-2:], mode="bilinear", align_corners=False)
 
-        # --- Debug: percentuale blocchi attivi ---
         if self.debug:
             active_ratio = mask.mean().item() * 100
             print(f"[DEBUG] Active blocks ratio: {active_ratio:.2f}% (th={self.pi_thresh})")
 
-        # --- Gating ---
         if self.gate == "multiply":
             gated = feat * mask
         elif self.gate == "concat":
@@ -78,7 +71,6 @@ class P2R_ZIP_Model(nn.Module):
         else:
             raise ValueError("gate deve essere 'multiply' o 'concat'")
 
-        # --- P2R head ---
         dens = self.p2r_head(gated)
         if self.upsample_to_input:
             dens = F.interpolate(dens, size=(H, W), mode="bilinear", align_corners=False)

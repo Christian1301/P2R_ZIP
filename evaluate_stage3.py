@@ -18,30 +18,24 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, canonicalize_p2r_grid
 
-
 def _round_up_8(x: int) -> int:
     return (x + 7) // 8 * 8
 
-
 def collate_val(batch):
     """Collate identico a quello usato in Stage 3 (MA CON I PUNTI)."""
-
     if isinstance(batch[0], dict):
         imgs = [b["image"] for b in batch]
         dens = [b["density"] for b in batch]
-        # FIX: Carica i punti
         pts = [b.get("points", torch.zeros((0,2))) for b in batch]
     else:
-        # FIX: Carica i punti
         imgs, dens, pts = zip(*[(s[0], s[1], s[2]) for s in batch])
 
     H_max = max(im.shape[-2] for im in imgs)
     W_max = max(im.shape[-1] for im in imgs)
     H_tgt, W_tgt = _round_up_8(H_max), _round_up_8(W_max)
 
-    # FIX: Aggiungi pts_out
     imgs_out, dens_out, pts_out = [], [], []
-    for im, den, p in zip(imgs, dens, pts): # FIX: Itera su p
+    for im, den, p in zip(imgs, dens, pts): 
         _, H, W = im.shape
         im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
                                mode="bilinear", align_corners=False).squeeze(0)
@@ -50,10 +44,8 @@ def collate_val(batch):
         den_res *= (H * W) / (H_tgt * W_tgt)
         imgs_out.append(im_res)
         dens_out.append(den_res)
-        # FIX: Aggiungi i punti originali (non serve scalarli per il conteggio)
         pts_out.append(p if p is not None else torch.zeros((0,2)))
 
-    # FIX: Ritorna i punti
     return torch.stack(imgs_out), torch.stack(dens_out), pts_out
 
 @torch.no_grad()
@@ -61,10 +53,8 @@ def evaluate_joint(model, dataloader, device, default_down):
     model.eval()
     mae, mse = 0.0, 0.0
     total_pred, total_gt = 0.0, 0.0
-
     pi_means, lambda_means = [], []
-
-    # FIX: Accetta 'points'
+    
     for idx, (images, gt_density, points) in enumerate(tqdm(dataloader, desc="[Validate Stage 3]")):
         images, gt_density = images.to(device), gt_density.to(device)
         outputs = model(images)

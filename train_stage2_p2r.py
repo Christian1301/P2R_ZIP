@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# P2R-ZIP: Stage 2 — P2R Training
-# ============================================================
-
 import os, yaml, numpy as np, torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -114,7 +110,6 @@ def calibrate_density_scale(
 
     return bias
 
-# -----------------------------------------------------------
 @torch.no_grad()
 def evaluate_p2r(model, loader, loss_fn, device, cfg):
     """
@@ -134,7 +129,6 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
         images = images.to(device)
         points_list = [p.to(device) for p in points]
 
-        # --- Forward ---
         out = model(images)
         pred_density = out.get("p2r_density", out.get("density"))
         if pred_density is None:
@@ -146,21 +140,16 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
         )
         down_h, down_w = down_tuple
         H_out, W_out = pred_density.shape[-2:]
-
-        # --- Loss (uguale al training) ---
         loss = loss_fn(pred_density, points_list, down=down_tuple)
         total_loss += loss.item()
 
         if H_out == H_in and W_out == W_in:
-            # Output upsamplato fino all'input → densità già normalizzata in P2RHead
             pred_count = torch.sum(pred_density, dim=(1, 2, 3))
         else:
-            # Output ridotto → riporta la somma alla scala dei conteggi
             cell_area = down_h * down_w
             pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
         gt_count = torch.tensor([len(p) for p in points_list], dtype=torch.float32, device=device)
 
-        # --- Debug solo la prima volta ---
         if not hasattr(evaluate_p2r, "_debug_done"):
             print("===== DEBUG STAGE 2 =====")
             print(f"Input size: {H_in}x{W_in}")
@@ -179,11 +168,9 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
         total_gt += gt_count.sum().item()
         num_samples += len(points_list)
 
-    # --- Medie ---
     avg_loss = total_loss / max(len(loader), 1)
     mae = mae_errors / max(num_samples, 1)
     rmse = np.sqrt(mse_errors / max(num_samples, 1))
-
     print("\n===== RISULTATI FINALI STAGE 2 =====")
     print(f"Validation Loss: {avg_loss:.4f}")
     print(f"MAE: {mae:.2f}")
@@ -195,23 +182,17 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
     return avg_loss, mae, rmse, total_pred, total_gt
 
-
-# -----------------------------------------------------------
 def main():
     with open("config.yaml", 'r') as f:
         cfg = yaml.safe_load(f)
-
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
     print(f"✅ Avvio Stage 2 (P2R Training) su {device}")
-
-    # --- Config ---
     optim_cfg = cfg["OPTIM_P2R"]
     data_cfg = cfg["DATA"]
     p2r_loss_cfg = cfg["P2R_LOSS"]
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
 
-    # --- Dataset + transforms ---
     train_transforms = build_transforms(data_cfg, is_train=True)
     val_transforms = build_transforms(data_cfg, is_train=False)
 
@@ -240,7 +221,6 @@ def main():
         collate_fn=collate_fn, pin_memory=True
     )
 
-    # --- Modello ---
     dataset_name = cfg["DATASET"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
@@ -261,7 +241,6 @@ def main():
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
-    # --- Carica Stage 1 ---
     stage1_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
     zip_ckpt = os.path.join(stage1_dir, "best_model.pth")
     if not os.path.isfile(zip_ckpt):
@@ -274,12 +253,10 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print(f"✅ Checkpoint Stage1 caricato da {zip_ckpt}")
 
-    # --- Congela ZIPHead e sblocca l'ultimo blocco del backbone ---
     print("🧊 Congelamento ZIPHead e sblocco parziale del backbone...")
     for p in model.zip_head.parameters():
         p.requires_grad = False
 
-    # Fissa tutto il backbone e poi riattiva l'ultimo blocco conv (layer >=34)
     for p in model.backbone.parameters():
         p.requires_grad = False
     if hasattr(model.backbone, "body"):
@@ -289,15 +266,13 @@ def main():
                     param.requires_grad = True
 
     for p in model.p2r_head.parameters():
-        p.requires_grad = True  # P2RHead sempre addestrabile
+        p.requires_grad = True  
 
-    # Reinizializza il log_scale per contenere la scala iniziale se richiesto
     log_scale_init = p2r_loss_cfg.get("LOG_SCALE_INIT")
     if log_scale_init is not None and hasattr(model.p2r_head, "log_scale"):
         model.p2r_head.log_scale.data.fill_(float(log_scale_init))
         print(f"ℹ️ log_scale inizializzato a {float(log_scale_init):.3f}")
 
-    # --- Ottimizzatore + Scheduler ---
     head_params, log_scale_params = [], []
     for name, param in model.p2r_head.named_parameters():
         if not param.requires_grad:
@@ -325,7 +300,6 @@ def main():
     opt = get_optimizer(params_to_train, optim_cfg)
     scheduler = get_scheduler(opt, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
-    # --- Loss ---
     loss_kwargs = {}
     if "SCALE_WEIGHT" in p2r_loss_cfg:
         loss_kwargs["scale_weight"] = float(p2r_loss_cfg["SCALE_WEIGHT"])
@@ -339,12 +313,10 @@ def main():
         loss_kwargs["max_radius"] = float(p2r_loss_cfg["MAX_RADIUS"])
     p2r_loss_fn = P2RLoss(**loss_kwargs).to(device)
 
-    # --- Setup esperimento ---
     exp_dir = os.path.join(stage1_dir, "stage2")
     writer = setup_experiment(exp_dir)
     start_ep, best_mae = (1, float("inf"))
     if optim_cfg.get("RESUME_LAST", False):
-        # Carica solo i pesi del modello, non l'optimizer
         last_ck = os.path.join(exp_dir, "last.pth")
         if os.path.isfile(last_ck):
             ckpt = torch.load(last_ck, map_location=device)
@@ -361,8 +333,6 @@ def main():
             start_ep, best_mae = 1, float("inf")
     else:
         start_ep, best_mae = 1, float("inf")
-
-    # --- Calibrazione iniziale del conteggio ---
     calibrate_batches_cfg = p2r_loss_cfg.get("CALIBRATE_BATCHES", 6)
     calibrate_max_batches = None
     if calibrate_batches_cfg is not None:
@@ -384,40 +354,31 @@ def main():
             clamp_range=clamp_cfg,
             max_adjust=max_adjust,
         )
-
-    # --- Training loop ---
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
     for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(enumerate(dl_train, start=1), total=len(dl_train), desc=f"[P2R Train] Epoch {ep}/{optim_cfg['EPOCHS']}")
-
         for batch_idx, (images, _, points) in pbar:
             images = images.to(device)
             points_list = [p.to(device) for p in points]
-
             out = model(images)
             pred_density = out.get("p2r_density", out.get("density"))
             if pred_density is None:
                 raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
-
             B, _, H_out, W_out = pred_density.shape
             _, _, H_in, W_in = images.shape
             pred_density, down_tuple, _ = canonicalize_p2r_grid(
                 pred_density, (H_in, W_in), default_down, warn_tag="stage2_train"
             )
 
-            # ✅ ORA loss coerente con ReLU/(upscale²) — niente più logit
             loss = p2r_loss_fn(pred_density, points_list, down=down_tuple)
-
             opt.zero_grad()
             loss.backward()
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
-
             total_loss += loss.item()
-
             ds_val = None
             with torch.no_grad():
                 if clamp_cfg and hasattr(model.p2r_head, "log_scale"):
@@ -436,8 +397,7 @@ def main():
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}", dens_scale=f"{ds_val:.6f}")
             else:
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}")
-
-        # --- Scheduler step ---
+ì
         if scheduler:
             scheduler.step()
 
@@ -448,7 +408,6 @@ def main():
             if len(opt.param_groups) > 2:
                 writer.add_scalar("lr/backbone", opt.param_groups[-1]["lr"], ep)
 
-        # --- Validazione periodica ---
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:
             val_loss, mae, mse, tot_pred, tot_gt = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
             orig_bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
@@ -459,7 +418,6 @@ def main():
                 if tot_gt > 0:
                     writer.add_scalar("val/pred_gt_ratio", orig_bias, ep)
 
-            # --- Best model ---
             is_best = mae < best_mae
             best_candidate = best_mae
             calibrated_metrics = None
@@ -501,7 +459,6 @@ def main():
                         torch.save(model.state_dict(), best_path)
                         print(f"💾 Nuovo best Stage 2 salvato in {best_path} (MAE={mae:.2f})")
 
-            # Aggiorna il tracker del best MAE con il candidato (calibrato se disponibile)
             if is_best:
                 best_mae = min(best_mae, best_candidate)
 
@@ -520,7 +477,6 @@ def main():
                     )
                 )
 
-            # --- Debug ogni 50 epoche ---
             if ep % 50 == 0:
                 with torch.no_grad():
                     sample_out = model(images[:1])
@@ -531,7 +487,5 @@ def main():
         writer.close()
     print("✅ Stage 2 completato.")
 
-
-# -----------------------------------------------------------
 if __name__ == "__main__":
     main()

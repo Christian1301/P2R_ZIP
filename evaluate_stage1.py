@@ -36,13 +36,10 @@ def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint
         loss, loss_dict = criterion(preds, gt_density)
         total_loss += loss.item()
 
-        # Estrai le mappe principali
-        pi_logits = preds["logit_pi_maps"]       # [B, 2, H, W]
-        lam_maps  = preds["lambda_maps"]         # [B, 1, H, W]
+        pi_logits = preds["logit_pi_maps"]       
+        lam_maps  = preds["lambda_maps"]        
         pi_softmax = torch.softmax(pi_logits, dim=1)
-        pi_not_zero = pi_softmax[:, 1:]          # Probabilità di blocco occupato
-
-        # Diagnostica statistica
+        pi_not_zero = pi_softmax[:, 1:]       
         pi_mean = pi_not_zero.mean().item()
         pi_min, pi_max = pi_not_zero.min().item(), pi_not_zero.max().item()
         lam_mean = lam_maps.mean().item()
@@ -50,7 +47,6 @@ def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint
         pct_over_01 = (pi_not_zero > 0.1).float().mean().item() * 100
         pct_over_05 = (pi_not_zero > 0.5).float().mean().item() * 100
 
-        # Conteggio previsto totale (sommando ZIP density)
         pred_density_zip = pi_not_zero * lam_maps
         pred_count = torch.sum(pred_density_zip).item()
 
@@ -60,7 +56,6 @@ def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint
         mae += abs(pred_count - gt_count)
         mse += (pred_count - gt_count) ** 2
 
-        # Stampa di debug ogni 10 immagini
         if idx % 10 == 0:
             print(f"[IMG {idx:03d}] pi:[{pi_min:.3f},{pi_max:.3f}] mean={pi_mean:.3f} "
                   f"| λ:[{lam_min:.3f},{lam_max:.3f}] mean={lam_mean:.3f} "
@@ -121,12 +116,10 @@ def main(config, checkpoint_path):
     raw_state = torch.load(checkpoint_path, map_location=device)
     state_dict = raw_state.get('model', raw_state)
 
-    # Compatibilità con vecchi checkpoint che usavano 'density_scale'
     density_key = 'p2r_head.density_scale'
     log_scale_key = 'p2r_head.log_scale'
     if density_key in state_dict and log_scale_key not in state_dict:
         density_scale = state_dict.pop(density_key)
-        # Evita log(0)
         state_dict[log_scale_key] = torch.log(density_scale.clamp(min=1e-8))
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -160,9 +153,7 @@ def main(config, checkpoint_path):
         num_workers=config['OPTIM_ZIP']['NUM_WORKERS'],
         collate_fn=collate_fn
     )
-
     validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
-
 
 if __name__ == '__main__':
     with open("config.yaml", 'r') as f:

@@ -8,15 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ============================================================
-# Opzioni di debug/sicurezza
-# ============================================================
-# Metti a True se vuoi forzare la sincronizzazione per ottenere stacktrace accurati
 ENABLE_CUDA_LAUNCH_BLOCKING = True
-# Metti a True per attivare l'anomaly detection (lento ma utile per localizzare NaN/Inf/backward bug)
 ENABLE_AUTOGRAD_ANOMALY_DETECT = False
-# Log di debug lightweight (dimensioni, num punti, range densità, ecc.)
 ENABLE_LIGHT_DEBUG_LOG = True
 
 if ENABLE_CUDA_LAUNCH_BLOCKING:
@@ -24,11 +17,6 @@ if ENABLE_CUDA_LAUNCH_BLOCKING:
 
 if ENABLE_AUTOGRAD_ANOMALY_DETECT:
     torch.autograd.set_detect_anomaly(True)
-
-
-# ============================================================
-# Utility
-# ============================================================
 
 def _safe_normalize_01(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
@@ -48,11 +36,6 @@ def _check_no_nan_inf(t: torch.Tensor, name: str = "tensor"):
     if torch.isinf(t).any():
         raise ValueError(f"{name} contiene Inf")
 
-
-# ============================================================
-# L2 Distance (streaming)
-# ============================================================
-
 class L2DIS:
     """
     Calcola distanze L2 normalizzate tra insiemi di punti:
@@ -64,17 +47,9 @@ class L2DIS:
         self.factor = factor
 
     def __call__(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        # X: [B,NX,2] -> [...,1,2]
-        # Y: [B,NY,2] -> [...,2]
-        # broadcasting: (B, NX, 1, 2) - (B, 1, NY, 2) -> (B, NX, NY, 2)
-        x_col = X.unsqueeze(-2)   # [B, NX, 1, 2]
-        y_row = Y.unsqueeze(-3)   # [B, 1, NY, 2]
+        x_col = X.unsqueeze(-2)   
+        y_row = Y.unsqueeze(-3)  
         return torch.norm(x_col - y_row, dim=-1) / max(self.factor, 1e-6)
-
-
-# ============================================================
-# P2R Loss (robusta)
-# ============================================================
 
 class P2RLoss(nn.Module):
     """
@@ -99,7 +74,7 @@ class P2RLoss(nn.Module):
         self,
         reduction: str = "mean",
         chunk_size: int = 4096,
-    scale_weight: float = 0.01,
+        scale_weight: float = 0.01,
         pos_weight: float = 2.0,
         min_radius: float = 8.0,
         max_radius: float = 96.0,
@@ -120,8 +95,8 @@ class P2RLoss(nn.Module):
     @torch.no_grad()
     def _min_distances_streaming(
         self,
-        A_coord: torch.Tensor,  # [1, HW, 2]
-        B_coord: torch.Tensor,  # [1, NP, 2]
+        A_coord: torch.Tensor,  
+        B_coord: torch.Tensor,  
         chunk_size: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -139,7 +114,6 @@ class P2RLoss(nn.Module):
         minC_list = []
         mcidx_list = []
 
-        # Caso particolare: nessun punto -> ritorna distanza molto alta e indice 0
         if n_pts == 0:
             very_large = torch.full((1, n_pix, 1), float('inf'), device=device)
             zero_idx = torch.zeros((1, n_pix, 1), dtype=torch.long, device=device)
@@ -147,21 +121,19 @@ class P2RLoss(nn.Module):
 
         for start in range(0, n_pix, chunk_size):
             end = min(start + chunk_size, n_pix)
-            # [1, chunk, 2] vs [1, n_pts, 2] -> [1, chunk, n_pts]
             C_chunk = self.cost(A_coord[:, start:end, :], B_coord)
             minC, mcidx = torch.min(C_chunk, dim=-1, keepdim=True)  # [1, chunk, 1]
             minC_list.append(minC)
             mcidx_list.append(mcidx)
-            # Rilascia subito il chunk
             del C_chunk, minC, mcidx
 
         return torch.cat(minC_list, dim=1), torch.cat(mcidx_list, dim=1)
 
     def forward(
         self,
-        dens: torch.Tensor,                  # [B, 1, H_out, W_out] (ReLU/(upscale^2))
-        points,                              # lista di B tensori [Ni, >=2] (x,y,[...]) in coord spazio input
-        down = 16,                           # fattore di downsampling: input/H_out (scalar o tuple)
+        dens: torch.Tensor,                  
+        points,                              
+        down = 16,                           
         masks: Optional[torch.Tensor] = None,
         crop_den_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -201,11 +173,9 @@ class P2RLoss(nn.Module):
         gt_counts = []
 
         for i in range(B):
-            # dens[i]: [1, H, W] -> den: [H, W, 1]
-            den = dens[i].permute(1, 2, 0).contiguous()  # [H, W, 1]
+            den = dens[i].permute(1, 2, 0).contiguous()  
             H, W = den.shape[:2]
 
-            # Debug lightweight
             if ENABLE_LIGHT_DEBUG_LOG and i == 0:
                 with torch.no_grad():
                     print(f"[P2R DEBUG] B={B}, HxW={H}x{W}, down=({down_h:.3f},{down_w:.3f}), "
@@ -216,9 +186,7 @@ class P2RLoss(nn.Module):
             if not torch.is_tensor(seq):
                 raise TypeError(f"points[{i}] deve essere torch.Tensor, ottenuto {type(seq)}")
 
-            # Normalizziamo forma e tipo
             if seq.ndim == 1:
-                # es: shape [2] -> reshape a [1,2]
                 if seq.numel() == 0:
                     seq = seq.reshape(0, 2)
                 else:
@@ -228,9 +196,7 @@ class P2RLoss(nn.Module):
 
             seq = seq.to(device, dtype=torch.float32)
 
-            # Gestione batch con 0 punti
             if seq.numel() == 0 or seq.shape[0] == 0:
-                # BCE contro tutto-zero (peso 0.5 come nel tuo codice)
                 loss_empty = F.binary_cross_entropy(
                     _safe_normalize_01(den),
                     torch.zeros_like(den),
@@ -244,63 +210,44 @@ class P2RLoss(nn.Module):
                     print(f"[P2R DEBUG] i={i} senza punti → loss_empty={loss_empty.item():.6f}")
                 continue
 
-            # Check NaN/Inf sui punti
             _check_no_nan_inf(seq, f"points[{i}]")
 
-            # Clamp dei punti nel dominio input (HxW nello spazio input = H*down, W*down)
             H_in = H * down_h
             W_in = W * down_w
-            # seq: [N, >=2], coordinate [x, y] in seq[:, :2]
-            # Convenzione comune: seq[:,0]=x (colonna), seq[:,1]=y (riga). Qui NON le scambiamo,
-            # usiamo coerenza interna: A_coord = (row, col) nello spazio input, B_coord = (y, x).
-            seq[:, 0] = torch.clamp(seq[:, 0], 0, W_in - 1)  # x in [0, W_in-1]
-            seq[:, 1] = torch.clamp(seq[:, 1], 0, H_in - 1)  # y in [0, H_in-1]
+            seq[:, 0] = torch.clamp(seq[:, 0], 0, W_in - 1)  
+            seq[:, 1] = torch.clamp(seq[:, 1], 0, H_in - 1)  
 
-            # Costruzione A (feature su pixel), shape [1, HW, 1]
             A = den.view(1, -1, 1)
             _check_no_nan_inf(A, "A(den_flat)")
 
-            # Coordinate dei pixel (centri) nello spazio input
-            # meshgrid in ordine (row=i, col=j)
             rows = torch.arange(H, device=device, dtype=torch.float32)
             cols = torch.arange(W, device=device, dtype=torch.float32)
-            rr, cc = torch.meshgrid(rows, cols, indexing="ij")  # [H,W], [H,W]
-            # Centro del pixel in input-space:
-            #   rr_in = rr*down + (down-1)/2,  cc_in = cc*down + (down-1)/2
+            rr, cc = torch.meshgrid(rows, cols, indexing="ij")  
             center_offset_h = (down_h - 1.0) / 2.0
             center_offset_w = (down_w - 1.0) / 2.0
             rr_in = rr * down_h + center_offset_h
             cc_in = cc * down_w + center_offset_w
-            A_coord = torch.stack([rr_in, cc_in], dim=-1).view(1, -1, 2)  # [1, HW, 2]
+            A_coord = torch.stack([rr_in, cc_in], dim=-1).view(1, -1, 2) 
 
-            # Coordinate dei punti nello spazio input (B_coord usa [y, x] coerente con rr/cc)
-            B_coord = torch.stack([seq[:, 1], seq[:, 0]], dim=-1).unsqueeze(0)  # [1, N, 2]
+            B_coord = torch.stack([seq[:, 1], seq[:, 0]], dim=-1).unsqueeze(0)  
 
-            # Calcolo minima distanza punto-pixel in streaming
             minC, mcidx = self._min_distances_streaming(A_coord, B_coord, self.chunk_size)
-            # Stabilizza
             maxC = torch.clamp(torch.amax(minC, dim=1, keepdim=True), self.min_radius, self.max_radius)
 
-            # Target binario T: pixel positivo se vicino a un punto (< min_radius nel dominio input)
-            T = (minC < self.min_radius).float().view_as(A)  # [1, HW, 1]
-            # Pesi: negativi=1, positivi=pos_weight (default 2.0 per retro-compatibilità)
+            T = (minC < self.min_radius).float().view_as(A)  
             Wt = torch.ones_like(T)
             if self.pos_weight != 1.0:
                 Wt = torch.where(T > 0, Wt * self.pos_weight, Wt)
             if crop_den_masks is not None:
                 Wt = Wt * crop_den_masks[i].view_as(Wt)
 
-            # Normalizzazione della densità per la BCE (range [0,1])
             A_norm = _safe_normalize_01(A)
 
-            # BCE
             loss_i = F.binary_cross_entropy(
                 A_norm, T, weight=Wt, reduction="mean"
             )
             total_loss = total_loss + loss_i
 
-            # Penalità di scala sui conteggi (entrambe le quantità in "count di persone")
-            # dens è nello spazio ridotto: somma(dens) ≈ count*(1/(down_h*down_w)) → riportiamo a count dividendo di (down_h*down_w)
             pred_counts.append(dens[i].sum() / (down_h * down_w))
             gt_counts.append(dens.new_tensor(float(seq.shape[0])))
 
@@ -310,13 +257,11 @@ class P2RLoss(nn.Module):
                           f"loss_bce={loss_i.item():.6f}, "
                           f"A_norm_range=[{A_norm.min().item():.4e},{A_norm.max().item():.4e}]")
 
-            # cleanup chunk
             del A_norm, A_coord, B_coord, minC, mcidx, T, Wt, rr, cc, rr_in, cc_in, center_offset_h, center_offset_w
 
-        # Penalità globale sui conteggi
         if len(pred_counts) > 0:
-            pred_counts_t = torch.stack(pred_counts)  # [B]
-            gt_counts_t = torch.stack(gt_counts)      # [B]
+            pred_counts_t = torch.stack(pred_counts) 
+            gt_counts_t = torch.stack(gt_counts)      
             _check_no_nan_inf(pred_counts_t, "pred_counts")
             _check_no_nan_inf(gt_counts_t, "gt_counts")
 
@@ -325,11 +270,9 @@ class P2RLoss(nn.Module):
         else:
             scale_penalty = dens.new_tensor(0.0)
 
-        # Riduzione per batch
         if self.reduction == "mean":
             total_loss = total_loss / max(B, 1)
 
-        # Debug finale
         if ENABLE_LIGHT_DEBUG_LOG:
             with torch.no_grad():
                 pc = torch.stack(pred_counts).mean().item() if pred_counts else 0.0

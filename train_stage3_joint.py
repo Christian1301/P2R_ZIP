@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# P2R-ZIP: Stage 3 — Joint Training (ZIP + P2R Fine-tuning)
-# ============================================================
-
 import os
 import yaml
 import torch
@@ -23,7 +19,6 @@ from train_utils import (
 from train_stage2_p2r import calibrate_density_scale
 import torch.nn.functional as F
 
-# --- utility per arrotondare a multipli di 8 ---
 def _round_up_8(x: int) -> int:
     return (x + 7) // 8 * 8
 
@@ -33,7 +28,6 @@ def collate_joint(batch):
     Ogni elemento del batch è un dict con chiavi:
         'image', 'density', 'points'
     """
-    # compatibilità con dataset tuple o dict
     if isinstance(batch[0], dict):
         imgs = [b["image"] for b in batch]
         dens = [b["density"] for b in batch]
@@ -41,7 +35,6 @@ def collate_joint(batch):
     else:
         imgs, dens, pts = zip(*[(s[0], s[1], s[2]) for s in batch])
 
-    # misura massima nel batch, arrotondata a multiplo di 8
     H_max = max(im.shape[-2] for im in imgs)
     W_max = max(im.shape[-1] for im in imgs)
     H_tgt, W_tgt = _round_up_8(H_max), _round_up_8(W_max)
@@ -51,16 +44,13 @@ def collate_joint(batch):
         _, H, W = im.shape
         sy, sx = H_tgt / H, W_tgt / W
 
-        # resize immagine
         im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
                                mode='bilinear', align_corners=False).squeeze(0)
 
-        # resize densità mantenendo il conteggio
         den_res = F.interpolate(den.unsqueeze(0), size=(H_tgt, W_tgt),
                                 mode='bilinear', align_corners=False).squeeze(0)
         den_res *= (H * W) / (H_tgt * W_tgt)
 
-        # scala i punti
         if p is None or (hasattr(p, "numel") and p.numel() == 0):
             p_scaled = p
         else:
@@ -97,11 +87,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         outputs = model(images)
-
-        # --- ZIP Loss ---
         loss_zip, loss_dict_zip = criterion_zip(outputs, gt_density)
-
-        # --- P2R Loss ---
         pred_density = outputs["p2r_density"]
         _, _, h_in, w_in = images.shape
         pred_density, down_tuple, _ = canonicalize_p2r_grid(
@@ -109,8 +95,6 @@ def train_one_epoch(
         )
 
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
-
-        # --- Combined Loss ---
         combined_loss = loss_zip + alpha * loss_p2r
         combined_loss.backward()
 
@@ -136,19 +120,15 @@ def train_one_epoch(
 
     return total_loss / len(dataloader)
 
-
-# -----------------------------------------------------------
 @torch.no_grad()
 def validate(model, dataloader, device, default_down):
     model.eval()
     mae, mse = 0.0, 0.0
     total_pred, total_gt = 0.0, 0.0
 
-    # FIX: Accetta 'points' (terzo elemento) invece di '_'
     for images, gt_density, points in tqdm(dataloader, desc="Validate Stage 3"):
         images, gt_density = images.to(device), gt_density.to(device)
-        # 'points' è una lista di tensori
-
+       
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
@@ -162,18 +142,14 @@ def validate(model, dataloader, device, default_down):
 
         pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
         
-        # FIX: Calcola gt_count dal numero di punti (come in Stage 2)
-        # Invece di: gt_count = torch.sum(gt_density, dim=(1, 2, 3))
         gt_count_list = [len(p) for p in points if p is not None]
         if not gt_count_list:
-             gt_count_list = [0] # Gestisce batch senza punti
+             gt_count_list = [0] 
         gt_count = torch.tensor(gt_count_list, dtype=torch.float32, device=device)
 
         mae += torch.abs(pred_count - gt_count).sum().item()
         mse += ((pred_count - gt_count) ** 2).sum().item()
         total_pred += pred_count.sum().item()
-        
-        # FIX: Assicura che il total_gt sia corretto
         total_gt += gt_count.sum().item()
 
     n = len(dataloader.dataset)
@@ -181,9 +157,7 @@ def validate(model, dataloader, device, default_down):
     rmse = np.sqrt(mse / n)
     return mae, rmse, total_pred, total_gt
 
-# -----------------------------------------------------------
 def main():
-    # === CONFIG ===
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
@@ -196,7 +170,6 @@ def main():
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
 
-    # === MODEL SETUP ===
     dataset_name = config["DATASET"]
     bin_config = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_config["bins"], bin_config["bin_centers"]
@@ -225,8 +198,6 @@ def main():
     ).to(device)
 
     optim_cfg = config["OPTIM_JOINT"]
-
-    # === CARICA CHECKPOINT ===
     output_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     stage2_checkpoint_path = os.path.join(output_dir, "stage2_best.pth")
     stage3_checkpoint_path = os.path.join(output_dir, "stage3_best.pth")
@@ -253,11 +224,9 @@ def main():
         except FileNotFoundError:
             print(f"⚠️ Checkpoint Stage 2 non trovato in {stage2_checkpoint_path}.")
 
-    # === SBLOCCA TUTTI I PARAMETRI PER IL FINE-TUNING ===
     for p in model.parameters():
         p.requires_grad = True
 
-    # === LOSS ===
     criterion_zip = ZIPCompositeLoss(
         bins=bins,
         weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
@@ -282,9 +251,6 @@ def main():
     criterion_p2r = P2RLoss(**loss_kwargs).to(device)
     alpha = config["JOINT_LOSS"]["ALPHA"]
 
-    # === OPTIMIZER E SCHEDULER ===
-    # --- Costruzione gruppi di parametri per LR differenziati ---
-
     param_groups = [
         {'params': model.backbone.parameters(), 'lr': optim_cfg["LR_BACKBONE"]},
         {'params': list(model.zip_head.parameters()) + list(model.p2r_head.parameters()),
@@ -307,9 +273,7 @@ def main():
     optimizer = get_optimizer(param_groups, optim_cfg)
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
-    # === DATASET ===
     data_cfg = config["DATA"]
-    # Stage 3 usa le immagini a piena risoluzione, ma serve mantenere la normalizzazione
     shared_transforms = build_transforms(data_cfg, is_train=False)
 
     DatasetClass = get_dataset(config["DATASET"])
@@ -333,7 +297,7 @@ def main():
         num_workers=optim_cfg["NUM_WORKERS"],
         pin_memory=True,
         drop_last=True,
-        collate_fn=collate_joint,   # <--- AGGIUNGI QUI
+        collate_fn=collate_joint,
     )
 
     val_loader = DataLoader(
@@ -342,7 +306,7 @@ def main():
         shuffle=False,
         num_workers=optim_cfg["NUM_WORKERS"],
         pin_memory=True,
-        collate_fn=collate_joint,   # <--- aggiungi questo
+        collate_fn=collate_joint,
     )
 
     calibrate_loader = DataLoader(
@@ -354,7 +318,6 @@ def main():
         collate_fn=collate_joint,
     )
 
-    # --- Calibrazione iniziale opzionale ---
     calibrate_batches_cfg = loss_cfg.get("CALIBRATE_BATCHES", 10)
     calibrate_max_batches = None
     if calibrate_batches_cfg is not None:
@@ -377,7 +340,6 @@ def main():
             max_adjust=max_adjust,
         )
 
-    # === TRAINING LOOP ===
     best_mae = float("inf")
     best_epoch = 0
     epochs_stage3 = optim_cfg["EPOCHS"]
@@ -465,7 +427,5 @@ def main():
 
     print(f"✅ Stage 3 completato con successo! Miglior MAE {best_mae:.2f} (epoch {best_epoch}).")
 
-
-# -----------------------------------------------------------
 if __name__ == "__main__":
     main()

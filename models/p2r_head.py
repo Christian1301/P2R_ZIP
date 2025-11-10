@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# P2RHead — versione finale conforme al paper
+# P2RHead Module
 # "Point-to-Region Supervision for Crowd Counting" (2023)
 # ============================================================
 import torch
@@ -8,9 +8,6 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 
-# ------------------------------------------------------------
-# Blocco conv 3×3 come nel paper (senza BatchNorm)
-# ------------------------------------------------------------
 def conv_3x3(in_channels, out_channels, bn=False):
     padding = 1
     layers = [
@@ -25,15 +22,10 @@ def conv_3x3(in_channels, out_channels, bn=False):
     layers.append(nn.ReLU(inplace=True))
     block = nn.Sequential(*layers)
 
-    # Inizializzazione come nel paper
     if not bn:
         init.constant_(block[0].bias, 0.)
     return block
 
-
-# ------------------------------------------------------------
-# Decoder originale P2R con diagnostica opzionale
-# ------------------------------------------------------------
 class P2RHead(nn.Module):
     """
     Decoder P2R conforme al paper:
@@ -44,7 +36,7 @@ class P2RHead(nn.Module):
         super().__init__()
         self.debug = debug
         self.up_scale = up_scale
-        self.base_stride = 8  # stride effettivo del backbone (es. VGG stride=8)
+        self.base_stride = 8  
         self.log_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=True)
         self.layer1 = conv_3x3(in_channel, fea_channel, bn=False)
         self.layer2 = conv_3x3(fea_channel, fea_channel, bn=False)
@@ -55,7 +47,6 @@ class P2RHead(nn.Module):
         )
         self.pixel_shuffle = nn.PixelShuffle(up_scale)
 
-        # Inizializzazione identica al paper
         init.constant_(self.conv_out.bias, 0.)
 
     def forward(self, x):
@@ -67,7 +58,6 @@ class P2RHead(nn.Module):
         out = self.conv_out(h)
         out = self.pixel_shuffle(out)
 
-        # ✅ Converte il log-scale in scala positiva
         scale = torch.exp(self.log_scale)
         out = torch.relu(out) * scale
 

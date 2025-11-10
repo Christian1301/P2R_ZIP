@@ -4,15 +4,15 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-from models.p2r_zip_model import P2RZIPModel  # il file principale della pipeline
-from utils import load_checkpoint  # se usi la tua funzione di caricamento
+from models.p2r_zip_model import P2RZIPModel 
+from utils import load_checkpoint
 
 # ===============================
 # PARAMETRI DI BASE
 # ===============================
-IMG_PATH = "demo/example.jpg"     # immagine di test
-CHECKPOINT = "checkpoints/best.pth"  # pesi addestrati
-TAU = 0.6                         # soglia per mascheramento
+IMG_PATH = "demo/example.jpg"     
+CHECKPOINT = "checkpoints/best.pth"
+TAU_VALUES = [0.2, 0.4, 0.6, 0.8]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ===============================
@@ -42,29 +42,43 @@ pi_map = pi_map.squeeze().cpu().numpy()
 density_map = density_map.squeeze().cpu().numpy()
 
 # ===============================
-# POST-PROCESSING
+# POST-PROCESSING & VISUALIZZAZIONE
 # ===============================
-mask = (pi_map < TAU).astype(np.float32)
-filtered_density = density_map * mask
-count_estimate = filtered_density.sum()
+results = []
+for tau in TAU_VALUES:
+    mask = (pi_map < tau).astype(np.float32)
+    filtered_density = density_map * mask
+    count_estimate = float(filtered_density.sum())
+    results.append((tau, mask, filtered_density, count_estimate))
 
-# ===============================
-# VISUALIZZAZIONE
-# ===============================
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+cols = len(results) + 1
+fig, axes = plt.subplots(2, cols, figsize=(4 * cols, 8))
+
+# Colonna iniziale: immagine e π-map
 axes[0, 0].imshow(img_rgb)
 axes[0, 0].set_title("Input Image")
+axes[0, 0].axis("off")
 
-axes[0, 1].imshow(pi_map, cmap='inferno')
-axes[0, 1].set_title(f"ZIP π-map (probabilità di background)")
+im_pi = axes[1, 0].imshow(pi_map, cmap="inferno")
+axes[1, 0].set_title("ZIP π-map (probabilità di background)")
+axes[1, 0].axis("off")
+fig.colorbar(im_pi, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-axes[1, 0].imshow(mask, cmap='gray')
-axes[1, 0].set_title(f"Maschera binaria (τ = {TAU})")
+for idx, (tau, mask, filtered, count_estimate) in enumerate(results, start=1):
+    ax_mask = axes[0, idx]
+    ax_mask.imshow(mask, cmap="gray", vmin=0, vmax=1)
+    ax_mask.set_title(f"Maschera (τ = {tau:.1f})")
+    ax_mask.axis("off")
 
-axes[1, 1].imshow(filtered_density, cmap='jet')
-axes[1, 1].set_title(f"Densità filtrata / Conteggio stimato = {count_estimate:.1f}")
+    ax_density = axes[1, idx]
+    im_density = ax_density.imshow(filtered, cmap="jet")
+    ax_density.set_title(f"Densità filtrata\nCount = {count_estimate:.1f}")
+    ax_density.axis("off")
+    fig.colorbar(im_density, ax=ax_density, fraction=0.046, pad=0.04)
 
 plt.tight_layout()
 plt.show()
 
-print(f"Conteggio stimato: {count_estimate:.1f} persone")
+print("Conteggi stimati per ciascuna soglia τ:")
+for tau, _, _, count_estimate in results:
+    print(f"  τ = {tau:.1f}: {count_estimate:.1f} persone")

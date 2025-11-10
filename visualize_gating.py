@@ -2,7 +2,7 @@ import argparse
 import os
 import random
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import cv2
 import matplotlib
@@ -24,6 +24,8 @@ DEFAULT_STAGE_FILES = {
     "stage2": "stage2_best.pth",
     "stage3": "stage3_best.pth",
 }
+
+DEFAULT_TAU_VALUES: List[float] = [0.2, 0.4, 0.6, 0.8]
 # --------------------
 
 
@@ -49,7 +51,6 @@ def resolve_checkpoint_path(config: dict, explicit_path: Optional[str], stage: s
     """Restituisce il percorso del checkpoint coerente con config e stage."""
     if explicit_path:
         return Path(explicit_path)
-
     out_dir = Path(config["EXP"]["OUT_DIR"]) / config["RUN_NAME"]
     filename = DEFAULT_STAGE_FILES.get(stage, DEFAULT_STAGE_FILES["stage3"])
     return out_dir / filename
@@ -62,7 +63,7 @@ def load_config(config_path: str) -> dict:
     return config
 
 def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
-    """Inizializza il modello P2R_ZIP."""
+    """Inizializza il modello P2R_ZIP coerente con lo stage selezionato."""
     dataset_name = config["DATASET"]
     bin_cfg = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
@@ -76,16 +77,12 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
     }
 
     upsample_flag = config["MODEL"].get("UPSAMPLE_TO_INPUT", False)
-    # Stage 2/3 hanno allenato la P2RHead su mappe downsample: forziamo False
-    if stage in {"stage2", "stage3"}:
-        if upsample_flag:
-            print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per coerenza con l'addestramento Stage 2/3.")
+    if stage in {"stage2", "stage3"} and upsample_flag:
+        print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per coerenza con l'addestramento Stage 2/3.")
         upsample_flag = False
 
     p2r_head_kwargs = config.get("P2R_HEAD", {})
 
-    # Nota: upsample_to_input=False è cruciale per Stage 2/3
-    # per far funzionare correttamente la P2RHead
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
@@ -96,8 +93,9 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
         zip_head_kwargs=zip_head_kwargs,
         p2r_head_kwargs=p2r_head_kwargs,
     ).to(device)
-    
+
     return model
+
 
 def load_checkpoint(model: P2R_ZIP_Model, checkpoint_path: Path, device: torch.device):
     """Carica i pesi del checkpoint nel modello."""
@@ -106,28 +104,26 @@ def load_checkpoint(model: P2R_ZIP_Model, checkpoint_path: Path, device: torch.d
 
     print(f"Caricamento checkpoint da: {checkpoint_path}")
     state_dict = torch.load(str(checkpoint_path), map_location=device)
-    
-    # Gestisce checkpoint salvati in formati diversi
+
     if "model" in state_dict:
         state_dict = state_dict["model"]
-        
-    # Carica i pesi (strict=False è più robusto se le architetture differiscono leggermente)
+
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
         print(f"Attenzione: caricamento non stretto (strict=False). Dettagli: {e}")
-    model.load_state_dict(state_dict, strict=False)
-    
+        model.load_state_dict(state_dict, strict=False)
+
     model.eval()
     print("Modello caricato in modalità valutazione (eval).")
+
 
 def get_random_sample(
     config: dict,
     sample_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, np.ndarray, Tuple[int, int], torch.Tensor, str]:
-    """Carica un campione (casuale o indicizzato) dal set di validazione."""
+    """Carica un campione (random o indicizzato) dal set di validazione."""
     data_cfg = config["DATA"]
-
     val_tf = build_transforms(data_cfg, is_train=False)
 
     DatasetClass = get_dataset(config["DATASET"])
@@ -152,6 +148,7 @@ def get_random_sample(
         if not (0 <= sample_index < len(val_set)):
             raise ValueError(f"Indice {sample_index} fuori dal range [0, {len(val_set) - 1}].")
         idx = sample_index
+
     sample = val_set[idx]
 
     if isinstance(sample, dict):
@@ -171,26 +168,26 @@ def get_random_sample(
     if original_img is None:
         original_img = denormalize_tensor(img_tensor)
     original_shape = original_img.shape[:2]
+
     if points_tensor is None:
         points_tensor = torch.zeros((0, 2))
     elif not isinstance(points_tensor, torch.Tensor):
         points_tensor = torch.as_tensor(points_tensor)
-    points_tensor = points_tensor.cpu()
 
-    return img_tensor, original_img, original_shape, points_tensor, img_path
+    return img_tensor, original_img, original_shape, points_tensor.cpu(), img_path
+
 
 def denormalize_tensor(tensor: torch.Tensor) -> np.ndarray:
-    """Converte un tensore normalizzato in un'immagine CV2."""
+    """Converte un tensore normalizzato in un'immagine BGR (CV2)."""
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
-    
-    img_np = tensor.cpu().numpy().transpose(1, 2, 0) # C, H, W -> H, W, C
+
+    img_np = tensor.cpu().numpy().transpose(1, 2, 0)
     img_np = (img_np * std + mean) * 255.0
     img_np = np.clip(img_np, 0, 255).astype(np.uint8)
-    
-    # Converti RGB (Matplotlib) -> BGR (CV2)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    return img_bgr
+
+    return cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
 
 @torch.no_grad()
 def get_predictions(model: P2R_ZIP_Model, img_tensor: torch.Tensor) -> dict:
@@ -226,64 +223,65 @@ def visualize_results(
     img_path: str,
     stage_label: str,
     output_path: Optional[str] = None,
+    tau_results: Optional[List[dict]] = None,
+    show_log: bool = True,
 ):
-    """Visualizza o salva i risultati usando Matplotlib, indicando lo stage analizzato."""
-    
-    # Converte l'originale BGR (CV2) in RGB (Matplotlib)
+    """Visualizza le mappe principali e le versioni filtrate per diverse soglie τ."""
+
+    tau_results = tau_results or []
+
     original_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
-    
-    # Riporta le mappe alla dimensione originale per confronto visivo
     h, w = original_shape
     zip_map_resized = cv2.resize(zip_map, (w, h), interpolation=cv2.INTER_LINEAR)
     p2r_map_resized = cv2.resize(p2r_map, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # Normalizzazioni per la visualizzazione
     p2r_linear_norm = cv2.normalize(p2r_map_resized, None, 0, 1, cv2.NORM_MINMAX)
     p2r_log_norm = cv2.normalize(np.log1p(p2r_map_resized), None, 0, 1, cv2.NORM_MINMAX)
 
-    # Crea la figura (aggiungiamo la vista logaritmica)
-    fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+    cols = max(2, len(tau_results) + 2)
+    fig, axes = plt.subplots(2, cols, figsize=(5 * cols, 8))
     down_h, down_w = downsample
-    fig.suptitle(
-        f"Visualizzazione Gating P2R-ZIP — {stage_label.upper()}",
-        fontsize=16,
-    )
+    fig.suptitle(f"Visualizzazione Gating P2R-ZIP — {stage_label.upper()}", fontsize=16)
 
-    # 1. Immagine Originale
-    axes[0].imshow(original_rgb)
-    axes[0].set_title("Immagine Originale")
-    axes[0].axis('off')
+    # --- Riga superiore ---
+    axes[0, 0].imshow(original_rgb)
+    axes[0, 0].set_title("Immagine Originale")
+    axes[0, 0].axis("off")
 
-    # 2. Maschera di Rilevanza (ZIP Head)
-    im1 = axes[1].imshow(zip_map_resized, cmap='viridis', vmin=0, vmax=1)
-    axes[1].set_title("Maschera Rilevanza ZIP (π_not_zero)")
-    axes[1].axis('off')
-    fig.colorbar(im1, ax=axes[1], orientation='vertical', fraction=0.046, pad=0.04)
+    im_zip = axes[0, 1].imshow(zip_map_resized, cmap="viridis", vmin=0, vmax=1)
+    axes[0, 1].set_title("Maschera Rilevanza ZIP")
+    axes[0, 1].axis("off")
+    fig.colorbar(im_zip, ax=axes[0, 1], orientation="vertical", fraction=0.046, pad=0.04)
 
-    # 3. Sovrapposizione Maschera
-    axes[2].imshow(original_rgb)
-    axes[2].imshow(zip_map_resized, cmap='jet', alpha=0.4, vmin=0, vmax=1)
-    axes[2].set_title("Originale + Maschera ZIP")
-    axes[2].axis('off')
+    for idx, res in enumerate(tau_results, start=2):
+        axes[0, idx].imshow(res["mask_original"], cmap="gray", vmin=0, vmax=1)
+        axes[0, idx].set_title(f"Maschera τ = {res['tau']:.1f}")
+        axes[0, idx].axis("off")
 
-    # 4. Densità Finale (P2R Head)
-    im3 = axes[3].imshow(p2r_linear_norm, cmap='jet')
-    axes[3].set_title(
-        "Densità P2R (lineare)\n"
-        f"Count pred: {pred_count:.1f} | GT: {gt_count:.1f}"
-    )
-    axes[3].axis('off')
-    fig.colorbar(im3, ax=axes[3], orientation='vertical', fraction=0.046, pad=0.04)
+    # --- Riga inferiore ---
+    im_p2r = axes[1, 0].imshow(p2r_linear_norm, cmap="jet")
+    axes[1, 0].set_title(f"Densità P2R (lineare)\nCount tot = {pred_count:.1f} | GT = {gt_count:.1f}")
+    axes[1, 0].axis("off")
+    fig.colorbar(im_p2r, ax=axes[1, 0], orientation="vertical", fraction=0.046, pad=0.04)
 
-    # log1p comprime il range dinamico (log(1+x)) così le code della densità
-    # sono leggibili senza saturare le aree a bassa intensità
-    im4 = axes[4].imshow(p2r_log_norm, cmap='jet')
-    axes[4].set_title(
-        "Densità P2R (log1p)\n"
-        f"down=({down_h:.1f},{down_w:.1f})"
-    )
-    axes[4].axis('off')
-    fig.colorbar(im4, ax=axes[4], orientation='vertical', fraction=0.046, pad=0.04)
+    if show_log:
+        im_log = axes[1, 1].imshow(p2r_log_norm, cmap="jet")
+        axes[1, 1].set_title(f"Densità P2R (log1p)\ndown=({down_h:.1f},{down_w:.1f})")
+        axes[1, 1].axis("off")
+        fig.colorbar(im_log, ax=axes[1, 1], orientation="vertical", fraction=0.046, pad=0.04)
+    else:
+        axes[1, 1].imshow(original_rgb)
+        axes[1, 1].imshow(zip_map_resized, cmap="jet", alpha=0.4, vmin=0, vmax=1)
+        axes[1, 1].set_title("Originale + ZIP")
+        axes[1, 1].axis("off")
+
+    for idx, res in enumerate(tau_results, start=2):
+        filt_resized = cv2.resize(res["filtered_density"], (w, h), interpolation=cv2.INTER_LINEAR)
+        filt_norm = cv2.normalize(filt_resized, None, 0, 1, cv2.NORM_MINMAX)
+        im_tau = axes[1, idx].imshow(filt_norm, cmap="jet")
+        axes[1, idx].set_title(f"Densità τ = {res['tau']:.1f}\nCount = {res['count']:.1f}")
+        axes[1, idx].axis("off")
+        fig.colorbar(im_tau, ax=axes[1, idx], orientation="vertical", fraction=0.046, pad=0.04)
 
     plt.tight_layout()
 
@@ -316,6 +314,10 @@ if __name__ == "__main__":
                         help="Seed per la selezione casuale del campione.")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="Percorso del file immagine da salvare (default: auto in headless).")
+    parser.add_argument("--taus", type=float, nargs="+", default=DEFAULT_TAU_VALUES,
+                        help="Elenco di soglie τ da applicare alla maschera ZIP (default: 0.2 0.4 0.6 0.8).")
+    parser.add_argument("--no-log", action="store_true",
+                        help="Disattiva la visualizzazione logaritmica della densità P2R.")
     args = parser.parse_args()
     
     try:
@@ -370,6 +372,24 @@ if __name__ == "__main__":
     if zip_density_map is not None:
         zip_pred_count = float(zip_density_map.sum())
 
+    tau_results: List[dict] = []
+    zip_map = maps["zip_relevance_map"]
+    tau_values = [float(t) for t in (args.taus or [])]
+    for tau in tau_values:
+        mask_zip = (zip_map >= tau).astype(np.float32)
+        mask_original = cv2.resize(mask_zip, (original_shape[1], original_shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask_density = cv2.resize(mask_zip, (W_out, H_out), interpolation=cv2.INTER_NEAREST)
+        filtered_density = p2r_map * mask_density
+        filtered_count = float(filtered_density.sum())
+        if not (H_out == H_in and W_out == W_in):
+            filtered_count /= (down_h * down_w)
+        tau_results.append({
+            "tau": tau,
+            "mask_original": mask_original,
+            "filtered_density": filtered_density,
+            "count": filtered_count,
+        })
+
     print(
         f"Conteggi P2R: pred={pred_count:.2f}, gt={gt_count:.2f}, down=({down_h:.2f},{down_w:.2f}), "
         f"H_outxW_out={H_out}x{W_out}, H_inxW_in={H_in}x{W_in}"
@@ -381,10 +401,15 @@ if __name__ == "__main__":
         diff = pred_count - gt_count
         print(f"Delta pred-gt = {diff:+.2f} (rel {diff / max(gt_count, 1e-6):+.2%})")
 
+    if tau_results:
+        print("Conteggi filtrati per soglie τ:")
+        for res in tau_results:
+            print(f"  τ = {res['tau']:.1f}: {res['count']:.2f} persone")
+
     # 8. Visualizza
     visualize_results(
         original_img,
-        maps["zip_relevance_map"],
+        zip_map,
         p2r_map,
         original_shape,
         pred_count,
@@ -393,4 +418,6 @@ if __name__ == "__main__":
         img_path,
         stage_label,
         output_path=args.output,
+        tau_results=tau_results,
+        show_log=not args.no_log,
     )

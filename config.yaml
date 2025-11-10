@@ -2,8 +2,8 @@
 # CONFIGURAZIONE FINALE P2R + ZIP
 # ========================================
 
-RUN_NAME: "shha_test" # Aggiorna il nome per riflettere le modifiche
-SEED: 2024
+RUN_NAME: "shha_test" 
+SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
@@ -32,7 +32,7 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
   LAMBDA_NOISE_STD: 0.0
 
-# === STAGE 1: ZIP TRAINING (Allineato a config ZIP ufficiale) ===
+# === STAGE 1: ZIP TRAINING  ===
 OPTIM_ZIP:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
@@ -58,7 +58,7 @@ ZIP_REG:
   LAMBDA_TARGET: 3.0
   LAMBDA_WEIGHT: 2.5e-4
 
-# === STAGE 2: P2R TRAINING (Mantiene Cosine, LR differenziato opzionale) ===
+# === STAGE 2: P2R TRAINING ===
 OPTIM_P2R:
   BATCH_SIZE: 16 
   NUM_WORKERS: 4
@@ -85,7 +85,7 @@ P2R_LOSS:
   LOG_SCALE_CALIBRATION_MAX_DELTA: 8.0
   CALIBRATE_BATCHES: 10
 
-# === STAGE 3: JOINT TRAINING (Mantiene Cosine, LR differenziati) ===
+# === STAGE 3: JOINT TRAINING ===
 OPTIM_JOINT:
   BATCH_SIZE: 8 
   NUM_WORKERS: 4
@@ -109,7 +109,6 @@ JOINT_LOSS:
   COUNT_L1_W: 0.1
 
 # === BIN CONFIGURATION ===
-# Assicurati che questi siano identici a configs/bin_config.json
 BINS_CONFIG:
   shha:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 12], [13, 14], [15, 9999]]

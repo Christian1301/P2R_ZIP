@@ -354,6 +354,29 @@ def main():
         collate_fn=collate_joint,
     )
 
+    # --- Calibrazione iniziale opzionale ---
+    calibrate_batches_cfg = loss_cfg.get("CALIBRATE_BATCHES", 10)
+    calibrate_max_batches = None
+    if calibrate_batches_cfg is not None:
+        try:
+            calibrate_batches_val = int(calibrate_batches_cfg)
+            if calibrate_batches_val > 0:
+                calibrate_max_batches = calibrate_batches_val
+        except (TypeError, ValueError):
+            calibrate_max_batches = None
+
+    if hasattr(model, "p2r_head") and hasattr(model.p2r_head, "log_scale"):
+        print("🔧 Calibrazione iniziale Stage 3...")
+        calibrate_density_scale(
+            model,
+            calibrate_loader,
+            device,
+            default_down,
+            max_batches=calibrate_max_batches,
+            clamp_range=clamp_cfg,
+            max_adjust=max_adjust,
+        )
+
     # === TRAINING LOOP ===
     best_mae = float("inf")
     best_epoch = 0

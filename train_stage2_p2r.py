@@ -397,7 +397,7 @@ def main():
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}", dens_scale=f"{ds_val:.6f}")
             else:
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}")
-ì
+
         if scheduler:
             scheduler.step()
 

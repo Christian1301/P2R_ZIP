@@ -76,6 +76,7 @@ def train_one_epoch(
     device,
     default_down,
     clamp_cfg=None,
+    zip_scale: float = 1.0,
 ):
     model.train()
     total_loss = 0.0
@@ -87,7 +88,9 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         outputs = model(images)
-        loss_zip, loss_dict_zip = criterion_zip(outputs, gt_density)
+        loss_zip, _ = criterion_zip(outputs, gt_density)
+        scaled_loss_zip = loss_zip * zip_scale
+
         pred_density = outputs["p2r_density"]
         _, _, h_in, w_in = images.shape
         pred_density, down_tuple, _ = canonicalize_p2r_grid(
@@ -95,7 +98,7 @@ def train_one_epoch(
         )
 
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
-        combined_loss = loss_zip + alpha * loss_p2r
+        combined_loss = scaled_loss_zip + alpha * loss_p2r
         combined_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -111,11 +114,12 @@ def train_one_epoch(
             model.p2r_head.log_scale.data.clamp_(min_val, max_val)
 
         total_loss += combined_loss.item()
+        current_lr = max(group['lr'] for group in optimizer.param_groups)
         progress_bar.set_postfix({
             "total": f"{combined_loss.item():.4f}",
-            "zip": f"{loss_zip.item():.4f}",
+            "zip": f"{scaled_loss_zip.item():.4f}",
             "p2r": f"{loss_p2r.item():.4f}",
-            "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
+            "lr": f"{current_lr:.6f}"
         })
 
     return total_loss / len(dataloader)
@@ -249,7 +253,8 @@ def main():
     if "MAX_RADIUS" in loss_cfg:
         loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
     criterion_p2r = P2RLoss(**loss_kwargs).to(device)
-    alpha = config["JOINT_LOSS"]["ALPHA"]
+    alpha = float(config["JOINT_LOSS"]["ALPHA"])
+    zip_scale = float(config["JOINT_LOSS"].get("ZIP_SCALE", 1.0))
 
     param_groups = [
         {'params': model.backbone.parameters(), 'lr': optim_cfg["LR_BACKBONE"]},
@@ -274,20 +279,21 @@ def main():
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
     data_cfg = config["DATA"]
-    shared_transforms = build_transforms(data_cfg, is_train=False)
+    train_transforms = build_transforms(data_cfg, is_train=True)
+    val_transforms = build_transforms(data_cfg, is_train=False)
 
     DatasetClass = get_dataset(config["DATASET"])
     train_dataset = DatasetClass(
         root=data_cfg["ROOT"],
         split=data_cfg["TRAIN_SPLIT"],
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=shared_transforms,
+        transforms=train_transforms,
     )
     val_dataset = DatasetClass(
         root=data_cfg["ROOT"],
         split=data_cfg["VAL_SPLIT"],
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=shared_transforms,
+        transforms=val_transforms,
     )
 
     train_loader = DataLoader(
@@ -363,6 +369,7 @@ def main():
             device,
             default_down,
             clamp_cfg=clamp_cfg,
+            zip_scale=zip_scale,
         )
 
         if scheduler and schedule_step_mode == "epoch":

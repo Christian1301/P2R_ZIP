@@ -1,17 +1,17 @@
 # evaluate_stage1_diagnostics.py
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 import os
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, collate_fn
+from train_utils import init_seeds, collate_fn, load_config
 
 
 @torch.no_grad()
@@ -155,11 +155,18 @@ def main(config, checkpoint_path):
     )
     validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate Stage 1 (ZIP)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path; defaults to RUN_NAME best.")
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    with open("config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
+    args = parse_args()
+    config = load_config(args.config)
 
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
-    CHECKPOINT_PATH = os.path.join(output_dir, "best_model.pth")
+    checkpoint_path = args.checkpoint or os.path.join(output_dir, "best_model.pth")
 
-    main(config, CHECKPOINT_PATH)
+    main(config, checkpoint_path)

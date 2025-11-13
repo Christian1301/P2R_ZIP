@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
+import argparse
 import os
-import yaml
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,7 +14,7 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
-    save_checkpoint, canonicalize_p2r_grid
+    save_checkpoint, canonicalize_p2r_grid, load_config
 )
 from train_stage2_p2r import calibrate_density_scale
 import torch.nn.functional as F
@@ -161,9 +161,14 @@ def validate(model, dataloader, device, default_down):
     rmse = np.sqrt(mse / n)
     return mae, rmse, total_pred, total_gt
 
-def main():
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 3 (Joint)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    config = load_config(config_path)
 
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
@@ -435,4 +440,5 @@ def main():
     print(f"✅ Stage 3 completato con successo! Miglior MAE {best_mae:.2f} (epoch {best_epoch}).")
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

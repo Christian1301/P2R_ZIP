@@ -15,7 +15,7 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 
-CONFIG_PATH = "config.yaml"
+DEFAULT_CONFIG_PATH = "config.yaml"
 
 DEFAULT_STAGE_FILES = {
     "stage1": "best_model.pth",
@@ -293,6 +293,8 @@ if __name__ == "__main__":
     os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE" 
 
     parser = argparse.ArgumentParser(description="Visualizza le mappe di gating P2R-ZIP.")
+    parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH,
+                        help="Percorso del file di configurazione (default: config.yaml).")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Percorso del checkpoint da caricare. Se omesso usa RUN_NAME/OUT_DIR da config.")
     parser.add_argument("--stage", type=str, default="stage3",
@@ -319,7 +321,7 @@ if __name__ == "__main__":
         random.seed(args.seed)
         torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = load_config(CONFIG_PATH)
+    config = load_config(args.config)
     checkpoint_path = resolve_checkpoint_path(config, args.checkpoint, stage_label)
     model = get_model(config, device, stage_label)
     try:

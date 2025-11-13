@@ -1,27 +1,37 @@
 #!/bin/bash
-set -e  
-mkdir -p logs
+set -euo pipefail
 
-echo "🚀 Avvio Stage 1 (ZIP)..."
-python3 train_stage1_zip.py  > logs/stage1.log 2>&1
-echo "✅ Stage 1 completato!"
+run_pipeline() {
+	local tag="$1"
+	local config_path="$2"
 
-echo "🚀 Avvio Stage 2 (P2R)..."
-python3 train_stage2_p2r.py  > logs/stage2.log 2>&1
-echo "✅ Stage 2 completato!"
+	local log_dir="logs/${tag}"
+	rm -rf "${log_dir}"
+	mkdir -p "${log_dir}"
 
-echo "🚀 Avvio Stage 3 (JOINT)..."
-python3 train_stage3_joint.py  > logs/stage3.log 2>&1
-echo "✅ Tutti gli stadi completati!"
+	echo "[${tag}] Stage 1 → ZIP"
+	python3 train_stage1_zip.py --config "${config_path}" > "${log_dir}/stage1.log" 2>&1
+	echo "[${tag}] Stage 1 completato"
 
-python3 evaluate_stage1.py > logs/ev_stage1.log 2>&1
-echo "✅ Valutazione 1 completata!"
+	echo "[${tag}] Stage 2 → P2R"
+	python3 train_stage2_p2r.py --config "${config_path}" > "${log_dir}/stage2.log" 2>&1
+	echo "[${tag}] Stage 2 completato"
 
-python3 evaluate_stage2.py > logs/ev_stage2.log 2>&1
-echo "✅ Valutazione 2 completata!"
+	echo "[${tag}] Stage 3 → Joint"
+	python3 train_stage3_joint.py --config "${config_path}" > "${log_dir}/stage3.log" 2>&1
+	echo "[${tag}] Stage 3 completato"
 
-python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
-echo "✅ Valutazione 3 completata!"
+	python3 evaluate_stage1.py --config "${config_path}" > "${log_dir}/ev_stage1.log" 2>&1
+	echo "[${tag}] Eval Stage 1 completata"
 
-python3 visualize_gating.py > logs/visualize_gating.log 2>&1
-echo "✅ Visualizzazione completata!"
+	python3 evaluate_stage2.py --config "${config_path}" > "${log_dir}/ev_stage2.log" 2>&1
+	echo "[${tag}] Eval Stage 2 completata"
+
+	python3 evaluate_stage3.py --config "${config_path}" > "${log_dir}/ev_stage3.log" 2>&1
+	echo "[${tag}] Eval Stage 3 completata"
+
+	python3 visualize_gating.py --config "${config_path}" > "${log_dir}/visualize_gating.log" 2>&1 || echo "[${tag}] Visualize fallito (considera esecuzione interattiva)"
+}
+
+run_pipeline "shha" "config.yaml"
+run_pipeline "shhb" "config_shhb.yaml"

@@ -1,17 +1,17 @@
 # P2R_ZIP/train_stage1_zip.py
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 import os
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn
+from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn, load_config
 
 def zip_regularization(
     preds,
@@ -101,9 +101,14 @@ def validate(model, criterion, dataloader, device):
     avg_rmse = (mse / len(dataloader.dataset)) ** 0.5
     return avg_loss, avg_mae, avg_rmse
 
-def main():
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 1 (ZIP)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    config = load_config(config_path)
 
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
@@ -143,6 +148,10 @@ def main():
     optim_cfg = config["OPTIM_ZIP"]
     lr_head = optim_cfg.get("LR", optim_cfg.get("BASE_LR", 5e-5))
     lr_backbone = optim_cfg.get("LR_BACKBONE", optim_cfg.get("BACKBONE_LR", lr_head * 0.5))
+    clip_grad = optim_cfg.get("CLIP_GRAD_NORM", 1.0)
+    val_interval = optim_cfg.get("VAL_INTERVAL", 5)
+    early_stop_patience = optim_cfg.get("EARLY_STOPPING_PATIENCE")
+    resume_training = optim_cfg.get("RESUME_LAST", True)
 
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = [p for p in model.zip_head.parameters() if p.requires_grad]
@@ -190,7 +199,11 @@ def main():
     )
     out_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(out_dir, exist_ok=True)
-    start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
+    if resume_training:
+        start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
+    else:
+        print("ℹ️ Ripartenza da zero richiesta: si parte dall'epoch 1.")
+        start_epoch, best_mae = 1, float("inf")
     zip_reg_cfg = config.get("ZIP_REG", {})
     zip_reg_params = {
         "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),
@@ -199,10 +212,14 @@ def main():
         "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
     }
 
-    print(f"🚀 Inizio addestramento Stage 1 per {optim_cfg['EPOCHS']} epoche...")
+    max_epochs = optim_cfg.get("EPOCHS", 1300)
+    no_improve_count = 0
+    stop_training = False
 
-    for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
-        print(f"\n--- Epoch {epoch}/{optim_cfg['EPOCHS']} ---")
+    print(f"🚀 Inizio addestramento Stage 1 per {max_epochs} epoche...")
+
+    for epoch in range(start_epoch, max_epochs + 1):
+        print(f"\n--- Epoch {epoch}/{max_epochs} ---")
         train_loss = train_one_epoch(
             model,
             criterion,
@@ -211,9 +228,12 @@ def main():
             scheduler,
             device,
             zip_reg_params,
+            clip_grad_norm=clip_grad,
         )
 
-        if epoch % optim_cfg["VAL_INTERVAL"] == 0 or epoch == optim_cfg["EPOCHS"]:
+        should_validate = (epoch % val_interval == 0) or (epoch == max_epochs)
+
+        if should_validate:
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)
             print(f"Val → Loss {val_loss:.4f}, MAE {val_mae:.2f}, RMSE {val_rmse:.2f}")
 
@@ -224,9 +244,19 @@ def main():
             save_checkpoint(model, optimizer, epoch, val_mae, best_mae, out_dir, is_best=is_best)
             if is_best:
                 print(f"✅ Saved new best model (MAE={best_mae:.2f})")
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+                if early_stop_patience and no_improve_count >= early_stop_patience:
+                    print(f"🛑 Early stopping: nessun miglioramento per {no_improve_count} validazioni consecutive.")
+                    stop_training = True
+
+        if stop_training:
+            break
 
     print("✅ Addestramento Stage 1 completato.")
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

@@ -7,6 +7,13 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR, MultiStepLR
 import torch.nn.functional as F
 import warnings
+import yaml
+
+
+def load_config(config_path: str):
+    """Load a YAML configuration file from disk."""
+    with open(config_path, "r") as handle:
+        return yaml.safe_load(handle)
 
 
 def init_seeds(seed=42):

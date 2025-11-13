@@ -1,15 +1,15 @@
 # ========================================
-# CONFIGURAZIONE FINALE P2R + ZIP
+# CONFIGURAZIONE FINALE P2R + ZIP (ShanghaiTech Part B)
 # ========================================
 
-RUN_NAME: "shha_test" 
+RUN_NAME: "shhb_test" 
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "shha"
+DATASET: "shhb"
 DATA:
-  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
+  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_B"
   ZIP_BLOCK_SIZE: 16
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]

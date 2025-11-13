@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-import os, yaml, numpy as np, torch
+import argparse
+import os
+import numpy as np
+import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -11,7 +14,7 @@ from losses.p2r_region_loss import P2RLoss
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
     resume_if_exists, save_checkpoint, setup_experiment, collate_fn,
-    canonicalize_p2r_grid,
+    canonicalize_p2r_grid, load_config,
 )
 
 @torch.no_grad()
@@ -182,9 +185,14 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
     return avg_loss, mae, rmse, total_pred, total_gt
 
-def main():
-    with open("config.yaml", 'r') as f:
-        cfg = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 2 (P2R)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    cfg = load_config(config_path)
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
     print(f"✅ Avvio Stage 2 (P2R Training) su {device}")
@@ -488,4 +496,5 @@ def main():
     print("✅ Stage 2 completato.")
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

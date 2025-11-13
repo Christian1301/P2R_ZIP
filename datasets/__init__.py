@@ -8,6 +8,7 @@ def get_dataset(name):
     name = name.lower()
     if name == "jhu": return JHU_Crowd
     if name == "shha": return SHHA
+    if name == "shhb": return SHHA
     if name == "ucf": return UCF_QNRF
     if name == "nwpu": return NWPU
     raise ValueError(f"Dataset {name} non riconosciuto.")

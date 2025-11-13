@@ -5,8 +5,9 @@ Replica la validazione usata durante il training con diagnostica opzionale
 su pi/lambda della ZIP head e metriche MAE/RMSE sulla densità P2R.
 """
 
+import argparse
 import os
-import yaml
+from typing import Optional
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, canonicalize_p2r_grid
+from train_utils import init_seeds, canonicalize_p2r_grid, load_config
 
 def _round_up_8(x: int) -> int:
     return (x + 7) // 8 * 8
@@ -122,9 +123,15 @@ def evaluate_joint(model, dataloader, device, default_down):
     print("=====================================\n")
 
 
-def main():
-    with open("config.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate Stage 3 (Joint)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path for evaluation.")
+    return parser.parse_args()
+
+
+def main(config_path: str, checkpoint_override: Optional[str] = None):
+    cfg = load_config(config_path)
 
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
@@ -157,11 +164,14 @@ def main():
     ).to(device)
 
     ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    ckpt_path = os.path.join(ckpt_dir, "stage3_best.pth")
-    if not os.path.exists(ckpt_path):
-        alt = os.path.join(ckpt_dir, "stage3", "last.pth")
-        if os.path.exists(alt):
-            ckpt_path = alt
+    if checkpoint_override:
+        ckpt_path = checkpoint_override
+    else:
+        ckpt_path = os.path.join(ckpt_dir, "stage3_best.pth")
+        if not os.path.exists(ckpt_path):
+            alt = os.path.join(ckpt_dir, "stage3", "last.pth")
+            if os.path.exists(alt):
+                ckpt_path = alt
     if not os.path.exists(ckpt_path):
         print("❌ Nessun checkpoint Stage 3 trovato.")
         return
@@ -201,4 +211,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config, args.checkpoint)

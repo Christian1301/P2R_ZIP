@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+import argparse
 import os
-import yaml
+from typing import Optional
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -10,7 +11,7 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLoss
-from train_utils import collate_fn, init_seeds
+from train_utils import collate_fn, init_seeds, load_config
 from train_stage2_p2r import calibrate_density_scale
 
 
@@ -93,9 +94,15 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
     return avg_loss, mae, rmse, total_pred, total_gt
 
 
-def main():
-    with open("config.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate Stage 2 (P2R)")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
+    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path to evaluate.")
+    return parser.parse_args()
+
+
+def main(config_path: str, checkpoint_override: Optional[str] = None):
+    cfg = load_config(config_path)
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
     print(f"✅ Avvio valutazione Stage 2 su {device}")
@@ -137,9 +144,12 @@ def main():
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
     ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    ckpt_path = os.path.join(ckpt_dir, "stage2_best.pth")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
+    if checkpoint_override:
+        ckpt_path = checkpoint_override
+    else:
+        ckpt_path = os.path.join(ckpt_dir, "stage2_best.pth")
+        if not os.path.exists(ckpt_path):
+            ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
     if not os.path.exists(ckpt_path):
         print("❌ Nessun checkpoint Stage 2 trovato.")
         return
@@ -178,4 +188,5 @@ def main():
     evaluate_p2r(model, val_loader, loss_fn, device, cfg)
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config, args.checkpoint)

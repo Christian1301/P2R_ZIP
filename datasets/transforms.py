@@ -134,14 +134,18 @@ class ImageOnlyTransform(object):
         img = self.transform(img)
         return img, pts, den
 
-def build_transforms(cfg_data, is_train=True):
+def build_transforms(cfg_data, is_train=True, override_crop_size=None, override_crop_scale=None):
     """Costruisce la pipeline di trasformazioni con l'ordine corretto."""
     mean = cfg_data['NORM_MEAN']
     std = cfg_data['NORM_STD']
 
     if is_train:
-        crop_size = cfg_data.get('CROP_SIZE', 256)
-        crop_scale_cfg = cfg_data.get('CROP_SCALE', (0.3, 1.0))
+        crop_size = override_crop_size if override_crop_size is not None else cfg_data.get('CROP_SIZE', 256)
+
+        if override_crop_scale is not None:
+            crop_scale_cfg = override_crop_scale
+        else:
+            crop_scale_cfg = cfg_data.get('CROP_SCALE', (0.3, 1.0))
         try:
             crop_scale = (float(crop_scale_cfg[0]), float(crop_scale_cfg[1]))
         except (TypeError, ValueError, IndexError):

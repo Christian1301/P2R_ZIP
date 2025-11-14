@@ -7,6 +7,8 @@ SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
+# NOTA: CROP_SIZE è impostato a 448 per lo Stage 1 (ZIP).
+# DEVE ESSERE CAMBIATO A 256 per lo Stage 2 (P2R).
 DATASET: "shhb"
 DATA:
   ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_B"
@@ -15,14 +17,18 @@ DATA:
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train_data"
-  VAL_SPLIT: "val_data"
-  CROP_SIZE: 256 
-  CROP_SCALE: [0.5, 1.0]
+  VAL_SPLIT: "test_data" # NB: Nel tuo file originale SHHA qui era 'val_data'
+  CROP_SIZE: 256
+  CROP_SCALE: [0.75, 2.5]
+  CROP_SIZE_STAGE1: 448
+  CROP_SCALE_STAGE1: [0.75, 2.5]
+  CROP_SIZE_STAGE2: 256
+  CROP_SCALE_STAGE2: [0.75, 2.5]
 
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn" 
-  ZIP_PI_THRESH: 0.5
+  ZIP_PI_THRESH: 0.3
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 
@@ -34,7 +40,7 @@ ZIP_HEAD:
 
 # === STAGE 1: ZIP TRAINING  ===
 OPTIM_ZIP:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 8 # MODIFICATO (da 4) - Allineato a shb.yaml
   NUM_WORKERS: 4
   EPOCHS: 1300 
   WEIGHT_DECAY: 1.0e-4
@@ -46,8 +52,8 @@ OPTIM_ZIP:
   SAVE_BEST: true
   EARLY_STOPPING_PATIENCE: 200
   CLIP_GRAD_NORM: 1.0
-  BASE_LR: 2.0e-5
-  LR_BACKBONE: 5.0e-6
+  BASE_LR: 1.0e-4 # MODIFICATO (da 2.0e-5) - Allineato a shb.yaml
+  LR_BACKBONE: 1.0e-4 # MODIFICATO (da 5.0e-6) - Allineato a shb.yaml
 
 ZIP_LOSS:
   WEIGHT_CE: 3.0
@@ -55,18 +61,18 @@ ZIP_LOSS:
   WEIGHT_COUNT: 0.25
 
 ZIP_REG:
-  PI_TARGET: 0.06
-  PI_WEIGHT: 1.4e-3
-  LAMBDA_TARGET: 1.5
-  LAMBDA_WEIGHT: 1.8e-3
+  PI_TARGET: 0.18
+  PI_WEIGHT: 3.0e-3
+  LAMBDA_TARGET: 1.2
+  LAMBDA_WEIGHT: 2.5e-3
 
 # === STAGE 2: P2R TRAINING ===
 OPTIM_P2R:
   BATCH_SIZE: 16 
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 1.0e-4
-  LR_BACKBONE: 5.0e-6
+  LR: 5.0e-5 # MODIFICATO (da 1.0e-4) - Allineato a config.py
+  LR_BACKBONE: 1.0e-5 # MODIFICATO (da 5.0e-6) - Allineato a config.py
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine" 
   VAL_INTERVAL: 10
@@ -76,7 +82,7 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.12
+  SCALE_WEIGHT: 0.08
   POS_WEIGHT: 3.2
   CHUNK_SIZE: 2048
   MIN_RADIUS: 6.0
@@ -107,22 +113,16 @@ OPTIM_JOINT:
   SAVE_BEST: true
 
 JOINT_LOSS:
-  ALPHA: 2.0
+  ALPHA: 3.0
   COUNT_L1_W: 0.05
-  ZIP_SCALE: 0.6
+  ZIP_SCALE: 0.3
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:
-  shha:
-    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9], [10, 10], [11, 12], [13, 14], [15, 9999]]
-    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.38, 13.38, 16.26]
   shhb:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
     bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  qnrf:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-
+  
 EXP:
   OUT_DIR: "exp"
   SAVE_BEST: true

@@ -284,7 +284,20 @@ def main(config_path: str):
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
     data_cfg = config["DATA"]
-    train_transforms = build_transforms(data_cfg, is_train=True)
+    stage3_crop = data_cfg.get(
+        "CROP_SIZE_STAGE3",
+        data_cfg.get("CROP_SIZE_STAGE2", data_cfg.get("CROP_SIZE", 256)),
+    )
+    stage3_scale = data_cfg.get(
+        "CROP_SCALE_STAGE3",
+        data_cfg.get("CROP_SCALE_STAGE2", data_cfg.get("CROP_SCALE", (0.3, 1.0))),
+    )
+    train_transforms = build_transforms(
+        data_cfg,
+        is_train=True,
+        override_crop_size=stage3_crop,
+        override_crop_scale=stage3_scale,
+    )
     val_transforms = build_transforms(data_cfg, is_train=False)
 
     DatasetClass = get_dataset(config["DATASET"])

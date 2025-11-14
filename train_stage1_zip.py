@@ -165,7 +165,14 @@ def main(config_path: str):
     )
     scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg.get("EPOCHS", 1300))
     data_cfg = config["DATA"]
-    train_tf = build_transforms(data_cfg, is_train=True)
+    stage1_crop = data_cfg.get("CROP_SIZE_STAGE1", data_cfg.get("CROP_SIZE", 256))
+    stage1_scale = data_cfg.get("CROP_SCALE_STAGE1", data_cfg.get("CROP_SCALE", (0.3, 1.0)))
+    train_tf = build_transforms(
+        data_cfg,
+        is_train=True,
+        override_crop_size=stage1_crop,
+        override_crop_scale=stage1_scale,
+    )
     val_tf = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(config["DATASET"])
     train_set = DatasetClass(

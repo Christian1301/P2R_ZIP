@@ -85,6 +85,7 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
         backbone_name=config["MODEL"]["BACKBONE"],
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
+        pi_mode=config["MODEL"].get("ZIP_PI_MODE", "hard"),
         upsample_to_input=upsample_flag,
         zip_head_kwargs=zip_head_kwargs,
         p2r_head_kwargs=p2r_head_kwargs,

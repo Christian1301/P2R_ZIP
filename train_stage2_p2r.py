@@ -272,6 +272,7 @@ def main():
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
+        pi_mode=cfg["MODEL"].get("ZIP_PI_MODE", "hard"),
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
@@ -291,13 +292,21 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print(f"✅ Checkpoint Stage1 caricato da {zip_ckpt}")
 
-    # --- Congela solo la ZIPHead: backbone e P2RHead devono essere allenati nello Stage 2 ---
-    print("🧊 Congelo la ZIPHead; backbone e P2RHead restano addestrabili.")
+    # --- Congela ZIPHead + backbone (default Stage 2) ---
+    finetune_backbone = bool(optim_cfg.get("FINETUNE_BACKBONE", False))
+
+    print("🧊 Congelo la ZIPHead.")
     for p in model.zip_head.parameters():
         p.requires_grad = False
 
-    for p in model.backbone.parameters():
-        p.requires_grad = True
+    if finetune_backbone:
+        print("🔓 Fine-tuning del backbone ATTIVO per Stage 2 (usa solo in casi particolari).")
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+    else:
+        print("🧊 Backbone congelato per tutto lo Stage 2 (comportamento consigliato).")
+        for p in model.backbone.parameters():
+            p.requires_grad = False
 
     for p in model.p2r_head.parameters():
         p.requires_grad = True  # P2RHead sempre addestrabile
@@ -319,6 +328,7 @@ def main():
             head_params.append(param)
 
     params_to_train = []
+    backbone_group_idx = None
     if head_params:
         params_to_train.append({'params': head_params, 'lr': optim_cfg['LR']})
     if log_scale_params:
@@ -327,11 +337,17 @@ def main():
         print(f"ℹ️ LR log_scale ridotto di un fattore {lr_factor:.2f}")
 
     backbone_lr = optim_cfg.get("LR_BACKBONE")
-    if backbone_lr is not None:
+    if finetune_backbone:
+        if backbone_lr is None:
+            raise ValueError("FINETUNE_BACKBONE richiede di specificare LR_BACKBONE in OPTIM_P2R.")
         backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
         if backbone_params:
+            backbone_group_idx = len(params_to_train)
             params_to_train.append({'params': backbone_params, 'lr': float(backbone_lr)})
             print(f"ℹ️ Backbone fine-tuning attivo con LR {float(backbone_lr):.2e}")
+    else:
+        if backbone_lr is not None:
+            print("ℹ️ LR_BACKBONE impostato ma FINETUNE_BACKBONE=False: ignorato nello Stage 2.")
 
     opt = get_optimizer(params_to_train, optim_cfg)
     scheduler = get_scheduler(opt, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
@@ -459,8 +475,8 @@ def main():
         if writer:
             writer.add_scalar("train/loss_p2r", avg_train, ep)
             writer.add_scalar("lr/p2r_head", opt.param_groups[0]["lr"], ep)
-            if len(opt.param_groups) > 2:
-                writer.add_scalar("lr/backbone", opt.param_groups[-1]["lr"], ep)
+        if writer and backbone_group_idx is not None:
+            writer.add_scalar("lr/backbone", opt.param_groups[backbone_group_idx]["lr"], ep)
 
         # --- Validazione periodica ---
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:

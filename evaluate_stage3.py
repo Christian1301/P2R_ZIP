@@ -159,6 +159,7 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
+        pi_mode=cfg["MODEL"].get("ZIP_PI_MODE", "hard"),
         upsample_to_input=upsample_to_input,
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)

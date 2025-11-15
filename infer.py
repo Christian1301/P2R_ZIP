@@ -45,6 +45,7 @@ def main():
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
+        pi_mode=cfg["MODEL"].get("ZIP_PI_MODE", "hard"),
         upsample_to_input=cfg["MODEL"]["UPSAMPLE_TO_INPUT"],
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)

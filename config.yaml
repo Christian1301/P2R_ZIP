@@ -66,13 +66,14 @@ ZIP_REG:
 
 # === STAGE 2: P2R TRAINING ===
 OPTIM_P2R:
-  BATCH_SIZE: 16 
+  BATCH_SIZE: 16
   NUM_WORKERS: 4
   EPOCHS: 1500
   LR: 5.0e-5 # MODIFICATO (da 1.0e-4) - Allineato a config.py
+  FINETUNE_BACKBONE: false
   LR_BACKBONE: 1.0e-5 # MODIFICATO (da 5.0e-6) - Allineato a config.py
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine" 
+  SCHEDULER: "cosine"
   VAL_INTERVAL: 10
   RESUME_LAST: true
   SAVE_BEST: true

@@ -202,6 +202,7 @@ def main(config_path: str):
         backbone_name=config["MODEL"]["BACKBONE"],
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
+        pi_mode=config["MODEL"].get("ZIP_PI_MODE", "hard"),
         upsample_to_input=upsample_to_input,
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)

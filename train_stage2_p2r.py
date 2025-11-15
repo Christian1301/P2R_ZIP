@@ -291,19 +291,13 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print(f"✅ Checkpoint Stage1 caricato da {zip_ckpt}")
 
-    # --- Congela ZIPHead e sblocca l'ultimo blocco del backbone ---
-    print("🧊 Congelamento ZIPHead e sblocco parziale del backbone...")
+    # --- Congela solo la ZIPHead: backbone e P2RHead devono essere allenati nello Stage 2 ---
+    print("🧊 Congelo la ZIPHead; backbone e P2RHead restano addestrabili.")
     for p in model.zip_head.parameters():
         p.requires_grad = False
 
-    # Fissa tutto il backbone e poi riattiva l'ultimo blocco conv (layer >=34)
     for p in model.backbone.parameters():
-        p.requires_grad = False
-    if hasattr(model.backbone, "body"):
-        for idx, module in enumerate(model.backbone.body):
-            if idx >= 34:
-                for param in module.parameters():
-                    param.requires_grad = True
+        p.requires_grad = True
 
     for p in model.p2r_head.parameters():
         p.requires_grad = True  # P2RHead sempre addestrabile

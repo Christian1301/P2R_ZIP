@@ -260,6 +260,7 @@ def main():
     # --- Modello ---
     dataset_name = cfg["DATASET"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
+    model_cfg = cfg["MODEL"]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
     zip_head_kwargs = {
         "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
@@ -268,11 +269,30 @@ def main():
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
+    pi_thresh_target = float(model_cfg.get("ZIP_PI_THRESH", 0.15))
+    pi_thresh_start = float(model_cfg.get("ZIP_PI_THRESH_START", pi_thresh_target))
+    pi_thresh_warm_epochs = int(model_cfg.get("ZIP_PI_THRESH_WARMUP_EPOCHS", 0) or 0)
+    pi_thresh_schedule_enabled = pi_thresh_warm_epochs > 0 and abs(pi_thresh_target - pi_thresh_start) > 1e-6
+    if pi_thresh_schedule_enabled:
+        print(
+            f"ℹ️ Stage 2: annealing ZIP_PI_THRESH da {pi_thresh_start:.3f} a {pi_thresh_target:.3f} "
+            f"in {pi_thresh_warm_epochs} epoche."
+        )
+
+    def compute_pi_thresh(epoch: int) -> float:
+        if not pi_thresh_schedule_enabled:
+            return float(pi_thresh_target)
+        progress = (epoch - 1) / max(pi_thresh_warm_epochs - 1, 1)
+        progress = max(0.0, min(1.0, progress))
+        return float(pi_thresh_start + progress * (pi_thresh_target - pi_thresh_start))
+
+    initial_pi_thresh = pi_thresh_start if pi_thresh_schedule_enabled else pi_thresh_target
+
     model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
-        pi_mode=cfg["MODEL"].get("ZIP_PI_MODE", "hard"),
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=initial_pi_thresh,
+        gate=model_cfg["GATE"],
+        pi_mode=model_cfg.get("ZIP_PI_MODE", "hard"),
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
@@ -390,6 +410,10 @@ def main():
         start_ep, best_mae = 1, float("inf")
 
     # --- Calibrazione iniziale del conteggio ---
+    # Aggiorna la soglia di gating in base all'epoca di ripartenza
+    current_scheduled_thresh = compute_pi_thresh(start_ep)
+    model.pi_thresh = current_scheduled_thresh
+
     calibrate_batches_cfg = p2r_loss_cfg.get("CALIBRATE_BATCHES", 6)
     calibrate_max_batches = None
     if calibrate_batches_cfg is not None:
@@ -414,7 +438,26 @@ def main():
 
     # --- Training loop ---
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
+    prev_pi_thresh_value = None
+    last_thresh_log = None
     for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
+        scheduled_thresh = compute_pi_thresh(ep)
+        model.pi_thresh = scheduled_thresh
+        threshold_changed = prev_pi_thresh_value is None or abs(scheduled_thresh - prev_pi_thresh_value) > 1e-6
+        if pi_thresh_schedule_enabled and threshold_changed:
+            log_interval = max(1, pi_thresh_warm_epochs // 5) if pi_thresh_warm_epochs > 0 else 1
+            should_log = (
+                last_thresh_log is None
+                or ep == start_ep
+                or ep >= pi_thresh_warm_epochs
+                or (ep - start_ep) % log_interval == 0
+            )
+            if should_log:
+                print(f"ℹ️ Epoch {ep}: ZIP_PI_THRESH impostato a {scheduled_thresh:.4f}")
+                last_thresh_log = ep
+        prev_pi_thresh_value = scheduled_thresh
+        if writer:
+            writer.add_scalar("p2r_head/pi_thresh", scheduled_thresh, ep)
         model.train()
         total_loss = 0.0
         pbar = tqdm(enumerate(dl_train, start=1), total=len(dl_train), desc=f"[P2R Train] Epoch {ep}/{optim_cfg['EPOCHS']}")

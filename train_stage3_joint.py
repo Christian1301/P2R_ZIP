@@ -80,6 +80,8 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    total_zip_loss = 0.0
+    total_p2r_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 3 (Joint)")
 
     for images, gt_density, points in progress_bar:
@@ -114,6 +116,8 @@ def train_one_epoch(
             model.p2r_head.log_scale.data.clamp_(min_val, max_val)
 
         total_loss += combined_loss.item()
+        total_zip_loss += scaled_loss_zip.item()
+        total_p2r_loss += loss_p2r.item()
         current_lr = max(group['lr'] for group in optimizer.param_groups)
         progress_bar.set_postfix({
             "total": f"{combined_loss.item():.4f}",
@@ -122,7 +126,12 @@ def train_one_epoch(
             "lr": f"{current_lr:.6f}"
         })
 
-    return total_loss / len(dataloader)
+    num_batches = max(1, len(dataloader))
+    return (
+        total_loss / num_batches,
+        total_zip_loss / num_batches,
+        total_p2r_loss / num_batches,
+    )
 
 @torch.no_grad()
 def validate(model, dataloader, device, default_down):
@@ -202,6 +211,9 @@ def main(config_path: str):
         backbone_name=config["MODEL"]["BACKBONE"],
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
+        pi_mode=config["MODEL"].get("ZIP_PI_MODE", "hard"),
+        pi_soft_gamma=config["MODEL"].get("ZIP_SOFT_GAMMA", 1.0),
+        detach_pi_mask=config["MODEL"].get("ZIP_PI_DETACH", False),
         upsample_to_input=upsample_to_input,
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
@@ -375,7 +387,7 @@ def main(config_path: str):
 
     for epoch in range(epochs_stage3):
         print(f"\n--- Epoch {epoch + 1}/{epochs_stage3} ---")
-        train_loss = train_one_epoch(
+        train_loss, avg_zip_loss, avg_p2r_loss = train_one_epoch(
             model,
             criterion_zip,
             criterion_p2r,
@@ -388,6 +400,16 @@ def main(config_path: str):
             default_down,
             clamp_cfg=clamp_cfg,
             zip_scale=zip_scale,
+        )
+
+        print(
+            "📊 Breakdown loss media/batch → total: {:.4f}, zip: {:.4f}, p2r: {:.4f} (zip_scale={}, alpha={})".format(
+                train_loss,
+                avg_zip_loss,
+                avg_p2r_loss,
+                zip_scale,
+                alpha,
+            )
         )
 
         if scheduler and schedule_step_mode == "epoch":

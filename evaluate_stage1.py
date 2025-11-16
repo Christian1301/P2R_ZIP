@@ -105,6 +105,9 @@ def main(config, checkpoint_path):
         pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
         gate=config['MODEL']['GATE'],
         upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
+        pi_mode=config['MODEL'].get('ZIP_PI_MODE', 'hard'),
+        pi_soft_gamma=config['MODEL'].get('ZIP_SOFT_GAMMA', 1.0),
+        detach_pi_mask=config['MODEL'].get('ZIP_PI_DETACH', False),
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 

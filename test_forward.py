@@ -29,6 +29,9 @@ if __name__ == "__main__":
         pi_thresh=0.5,
         gate="multiply",
         upsample_to_input=True,
+        pi_mode="soft",
+        pi_soft_gamma=1.0,
+        detach_pi_mask=False,
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
     model.train()

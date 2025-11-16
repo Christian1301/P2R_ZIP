@@ -19,8 +19,11 @@ class P2R_ZIP_Model(nn.Module):
         gate="multiply",
         upsample_to_input=True,
         debug=False,
-    zip_head_kwargs: Optional[dict] = None,
-    p2r_head_kwargs: Optional[dict] = None,
+        pi_mode: str = "hard",
+        pi_soft_gamma: float = 1.0,
+        detach_pi_mask: bool = False,
+        zip_head_kwargs: Optional[dict] = None,
+        p2r_head_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.bins = bins
@@ -45,6 +48,14 @@ class P2R_ZIP_Model(nn.Module):
         self.gate = gate
         self.upsample_to_input = upsample_to_input
         self.debug = debug
+        self.pi_mode = pi_mode.lower() if isinstance(pi_mode, str) else "hard"
+        try:
+            self.pi_soft_gamma = float(pi_soft_gamma)
+        except (TypeError, ValueError):
+            self.pi_soft_gamma = 1.0
+        if self.pi_soft_gamma <= 0:
+            self.pi_soft_gamma = 1.0
+        self.detach_pi_mask = bool(detach_pi_mask)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -54,8 +65,33 @@ class P2R_ZIP_Model(nn.Module):
         logit_pi_maps = zip_outputs["logit_pi_maps"]
         lambda_maps = zip_outputs["lambda_maps"]
         pi_softmax = logit_pi_maps.softmax(dim=1)
-        pi_not_zero = pi_softmax[:, 1:] 
-        mask = (pi_not_zero > self.pi_thresh).float()
+        pi_not_zero = pi_softmax[:, 1:]
+
+        if self.pi_thresh is not None:
+            hard_mask = (pi_not_zero > self.pi_thresh).float()
+        else:
+            hard_mask = None
+
+        if self.pi_mode == "soft":
+            if self.pi_thresh is None:
+                mask = torch.clamp(pi_not_zero, 0.0, 1.0)
+            else:
+                denom = max(1.0 - float(self.pi_thresh), 1e-6)
+                mask = torch.clamp((pi_not_zero - self.pi_thresh) / denom, 0.0, 1.0)
+            if self.pi_soft_gamma != 1.0:
+                mask = torch.pow(mask, self.pi_soft_gamma)
+        elif self.pi_mode == "prob":
+            mask = torch.clamp(pi_not_zero, 0.0, 1.0)
+        elif self.pi_mode == "none":
+            mask = torch.ones_like(pi_not_zero)
+        else:  # default hard mask
+            if hard_mask is None:
+                mask = (pi_not_zero > 0.5).float()
+            else:
+                mask = hard_mask
+
+        if self.detach_pi_mask and self.pi_mode in {"soft", "prob"}:
+            mask = mask.detach()
 
         if mask.shape[-2:] != feat.shape[-2:]:
             mask = F.interpolate(mask, size=feat.shape[-2:], mode="bilinear", align_corners=False)
@@ -65,6 +101,10 @@ class P2R_ZIP_Model(nn.Module):
             print(f"[DEBUG] Active blocks ratio: {active_ratio:.2f}% (th={self.pi_thresh})")
 
         if self.gate == "multiply":
+            if mask.shape[1] not in (1, feat.shape[1]):
+                raise ValueError(
+                    "La maschera ZIP deve avere 1 canale o lo stesso numero di canali delle feature."
+                )
             gated = feat * mask
         elif self.gate == "concat":
             gated = torch.cat([feat, mask.expand_as(feat[:, :1, :, :])], dim=1)
@@ -75,6 +115,10 @@ class P2R_ZIP_Model(nn.Module):
         if self.upsample_to_input:
             dens = F.interpolate(dens, size=(H, W), mode="bilinear", align_corners=False)
 
+        if lambda_maps.shape != pi_not_zero.shape:
+            raise ValueError(
+                "lambda_maps e pi_not_zero devono avere la stessa shape per produrre la densità ZIP"
+            )
         pred_density_zip = pi_not_zero * lambda_maps
 
         return {

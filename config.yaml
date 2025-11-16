@@ -30,6 +30,10 @@ MODEL:
   ZIP_PI_THRESH_START: 0.02
   ZIP_PI_THRESH_WARMUP_EPOCHS: 200
   ZIP_PI_MODE: "soft"
+  ZIP_PI_MODE_STAGE2: "prob"  # Stage 2 richiede gating morbido per evitare maschere quasi nulle
+  ZIP_PI_THRESH_STAGE2: 0.02   # Soglia bloccata a un valore permissivo durante il training P2R
+  ZIP_PI_THRESH_STAGE2_START: 0.02
+  ZIP_PI_THRESH_STAGE2_WARMUP_EPOCHS: 0
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 

@@ -134,11 +134,14 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
+    pi_thresh_eval = cfg["MODEL"].get("ZIP_PI_THRESH_STAGE2", cfg["MODEL"].get("ZIP_PI_THRESH", 0.15))
+    pi_mode_eval = cfg["MODEL"].get("ZIP_PI_MODE_STAGE2", cfg["MODEL"].get("ZIP_PI_MODE", "hard"))
+
     model = P2R_ZIP_Model(
         backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
+        pi_thresh=float(pi_thresh_eval),
         gate=cfg["MODEL"]["GATE"],
-        pi_mode=cfg["MODEL"].get("ZIP_PI_MODE", "hard"),
+        pi_mode=pi_mode_eval,
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],

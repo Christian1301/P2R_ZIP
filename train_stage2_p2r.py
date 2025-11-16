@@ -269,9 +269,10 @@ def main():
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
-    pi_thresh_target = float(model_cfg.get("ZIP_PI_THRESH", 0.15))
-    pi_thresh_start = float(model_cfg.get("ZIP_PI_THRESH_START", pi_thresh_target))
-    pi_thresh_warm_epochs = int(model_cfg.get("ZIP_PI_THRESH_WARMUP_EPOCHS", 0) or 0)
+    pi_mode_stage2 = model_cfg.get("ZIP_PI_MODE_STAGE2", model_cfg.get("ZIP_PI_MODE", "hard"))
+    pi_thresh_target = float(model_cfg.get("ZIP_PI_THRESH_STAGE2", model_cfg.get("ZIP_PI_THRESH", 0.15)))
+    pi_thresh_start = float(model_cfg.get("ZIP_PI_THRESH_STAGE2_START", model_cfg.get("ZIP_PI_THRESH_START", pi_thresh_target)))
+    pi_thresh_warm_epochs = int(model_cfg.get("ZIP_PI_THRESH_STAGE2_WARMUP_EPOCHS", model_cfg.get("ZIP_PI_THRESH_WARMUP_EPOCHS", 0)) or 0)
     pi_thresh_schedule_enabled = pi_thresh_warm_epochs > 0 and abs(pi_thresh_target - pi_thresh_start) > 1e-6
     if pi_thresh_schedule_enabled:
         print(
@@ -292,7 +293,7 @@ def main():
         backbone_name=model_cfg["BACKBONE"],
         pi_thresh=initial_pi_thresh,
         gate=model_cfg["GATE"],
-        pi_mode=model_cfg.get("ZIP_PI_MODE", "hard"),
+        pi_mode=pi_mode_stage2,
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],

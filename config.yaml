@@ -34,6 +34,13 @@ MODEL:
   ZIP_PI_THRESH_STAGE2: 0.02   # Soglia bloccata a un valore permissivo durante il training P2R
   ZIP_PI_THRESH_STAGE2_START: 0.02
   ZIP_PI_THRESH_STAGE2_WARMUP_EPOCHS: 0
+  ZIP_PI_MODE_STAGE3: "prob"   # Mantieni gating permissivo anche nel joint fine-tuning
+  ZIP_PI_THRESH_STAGE3: 0.02
+  ZIP_PI_FLOOR_STAGE2: 0.05
+  ZIP_LAMBDA_CLAMP_STAGE2: [0.0, 2.5]
+  ZIP_PI_FLOOR_STAGE3: 0.05
+  ZIP_LAMBDA_CLAMP_STAGE3: [0.0, 2.5]
+
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
 
@@ -57,8 +64,8 @@ OPTIM_ZIP:
   SAVE_BEST: true
   EARLY_STOPPING_PATIENCE: 200
   CLIP_GRAD_NORM: 1.0
-  BASE_LR: 2.0e-5 # ripristinato per stabilizzare Stage 1
-  LR_BACKBONE: 5.0e-6 # ripristinato per stabilizzare Stage 1
+  BASE_LR: 1.0e-4 # alzato per recuperare la capacità di apprendere pattern di densità
+  LR_BACKBONE: 1.0e-5 # mantieni backbone più lento ma non completamente congelato
 
 ZIP_LOSS:
   WEIGHT_CE: 3.0

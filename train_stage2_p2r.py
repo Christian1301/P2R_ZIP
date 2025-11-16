@@ -3,7 +3,9 @@
 # P2R-ZIP: Stage 2 — P2R Training
 # ============================================================
 
-import os, yaml, numpy as np, torch
+import argparse
+import math
+import os, numpy as np, torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -13,8 +15,14 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLoss
 from train_utils import (
-    init_seeds, get_optimizer, get_scheduler,
-    resume_if_exists, save_checkpoint, setup_experiment, collate_fn
+    init_seeds,
+    get_optimizer,
+    get_scheduler,
+    resume_if_exists,
+    save_checkpoint,
+    setup_experiment,
+    collate_fn,
+    load_config,
 )
 
 @torch.no_grad()
@@ -207,9 +215,14 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
 
 # -----------------------------------------------------------
-def main():
-    with open("config.yaml", 'r') as f:
-        cfg = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 2 (P2R)")
+    parser.add_argument("--config", default="config.yaml", help="Percorso al file di configurazione YAML")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    cfg = load_config(config_path)
 
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
@@ -231,7 +244,6 @@ def main():
         override_crop_scale=stage2_scale,
     )
     val_transforms = build_transforms(data_cfg, is_train=False)
-
     DatasetClass = get_dataset(cfg["DATASET"])
     train_ds = DatasetClass(
         root=data_cfg["ROOT"],
@@ -271,6 +283,8 @@ def main():
 
     pi_mode_stage2 = model_cfg.get("ZIP_PI_MODE_STAGE2", model_cfg.get("ZIP_PI_MODE", "hard"))
     pi_thresh_target = float(model_cfg.get("ZIP_PI_THRESH_STAGE2", model_cfg.get("ZIP_PI_THRESH", 0.15)))
+    pi_floor_stage2 = model_cfg.get("ZIP_PI_FLOOR_STAGE2", model_cfg.get("ZIP_PI_FLOOR"))
+    lambda_clamp_stage2 = model_cfg.get("ZIP_LAMBDA_CLAMP_STAGE2", model_cfg.get("ZIP_LAMBDA_CLAMP"))
     pi_thresh_start = float(model_cfg.get("ZIP_PI_THRESH_STAGE2_START", model_cfg.get("ZIP_PI_THRESH_START", pi_thresh_target)))
     pi_thresh_warm_epochs = int(model_cfg.get("ZIP_PI_THRESH_STAGE2_WARMUP_EPOCHS", model_cfg.get("ZIP_PI_THRESH_WARMUP_EPOCHS", 0)) or 0)
     pi_thresh_schedule_enabled = pi_thresh_warm_epochs > 0 and abs(pi_thresh_target - pi_thresh_start) > 1e-6
@@ -294,6 +308,8 @@ def main():
         pi_thresh=initial_pi_thresh,
         gate=model_cfg["GATE"],
         pi_mode=pi_mode_stage2,
+        pi_floor=pi_floor_stage2,
+        lambda_clamp=lambda_clamp_stage2,
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
@@ -472,6 +488,18 @@ def main():
             if pred_density is None:
                 raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
 
+            pi_mean_batch = float("nan")
+            lambda_mean_batch = float("nan")
+            logit_pi_batch = out.get("logit_pi_maps")
+            if logit_pi_batch is not None:
+                pi_vals = logit_pi_batch.softmax(dim=1)[:, 1:]
+                if pi_vals.numel() > 0:
+                    pi_mean_batch = float(pi_vals.mean().item())
+            lambda_maps_batch = out.get("lambda_maps")
+            if lambda_maps_batch is not None:
+                if lambda_maps_batch.numel() > 0:
+                    lambda_mean_batch = float(lambda_maps_batch.mean().item())
+
             B, _, H_out, W_out = pred_density.shape
             _, _, H_in, W_in = images.shape
             if H_out == H_in and W_out == W_in:
@@ -506,10 +534,24 @@ def main():
                         writer.add_scalar("p2r_head/density_scale", ds_val, global_step)
                         writer.add_scalar("p2r_head/log_scale", float(model.p2r_head.log_scale.detach().item()), global_step)
 
+            if writer:
+                global_step = (ep - 1) * len(dl_train) + batch_idx
+                if not math.isnan(pi_mean_batch):
+                    writer.add_scalar("zip/pi_mean", pi_mean_batch, global_step)
+                if not math.isnan(lambda_mean_batch):
+                    writer.add_scalar("zip/lambda_mean", lambda_mean_batch, global_step)
+
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "lr": f"{opt.param_groups[0]['lr']:.6f}",
+            }
+            if not math.isnan(pi_mean_batch):
+                postfix["pi"] = f"{pi_mean_batch:.3f}"
+            if not math.isnan(lambda_mean_batch):
+                postfix["lam"] = f"{lambda_mean_batch:.3f}"
             if ds_val is not None:
-                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}", dens_scale=f"{ds_val:.6f}")
-            else:
-                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}")
+                postfix["dens_scale"] = f"{ds_val:.6f}"
+            pbar.set_postfix(postfix)
 
         # --- Scheduler step ---
         if scheduler:
@@ -608,4 +650,5 @@ def main():
 
 # -----------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

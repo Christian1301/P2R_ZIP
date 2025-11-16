@@ -136,12 +136,16 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
 
     pi_thresh_eval = cfg["MODEL"].get("ZIP_PI_THRESH_STAGE2", cfg["MODEL"].get("ZIP_PI_THRESH", 0.15))
     pi_mode_eval = cfg["MODEL"].get("ZIP_PI_MODE_STAGE2", cfg["MODEL"].get("ZIP_PI_MODE", "hard"))
+    pi_floor_eval = cfg["MODEL"].get("ZIP_PI_FLOOR_STAGE2", cfg["MODEL"].get("ZIP_PI_FLOOR"))
+    lambda_clamp_eval = cfg["MODEL"].get("ZIP_LAMBDA_CLAMP_STAGE2", cfg["MODEL"].get("ZIP_LAMBDA_CLAMP"))
 
     model = P2R_ZIP_Model(
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=float(pi_thresh_eval),
         gate=cfg["MODEL"]["GATE"],
         pi_mode=pi_mode_eval,
+        pi_floor=pi_floor_eval,
+        lambda_clamp=lambda_clamp_eval,
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],

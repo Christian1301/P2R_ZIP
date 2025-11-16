@@ -20,6 +20,8 @@ class P2R_ZIP_Model(nn.Module):
         upsample_to_input=True,
         debug=False,
         pi_mode: str = "hard",
+        pi_floor: Optional[float] = None,
+        lambda_clamp: Optional[List[float]] = None,
         zip_head_kwargs: Optional[dict] = None,
         p2r_head_kwargs: Optional[dict] = None,
     ):
@@ -47,6 +49,18 @@ class P2R_ZIP_Model(nn.Module):
         self.upsample_to_input = upsample_to_input
         self.debug = debug
         self.pi_mode = pi_mode.lower() if isinstance(pi_mode, str) else "hard"
+        self.pi_floor = None
+        if pi_floor is not None:
+            self.pi_floor = max(0.0, min(1.0, float(pi_floor)))
+        self.lambda_clamp = None
+        if lambda_clamp is not None:
+            if len(lambda_clamp) != 2:
+                raise ValueError("lambda_clamp deve contenere [min, max].")
+            min_lam = None if lambda_clamp[0] is None else float(lambda_clamp[0])
+            max_lam = None if lambda_clamp[1] is None else float(lambda_clamp[1])
+            if min_lam is not None and max_lam is not None and min_lam > max_lam:
+                raise ValueError("lambda_clamp: min deve essere <= max.")
+            self.lambda_clamp = (min_lam, max_lam)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -57,6 +71,9 @@ class P2R_ZIP_Model(nn.Module):
         lambda_maps = zip_outputs["lambda_maps"]
         pi_softmax = logit_pi_maps.softmax(dim=1)
         pi_not_zero = pi_softmax[:, 1:]
+
+        if self.pi_floor is not None:
+            pi_not_zero = torch.clamp(pi_not_zero, min=self.pi_floor)
 
         if self.pi_mode == "soft":
             if self.pi_thresh is None:
@@ -84,6 +101,13 @@ class P2R_ZIP_Model(nn.Module):
             gated = torch.cat([feat, mask.expand_as(feat[:, :1, :, :])], dim=1)
         else:
             raise ValueError("gate deve essere 'multiply' o 'concat'")
+
+        if self.lambda_clamp is not None:
+            min_lam, max_lam = self.lambda_clamp
+            if min_lam is not None or max_lam is not None:
+                clamp_min = min_lam if min_lam is not None else float("-inf")
+                clamp_max = max_lam if max_lam is not None else float("inf")
+                lambda_maps = torch.clamp(lambda_maps, clamp_min, clamp_max)
 
         dens = self.p2r_head(gated)
         if self.upsample_to_input:

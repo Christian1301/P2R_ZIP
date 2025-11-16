@@ -80,6 +80,8 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    pi_epoch_vals = []
+    lambda_epoch_vals = []
     progress_bar = tqdm(dataloader, desc="Train Stage 3 (Joint)")
 
     for images, gt_density, points in progress_bar:
@@ -90,6 +92,20 @@ def train_one_epoch(
         outputs = model(images)
         loss_zip, _ = criterion_zip(outputs, gt_density)
         scaled_loss_zip = loss_zip * zip_scale
+
+        pi_mean_batch = None
+        lambda_mean_batch = None
+        logit_pi_batch = outputs.get("logit_pi_maps")
+        if logit_pi_batch is not None:
+            pi_vals = logit_pi_batch.softmax(dim=1)[:, 1:]
+            if pi_vals.numel() > 0:
+                pi_mean_batch = float(pi_vals.mean().item())
+                pi_epoch_vals.append(pi_mean_batch)
+        lambda_maps_batch = outputs.get("lambda_maps")
+        if lambda_maps_batch is not None:
+            if lambda_maps_batch.numel() > 0:
+                lambda_mean_batch = float(lambda_maps_batch.mean().item())
+                lambda_epoch_vals.append(lambda_mean_batch)
 
         pred_density = outputs["p2r_density"]
         _, _, h_in, w_in = images.shape
@@ -107,22 +123,35 @@ def train_one_epoch(
         if scheduler and schedule_step_mode == "iteration":
             scheduler.step()
 
+        dens_scale_val = None
         if clamp_cfg and hasattr(model.p2r_head, "log_scale"):
             if len(clamp_cfg) != 2:
                 raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
             min_val, max_val = float(clamp_cfg[0]), float(clamp_cfg[1])
             model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+            dens_scale_val = float(torch.exp(model.p2r_head.log_scale.detach()).item())
+        elif hasattr(model.p2r_head, "log_scale"):
+            dens_scale_val = float(torch.exp(model.p2r_head.log_scale.detach()).item())
 
         total_loss += combined_loss.item()
         current_lr = max(group['lr'] for group in optimizer.param_groups)
-        progress_bar.set_postfix({
+        postfix = {
             "total": f"{combined_loss.item():.4f}",
             "zip": f"{scaled_loss_zip.item():.4f}",
             "p2r": f"{loss_p2r.item():.4f}",
             "lr": f"{current_lr:.6f}"
-        })
+        }
+        if pi_mean_batch is not None:
+            postfix["pi"] = f"{pi_mean_batch:.3f}"
+        if lambda_mean_batch is not None:
+            postfix["lam"] = f"{lambda_mean_batch:.3f}"
+        if dens_scale_val is not None:
+            postfix["dens_scale"] = f"{dens_scale_val:.6f}"
+        progress_bar.set_postfix(postfix)
 
-    return total_loss / len(dataloader)
+    avg_pi = float(np.mean(pi_epoch_vals)) if pi_epoch_vals else None
+    avg_lambda = float(np.mean(lambda_epoch_vals)) if lambda_epoch_vals else None
+    return total_loss / len(dataloader), avg_pi, avg_lambda
 
 @torch.no_grad()
 def validate(model, dataloader, device, default_down):
@@ -196,13 +225,32 @@ def main(config_path: str):
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
+    pi_mode_stage3 = config["MODEL"].get(
+        "ZIP_PI_MODE_STAGE3",
+        config["MODEL"].get("ZIP_PI_MODE_STAGE2", config["MODEL"].get("ZIP_PI_MODE", "hard"))
+    )
+    pi_thresh_stage3 = float(config["MODEL"].get(
+        "ZIP_PI_THRESH_STAGE3",
+        config["MODEL"].get("ZIP_PI_THRESH_STAGE2", config["MODEL"].get("ZIP_PI_THRESH", 0.15))
+    ))
+    pi_floor_stage3 = config["MODEL"].get(
+        "ZIP_PI_FLOOR_STAGE3",
+        config["MODEL"].get("ZIP_PI_FLOOR_STAGE2", config["MODEL"].get("ZIP_PI_FLOOR"))
+    )
+    lambda_clamp_stage3 = config["MODEL"].get(
+        "ZIP_LAMBDA_CLAMP_STAGE3",
+        config["MODEL"].get("ZIP_LAMBDA_CLAMP_STAGE2", config["MODEL"].get("ZIP_LAMBDA_CLAMP"))
+    )
+
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
         backbone_name=config["MODEL"]["BACKBONE"],
-        pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
+        pi_thresh=pi_thresh_stage3,
         gate=config["MODEL"]["GATE"],
-        pi_mode=config["MODEL"].get("ZIP_PI_MODE", "hard"),
+        pi_mode=pi_mode_stage3,
+        pi_floor=pi_floor_stage3,
+        lambda_clamp=lambda_clamp_stage3,
         upsample_to_input=upsample_to_input,
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
@@ -376,7 +424,7 @@ def main(config_path: str):
 
     for epoch in range(epochs_stage3):
         print(f"\n--- Epoch {epoch + 1}/{epochs_stage3} ---")
-        train_loss = train_one_epoch(
+        train_loss, pi_epoch_mean, lambda_epoch_mean = train_one_epoch(
             model,
             criterion_zip,
             criterion_p2r,
@@ -393,6 +441,11 @@ def main(config_path: str):
 
         if scheduler and schedule_step_mode == "epoch":
             scheduler.step()
+
+        if pi_epoch_mean is not None or lambda_epoch_mean is not None:
+            pi_str = "n/a" if pi_epoch_mean is None else f"{pi_epoch_mean:.3f}"
+            lam_str = "n/a" if lambda_epoch_mean is None else f"{lambda_epoch_mean:.3f}"
+            print(f"    ↳ Media epoch: π={pi_str}, λ={lam_str}")
 
         if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:
             val_mae, val_rmse, tot_pred, tot_gt = validate(model, val_loader, device, default_down)

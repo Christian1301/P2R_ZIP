@@ -1,38 +1,72 @@
 # P2R_ZIP/train_stage1_zip.py
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 import os
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn
+from train_utils import (
+    init_seeds,
+    get_optimizer,
+    get_scheduler,
+    resume_if_exists,
+    save_checkpoint,
+    collate_fn,
+    load_config,
+)
 
 
 # ============================================================
 # 🔧 Funzione di regolarizzazione extra per ZIP Head
 # Penalizza pi saturato (vicino a 0 o 1) e lambda troppo costante
 # ============================================================
-def zip_regularization(preds, lam_weight=1e-3, pi_weight=1e-3):
+def zip_regularization(preds, reg_cfg=None):
+    """Stabilizza pi/λ verso i target configurati per evitare collasso dei gate."""
+    if reg_cfg is None:
+        reg_cfg = {}
+
     logit_pi = preds["logit_pi_maps"]
     lam = preds["lambda_maps"]
+    pi_soft = logit_pi.softmax(dim=1)[:, 1:]
 
-    pi_soft = logit_pi.softmax(dim=1)[:, 1:]  # prob blocco occupato
-    pi_reg = ((pi_soft - 0.5) ** 2).mean()  # penalizza saturazione (vicino a 0 o 1)
-    lam_reg = lam.std()  # incoraggia variazione spaziale
+    loss_reg = torch.zeros((), device=logit_pi.device, dtype=logit_pi.dtype)
 
-    return pi_weight * pi_reg - lam_weight * lam_reg  # lam_reg con segno - per favorire varianza
+    pi_target = reg_cfg.get("PI_TARGET")
+    pi_weight = float(reg_cfg.get("PI_WEIGHT", 0.0) or 0.0)
+    if pi_target is not None and pi_weight > 0.0:
+        pi_target_val = float(pi_target)
+        pi_deficit = torch.clamp(pi_target_val - pi_soft, min=0.0)
+        if pi_deficit.numel() > 0:
+            pi_penalty = pi_deficit.pow(2).view(pi_deficit.size(0), -1).sum(dim=1).mean()
+            loss_reg = loss_reg + pi_weight * pi_penalty
+
+    lambda_target = reg_cfg.get("LAMBDA_TARGET")
+    lambda_weight = float(reg_cfg.get("LAMBDA_WEIGHT", 0.0) or 0.0)
+    if lambda_target is not None and lambda_weight > 0.0:
+        lambda_target_val = float(lambda_target)
+        lam_excess = torch.clamp(lam - lambda_target_val, min=0.0)
+        if lam_excess.numel() > 0:
+            lam_penalty = lam_excess.pow(2).view(lam_excess.size(0), -1).sum(dim=1).mean()
+            loss_reg = loss_reg + lambda_weight * lam_penalty
+
+    lambda_std_weight = float(reg_cfg.get("LAMBDA_STD_WEIGHT", 0.0) or 0.0)
+    if lambda_std_weight > 0.0:
+        lam_std = lam.std()
+        loss_reg = loss_reg + lambda_std_weight * lam_std
+
+    return loss_reg
 
 
 # ============================================================
 # 🔹 Training loop con diagnostica
 # ============================================================
-def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, clip_grad_norm=1.0):
+def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, reg_cfg, clip_grad_norm=1.0):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
@@ -44,8 +78,8 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         predictions = model(images)
         loss, loss_dict = criterion(predictions, gt_density)
 
-        # Regolarizzazione extra
-        reg_loss = zip_regularization(predictions)
+        # Regolarizzazione extra per tenere pi/λ in range fisiologici
+        reg_loss = zip_regularization(predictions, reg_cfg=reg_cfg)
         total = loss + reg_loss
 
         total.backward()
@@ -55,11 +89,15 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
 
         total_loss += total.item()
 
+        pi_mean = predictions["logit_pi_maps"].softmax(dim=1)[:, 1:].mean().item()
+        lambda_mean = predictions["lambda_maps"].mean().item()
         progress_bar.set_postfix({
             'loss': f"{total.item():.4f}",
             'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}",
             'count': f"{loss_dict['zip_count_loss']:.4f}",
+            'pi': f"{pi_mean:.3f}",
+            'lam': f"{lambda_mean:.3f}",
             'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
         })
 
@@ -106,9 +144,14 @@ def validate(model, criterion, dataloader, device):
 # ============================================================
 # 🔹 Main training loop
 # ============================================================
-def main():
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 1 (ZIP)")
+    parser.add_argument("--config", default="config.yaml", help="Percorso al file di configurazione YAML")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    config = load_config(config_path)
 
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
@@ -136,6 +179,8 @@ def main():
         weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"] * 2.0,  # 🔥 CE più pesante
         zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
     ).to(device)
+
+    zip_reg_cfg = config.get("ZIP_REG", {})
 
     optim_cfg = config["OPTIM_ZIP"]
     # Compatibilità con diversi nomi di chiave nel config
@@ -200,7 +245,7 @@ def main():
 
     for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         print(f"\n--- Epoch {epoch}/{optim_cfg['EPOCHS']} ---")
-        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device)
+        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device, zip_reg_cfg)
 
         if epoch % optim_cfg["VAL_INTERVAL"] == 0 or epoch == optim_cfg["EPOCHS"]:
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)
@@ -218,4 +263,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

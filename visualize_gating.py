@@ -79,13 +79,59 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
 
     p2r_head_kwargs = config.get("P2R_HEAD", {})
 
+    if stage == "stage2":
+        pi_mode = config["MODEL"].get(
+            "ZIP_PI_MODE_STAGE2",
+            config["MODEL"].get("ZIP_PI_MODE", "hard")
+        )
+        pi_thresh = float(config["MODEL"].get(
+            "ZIP_PI_THRESH_STAGE2",
+            config["MODEL"].get("ZIP_PI_THRESH", 0.15)
+        ))
+        pi_floor = config["MODEL"].get(
+            "ZIP_PI_FLOOR_STAGE2",
+            config["MODEL"].get("ZIP_PI_FLOOR")
+        )
+        lambda_clamp = config["MODEL"].get(
+            "ZIP_LAMBDA_CLAMP_STAGE2",
+            config["MODEL"].get("ZIP_LAMBDA_CLAMP")
+        )
+    elif stage == "stage3":
+        pi_mode = config["MODEL"].get(
+            "ZIP_PI_MODE_STAGE3",
+            config["MODEL"].get(
+                "ZIP_PI_MODE_STAGE2", config["MODEL"].get("ZIP_PI_MODE", "hard")
+            )
+        )
+        pi_thresh = float(config["MODEL"].get(
+            "ZIP_PI_THRESH_STAGE3",
+            config["MODEL"].get(
+                "ZIP_PI_THRESH_STAGE2", config["MODEL"].get("ZIP_PI_THRESH", 0.15)
+            )
+        ))
+        pi_floor = config["MODEL"].get(
+            "ZIP_PI_FLOOR_STAGE3",
+            config["MODEL"].get("ZIP_PI_FLOOR_STAGE2", config["MODEL"].get("ZIP_PI_FLOOR"))
+        )
+        lambda_clamp = config["MODEL"].get(
+            "ZIP_LAMBDA_CLAMP_STAGE3",
+            config["MODEL"].get("ZIP_LAMBDA_CLAMP_STAGE2", config["MODEL"].get("ZIP_LAMBDA_CLAMP"))
+        )
+    else:
+        pi_mode = config["MODEL"].get("ZIP_PI_MODE", "hard")
+        pi_thresh = float(config["MODEL"].get("ZIP_PI_THRESH", 0.15))
+        pi_floor = config["MODEL"].get("ZIP_PI_FLOOR")
+        lambda_clamp = config["MODEL"].get("ZIP_LAMBDA_CLAMP")
+
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
         backbone_name=config["MODEL"]["BACKBONE"],
-        pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
+        pi_thresh=pi_thresh,
         gate=config["MODEL"]["GATE"],
-        pi_mode=config["MODEL"].get("ZIP_PI_MODE", "hard"),
+        pi_mode=pi_mode,
+        pi_floor=pi_floor,
+        lambda_clamp=lambda_clamp,
         upsample_to_input=upsample_flag,
         zip_head_kwargs=zip_head_kwargs,
         p2r_head_kwargs=p2r_head_kwargs,

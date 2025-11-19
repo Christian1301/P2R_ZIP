@@ -30,6 +30,10 @@ if __name__ == "__main__":
         gate="multiply",
         upsample_to_input=True,
         zip_head_kwargs=zip_head_kwargs,
+        soft_pi_gate=True,
+        pi_gate_power=1.0,
+        pi_gate_min=0.1,
+        apply_gate_to_output=True,
     ).to(device)
     model.train()
     img = torch.randn(2, 3, 256, 256).to(device)

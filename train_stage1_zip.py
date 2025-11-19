@@ -114,6 +114,7 @@ def main(config_path: str):
     init_seeds(config["SEED"])
 
     dataset_name = config["DATASET"]
+    model_cfg = config["MODEL"]
     bin_cfg = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
@@ -128,11 +129,15 @@ def main(config_path: str):
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
-        backbone_name=config["MODEL"]["BACKBONE"],
-        pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
-        gate=config["MODEL"]["GATE"],
-        upsample_to_input=config["MODEL"]["UPSAMPLE_TO_INPUT"],
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
+        gate=model_cfg.get("GATE", "multiply"),
+        upsample_to_input=model_cfg.get("UPSAMPLE_TO_INPUT", True),
         zip_head_kwargs=zip_head_kwargs,
+        soft_pi_gate=model_cfg.get("ZIP_PI_SOFT", False),
+        pi_gate_power=model_cfg.get("ZIP_PI_SOFT_POWER", 1.0),
+        pi_gate_min=model_cfg.get("ZIP_PI_SOFT_MIN", 0.0),
+        apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
 
     for p in model.p2r_head.parameters():

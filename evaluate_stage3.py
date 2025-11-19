@@ -139,8 +139,9 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
 
     dataset_name = cfg["DATASET"]
     bin_cfg = cfg["BINS_CONFIG"][dataset_name]
+    model_cfg = cfg["MODEL"]
 
-    upsample_to_input = cfg["MODEL"].get("UPSAMPLE_TO_INPUT", False)
+    upsample_to_input = model_cfg.get("UPSAMPLE_TO_INPUT", False)
     if upsample_to_input:
         print("ℹ️ Stage 3 eval: forzo UPSAMPLE_TO_INPUT=False per coerenza col training.")
         upsample_to_input = False
@@ -156,11 +157,15 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
     model = P2R_ZIP_Model(
         bins=bin_cfg["bins"],
         bin_centers=bin_cfg["bin_centers"],
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
+        gate=model_cfg.get("GATE", "multiply"),
         upsample_to_input=upsample_to_input,
         zip_head_kwargs=zip_head_kwargs,
+        soft_pi_gate=model_cfg.get("ZIP_PI_SOFT", False),
+        pi_gate_power=model_cfg.get("ZIP_PI_SOFT_POWER", 1.0),
+        pi_gate_min=model_cfg.get("ZIP_PI_SOFT_MIN", 0.0),
+        apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
 
     ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])

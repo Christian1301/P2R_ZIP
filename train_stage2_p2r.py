@@ -27,6 +27,8 @@ def calibrate_density_scale(
     clamp_range=None,
     max_adjust=None,
     bias_eps=1e-3,
+    trim_ratio=0.0,
+    stat="median",
 ):
     """
     Stima il bias iniziale del conteggio P2R e aggiusta log_scale di conseguenza
@@ -38,6 +40,7 @@ def calibrate_density_scale(
 
     model.eval()
     total_pred, total_gt = 0.0, 0.0
+    per_sample_biases = []
 
     for batch_idx, (images, _, points) in enumerate(loader, start=1):
         if max_batches is not None and batch_idx > max_batches:
@@ -68,17 +71,50 @@ def calibrate_density_scale(
         total_pred += pred_count.sum().item()
         total_gt += gt_count.sum().item()
 
-    if total_gt <= 0 or total_pred <= 0:
-        print("ℹ️ Calibrazione densità P2R saltata: conteggi non positivi.")
+        with torch.no_grad():
+            for sample_idx in range(len(points_list)):
+                gt_val = float(gt_count[sample_idx].item())
+                pred_val = float(pred_count[sample_idx].item())
+                if gt_val <= 0.0 or pred_val <= 0.0:
+                    continue
+                per_sample_biases.append(pred_val / max(gt_val, 1e-6))
+
+    if not per_sample_biases:
+        print("ℹ️ Calibrazione densità P2R saltata: bias per-sample non disponibile.")
         return None
 
-    bias = total_pred / total_gt
+    trim_ratio = float(max(0.0, min(trim_ratio, 0.45)))
+    num_samples = len(per_sample_biases)
+    sorted_biases = np.sort(np.array(per_sample_biases, dtype=np.float32))
+    if trim_ratio > 0.0 and sorted_biases.size >= 3:
+        trim = int(sorted_biases.size * trim_ratio)
+        if trim > 0:
+            low_idx = trim
+            high_idx = sorted_biases.size - trim
+            if low_idx < high_idx:
+                sorted_biases = sorted_biases[low_idx:high_idx]
+    used_samples = int(sorted_biases.size)
+
+    if sorted_biases.size == 0:
+        print("ℹ️ Calibrazione densità P2R saltata: dopo il trimming non restano campioni validi.")
+        return None
+
+    stat = (stat or "median").lower()
+    if stat == "mean":
+        bias = float(np.mean(sorted_biases))
+    else:
+        bias = float(np.median(sorted_biases))
+
     if not np.isfinite(bias) or bias <= 0:
         print("ℹ️ Calibrazione densità P2R saltata: bias non finito.")
         return None
     if abs(bias - 1.0) < bias_eps:
         print(f"ℹ️ Calibrazione densità P2R: bias già unitario ({bias:.3f}).")
         return bias
+
+    if total_gt <= 0 or total_pred <= 0:
+        print("ℹ️ Calibrazione densità P2R saltata: conteggi non positivi.")
+        return None
 
     prev_log_scale = float(model.p2r_head.log_scale.detach().item())
     raw_adjust = float(np.log(bias))
@@ -100,8 +136,17 @@ def calibrate_density_scale(
     new_log_scale = float(model.p2r_head.log_scale.detach().item())
     new_scale = torch.exp(model.p2r_head.log_scale.detach()).item()
     print(
-        "🔧 Calibrazione densità P2R: bias={:.3f} → log_scale {:.4f}→{:.4f} "
-        "(scala={:.4f})".format(bias, prev_log_scale, new_log_scale, new_scale)
+        "🔧 Calibrazione densità P2R: bias={:.3f} ({}/{}, trim={:.2f}, stat={}) → log_scale {:.4f}→{:.4f} "
+        "(scala={:.4f})".format(
+            bias,
+            used_samples,
+            num_samples,
+            trim_ratio,
+            stat,
+            prev_log_scale,
+            new_log_scale,
+            new_scale,
+        )
     )
     if clipped_adjust:
         print("ℹ️ Calibrazione limitata da LOG_SCALE_CALIBRATION_MAX_DELTA: valutare un delta più alto se necessario.")
@@ -259,6 +304,7 @@ def main():
 
     # --- Modello ---
     dataset_name = cfg["DATASET"]
+    model_cfg = cfg["MODEL"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
     zip_head_kwargs = {
@@ -269,13 +315,17 @@ def main():
     }
 
     model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
+        gate=model_cfg.get("GATE", "multiply"),
         upsample_to_input=False,
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
         zip_head_kwargs=zip_head_kwargs,
+        soft_pi_gate=model_cfg.get("ZIP_PI_SOFT", False),
+        pi_gate_power=model_cfg.get("ZIP_PI_SOFT_POWER", 1.0),
+        pi_gate_min=model_cfg.get("ZIP_PI_SOFT_MIN", 0.0),
+        apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
 
     # --- Carica Stage 1 ---
@@ -365,6 +415,9 @@ def main():
         loss_kwargs["max_radius"] = float(p2r_loss_cfg["MAX_RADIUS"])
     p2r_loss_fn = P2RLoss(**loss_kwargs).to(device)
 
+    log_scale_reg_weight = float(p2r_loss_cfg.get("LOG_SCALE_REG_WEIGHT", 0.0))
+    log_scale_reg_target = float(p2r_loss_cfg.get("LOG_SCALE_REG_TARGET", 0.0))
+
     # --- Setup esperimento ---
     exp_dir = os.path.join(stage1_dir, "stage2")
     writer = setup_experiment(exp_dir)
@@ -400,6 +453,8 @@ def main():
             calibrate_max_batches = None
     clamp_cfg = p2r_loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
+    calibrate_trim = float(p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_TRIM", 0.0))
+    calibrate_stat = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_STAT", "median")
     if start_ep == 1:
         calibrate_density_scale(
             model,
@@ -409,6 +464,8 @@ def main():
             max_batches=calibrate_max_batches,
             clamp_range=clamp_cfg,
             max_adjust=max_adjust,
+            trim_ratio=calibrate_trim,
+            stat=calibrate_stat,
         )
 
     # --- Training loop ---
@@ -439,6 +496,18 @@ def main():
             # ✅ ORA loss coerente con ReLU/(upscale²) — niente più logit
             loss = p2r_loss_fn(pred_density, points_list, down=down_tuple)
 
+            reg_penalty_weighted = None
+            if log_scale_reg_weight > 0.0 and hasattr(model.p2r_head, "log_scale"):
+                target_val = float(log_scale_reg_target)
+                log_scale_param = model.p2r_head.log_scale
+                reg_penalty = F.smooth_l1_loss(
+                    log_scale_param,
+                    log_scale_param.new_tensor(target_val),
+                    reduction="mean",
+                )
+                reg_penalty_weighted = log_scale_reg_weight * reg_penalty
+                loss = loss + reg_penalty_weighted
+
             opt.zero_grad()
             loss.backward()
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -460,6 +529,12 @@ def main():
                         global_step = (ep - 1) * len(dl_train) + batch_idx
                         writer.add_scalar("p2r_head/density_scale", ds_val, global_step)
                         writer.add_scalar("p2r_head/log_scale", float(model.p2r_head.log_scale.detach().item()), global_step)
+                        if reg_penalty_weighted is not None:
+                            writer.add_scalar(
+                                "loss/log_scale_reg",
+                                float(reg_penalty_weighted.detach().item()),
+                                global_step,
+                            )
 
             if ds_val is not None:
                 pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}", dens_scale=f"{ds_val:.6f}")
@@ -508,6 +583,8 @@ def main():
                             max_batches=None,
                             clamp_range=clamp_cfg,
                             max_adjust=max_adjust,
+                            trim_ratio=calibrate_trim,
+                            stat=calibrate_stat,
                         )
                         calibrated_metrics = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
                         cal_loss, cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = calibrated_metrics

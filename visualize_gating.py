@@ -62,6 +62,7 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
     """Inizializza il modello P2R_ZIP coerente con lo stage selezionato."""
     dataset_name = config["DATASET"]
     bin_cfg = config["BINS_CONFIG"][dataset_name]
+    model_cfg = config["MODEL"]
     bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
     zip_head_cfg = config.get("ZIP_HEAD", {})
@@ -72,7 +73,7 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
-    upsample_flag = config["MODEL"].get("UPSAMPLE_TO_INPUT", False)
+    upsample_flag = model_cfg.get("UPSAMPLE_TO_INPUT", False)
     if stage in {"stage2", "stage3"} and upsample_flag:
         print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per coerenza con l'addestramento Stage 2/3.")
         upsample_flag = False
@@ -82,12 +83,16 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
-        backbone_name=config["MODEL"]["BACKBONE"],
-        pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
-        gate=config["MODEL"]["GATE"],
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
+        gate=model_cfg.get("GATE", "multiply"),
         upsample_to_input=upsample_flag,
         zip_head_kwargs=zip_head_kwargs,
         p2r_head_kwargs=p2r_head_kwargs,
+        soft_pi_gate=model_cfg.get("ZIP_PI_SOFT", False),
+        pi_gate_power=model_cfg.get("ZIP_PI_SOFT_POWER", 1.0),
+        pi_gate_min=model_cfg.get("ZIP_PI_SOFT_MIN", 0.0),
+        apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
 
     return model

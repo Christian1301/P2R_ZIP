@@ -125,6 +125,7 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
         pin_memory=True
     )
     dataset_name = cfg["DATASET"]
+    model_cfg = cfg["MODEL"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
     zip_head_kwargs = {
@@ -135,13 +136,17 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
     }
 
     model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
+        backbone_name=model_cfg["BACKBONE"],
+        pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
+        gate=model_cfg.get("GATE", "multiply"),
         upsample_to_input=False,  
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
         zip_head_kwargs=zip_head_kwargs,
+        soft_pi_gate=model_cfg.get("ZIP_PI_SOFT", False),
+        pi_gate_power=model_cfg.get("ZIP_PI_SOFT_POWER", 1.0),
+        pi_gate_min=model_cfg.get("ZIP_PI_SOFT_MIN", 0.0),
+        apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
     ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
     if checkpoint_override:

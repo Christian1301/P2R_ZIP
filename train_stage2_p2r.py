@@ -3,7 +3,7 @@
 # P2R-ZIP: Stage 2 — P2R Training
 # ============================================================
 
-import os, yaml, numpy as np, torch
+import os, numpy as np, torch, argparse
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -14,7 +14,7 @@ from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLoss
 from train_utils import (
     init_seeds, get_optimizer, get_scheduler,
-    resume_if_exists, save_checkpoint, setup_experiment, collate_fn
+    resume_if_exists, save_checkpoint, setup_experiment, collate_fn, load_config
 )
 
 @torch.no_grad()
@@ -26,9 +26,13 @@ def calibrate_density_scale(
     max_batches=8,
     clamp_range=None,
     max_adjust=None,
+    min_samples=None,
+    min_bias=None,
+    max_bias=None,
     bias_eps=1e-3,
     trim_ratio=0.0,
     stat="median",
+    dynamic_floor=None,
 ):
     """
     Stima il bias iniziale del conteggio P2R e aggiusta log_scale di conseguenza
@@ -39,12 +43,35 @@ def calibrate_density_scale(
         return None
 
     model.eval()
+    min_samples_int = None
+    if min_samples is not None:
+        try:
+            min_samples_int = max(int(min_samples), 1)
+        except (TypeError, ValueError):
+            min_samples_int = None
+
+    effective_clamp = None
+    if clamp_range is not None:
+        if len(clamp_range) != 2:
+            raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
+        min_val = float(clamp_range[0])
+        max_val = float(clamp_range[1])
+        dyn_clamp = getattr(model.p2r_head, "_dynamic_clamp", None)
+        if dyn_clamp is not None and len(dyn_clamp) == 2:
+            min_val = min(min_val, float(dyn_clamp[0]))
+            max_val = max(max_val, float(dyn_clamp[1]))
+        effective_clamp = [min_val, max_val]
+    else:
+        dyn_clamp = getattr(model.p2r_head, "_dynamic_clamp", None)
+        if dyn_clamp is not None and len(dyn_clamp) == 2:
+            effective_clamp = [float(dyn_clamp[0]), float(dyn_clamp[1])]
+
     total_pred, total_gt = 0.0, 0.0
     per_sample_biases = []
+    per_sample_weights = []
+    warned_extra_batches = False
 
     for batch_idx, (images, _, points) in enumerate(loader, start=1):
-        if max_batches is not None and batch_idx > max_batches:
-            break
 
         images = images.to(device)
         points_list = [p.to(device) for p in points]
@@ -78,6 +105,20 @@ def calibrate_density_scale(
                 if gt_val <= 0.0 or pred_val <= 0.0:
                     continue
                 per_sample_biases.append(pred_val / max(gt_val, 1e-6))
+                per_sample_weights.append(gt_val)
+
+        if max_batches is not None and batch_idx >= max_batches:
+            if min_samples_int is None or len(per_sample_biases) >= min_samples_int:
+                break
+            if not warned_extra_batches:
+                print(
+                    "ℹ️ Calibrazione densità P2R: raccolgo batch aggiuntivi oltre il limite configurato per "
+                    "raggiungere i campioni minimi (attesi {}, attuali {}).".format(
+                        min_samples_int,
+                        len(per_sample_biases),
+                    )
+                )
+                warned_extra_batches = True
 
     if not per_sample_biases:
         print("ℹ️ Calibrazione densità P2R saltata: bias per-sample non disponibile.")
@@ -85,31 +126,130 @@ def calibrate_density_scale(
 
     trim_ratio = float(max(0.0, min(trim_ratio, 0.45)))
     num_samples = len(per_sample_biases)
-    sorted_biases = np.sort(np.array(per_sample_biases, dtype=np.float32))
+    bias_array = np.array(per_sample_biases, dtype=np.float32)
+    weight_array = np.array(per_sample_weights, dtype=np.float32)
+    order = np.argsort(bias_array)
+    sorted_biases = bias_array[order]
+    sorted_weights = weight_array[order]
+    trimmed_biases = sorted_biases
+    trimmed_weights = sorted_weights
+    fallback_trim = False
+    did_trim = False
     if trim_ratio > 0.0 and sorted_biases.size >= 3:
         trim = int(sorted_biases.size * trim_ratio)
-        if trim > 0:
+        if trim > 0 and trim * 2 < sorted_biases.size:
             low_idx = trim
             high_idx = sorted_biases.size - trim
-            if low_idx < high_idx:
-                sorted_biases = sorted_biases[low_idx:high_idx]
-    used_samples = int(sorted_biases.size)
+            trimmed_biases = sorted_biases[low_idx:high_idx]
+            trimmed_weights = sorted_weights[low_idx:high_idx]
+            did_trim = True
+    used_samples = int(trimmed_biases.size)
 
-    if sorted_biases.size == 0:
+    if min_samples_int is not None and used_samples < max(min_samples_int, 1):
+        if did_trim:
+            # Riprova senza trimming per recuperare campioni utili.
+            trimmed_biases = sorted_biases
+            trimmed_weights = sorted_weights
+            used_samples = int(trimmed_biases.size)
+            fallback_trim = True
+            did_trim = False
+
+    if min_samples_int is not None and used_samples < max(min_samples_int, 1):
+        print(
+            "ℹ️ Calibrazione densità P2R saltata: campioni utili {} insufficienti (minimo richiesto {}).".format(
+                used_samples,
+                min_samples_int,
+            )
+        )
+        return None
+
+    if fallback_trim:
+        print(
+            "ℹ️ Calibrazione densità P2R: trimming disattivato per preservare {} campioni utili.".format(
+                used_samples
+            )
+        )
+
+    if trimmed_biases.size == 0:
         print("ℹ️ Calibrazione densità P2R saltata: dopo il trimming non restano campioni validi.")
         return None
 
-    stat = (stat or "median").lower()
-    if stat == "mean":
-        bias = float(np.mean(sorted_biases))
+    stat_choice = (stat or "median").lower()
+    sample_stat_bias = float(np.mean(trimmed_biases)) if stat_choice == "mean" else float(np.median(trimmed_biases))
+
+    weighted_bias = None
+    if trimmed_biases.size > 0:
+        weight_sum = float(trimmed_weights.sum())
+        if weight_sum > 1e-6:
+            weighted_bias = float(np.sum(trimmed_biases * trimmed_weights) / weight_sum)
+        else:
+            weighted_bias = float(np.mean(trimmed_biases))
+
+    global_bias = None
+    if total_gt > 0 and total_pred > 0:
+        global_bias = float(total_pred / total_gt)
+        if not np.isfinite(global_bias) or global_bias <= 0.0:
+            global_bias = None
+
+    bias = None
+    bias_source = "mediana"
+    if global_bias is not None:
+        bias = global_bias
+        bias_source = "totale"
+    elif weighted_bias is not None and np.isfinite(weighted_bias) and weighted_bias > 0.0:
+        bias = weighted_bias
+        bias_source = "pesato"
     else:
-        bias = float(np.median(sorted_biases))
+        bias = sample_stat_bias
+        bias_source = stat_choice
+
+    if (
+        max_batches is not None
+        and total_gt > 0.0
+        and np.isfinite(total_pred)
+        and (total_pred < 0.05 * total_gt or total_pred > 5.0 * total_gt)
+    ):
+        print(
+            "ℹ️ Calibrazione densità P2R saltata: massa predetta {:.3f} rispetto al GT {:.3f} "
+            "(bias stimato {:.3f}) non è ancora affidabile.".format(
+                total_pred,
+                total_gt,
+                bias,
+            )
+        )
+        return None
+
+    clip_notes = []
+    if min_bias is not None:
+        try:
+            min_bias_val = float(min_bias)
+            if bias < min_bias_val:
+                bias = min_bias_val
+                clip_notes.append(f"min_bias={min_bias_val:.3f}")
+        except (TypeError, ValueError):
+            pass
+    if max_bias is not None:
+        try:
+            max_bias_val = float(max_bias)
+            if bias > max_bias_val:
+                bias = max_bias_val
+                clip_notes.append(f"max_bias={max_bias_val:.3f}")
+        except (TypeError, ValueError):
+            pass
 
     if not np.isfinite(bias) or bias <= 0:
         print("ℹ️ Calibrazione densità P2R saltata: bias non finito.")
         return None
     if abs(bias - 1.0) < bias_eps:
-        print(f"ℹ️ Calibrazione densità P2R: bias già unitario ({bias:.3f}).")
+        print(
+            "ℹ️ Calibrazione densità P2R: bias già unitario ({:.3f}) [totale={}, pesato={}, {}={}].".format(
+                bias,
+                "n/a" if global_bias is None else f"{global_bias:.3f}",
+                "n/a" if weighted_bias is None else f"{weighted_bias:.3f}",
+                stat_choice,
+                f"{sample_stat_bias:.3f}" if trimmed_biases.size > 0 else "n/a",
+            )
+        )
         return bias
 
     if total_gt <= 0 or total_pred <= 0:
@@ -126,34 +266,106 @@ def calibrate_density_scale(
             raise ValueError("LOG_SCALE_CALIBRATION_MAX_DELTA deve essere positivo.")
         adjust = float(np.clip(adjust, -max_adjust_val, max_adjust_val))
         clipped_adjust = abs(adjust - raw_adjust) > 1e-6
-    adjust_tensor = torch.tensor(adjust, device=device, dtype=model.p2r_head.log_scale.dtype)
-    model.p2r_head.log_scale.data -= adjust_tensor
-    if clamp_range is not None:
-        if len(clamp_range) != 2:
-            raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
-        min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
+    target_log_scale = prev_log_scale - adjust
+    model.p2r_head.log_scale.data.fill_(target_log_scale)
+    if effective_clamp is not None:
+        min_val, max_val = effective_clamp
         model.p2r_head.log_scale.data.clamp_(min_val, max_val)
     new_log_scale = float(model.p2r_head.log_scale.detach().item())
     new_scale = torch.exp(model.p2r_head.log_scale.detach()).item()
+    global_str = "n/a" if global_bias is None else f"{global_bias:.3f}"
+    weighted_str = "n/a" if weighted_bias is None else f"{weighted_bias:.3f}"
+    stat_str = "n/a" if trimmed_biases.size == 0 else f"{sample_stat_bias:.3f}"
+    print(
+        "ℹ️ Calibrazione densità P2R: stime bias → totale={}, pesato={}, {}={}, selezionato={}.".format(
+            global_str,
+            weighted_str,
+            stat_choice,
+            stat_str,
+            bias_source,
+        )
+    )
+
+    clip_info = ""
+    clip_parts = []
+    if clip_notes:
+        clip_parts.append("bias limitato da {}".format(", ".join(clip_notes)))
+    if abs(new_log_scale - target_log_scale) > 1e-6:
+        clip_parts.append(f"target_clipped({target_log_scale:.4f})")
+    clip_parts.append(f"fonte={bias_source}")
+    if clip_parts:
+        clip_info = " [" + "; ".join(clip_parts) + "]"
+
     print(
         "🔧 Calibrazione densità P2R: bias={:.3f} ({}/{}, trim={:.2f}, stat={}) → log_scale {:.4f}→{:.4f} "
-        "(scala={:.4f})".format(
+        "(target={:.4f}, scala={:.4f}){}".format(
             bias,
             used_samples,
             num_samples,
-            trim_ratio,
-            stat,
+            0.0 if fallback_trim else trim_ratio,
+            stat_choice,
             prev_log_scale,
             new_log_scale,
+            target_log_scale,
             new_scale,
+            clip_info,
         )
     )
     if clipped_adjust:
         print("ℹ️ Calibrazione limitata da LOG_SCALE_CALIBRATION_MAX_DELTA: valutare un delta più alto se necessario.")
-    if clamp_range is not None:
-        min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
+    clamp_expanded = False
+    try:
+        clamp_floor = float(dynamic_floor) if dynamic_floor is not None else -9.0
+    except (TypeError, ValueError):
+        clamp_floor = -9.0
+    clamp_floor = min(clamp_floor, -1e-3)
+    if effective_clamp is not None:
+        min_val, max_val = effective_clamp
+        # Consente alla dinamica di ridurre il clamp inferiore di almeno 0.5 senza scendere oltre clamp_floor
+        if clamp_floor >= min_val:
+            clamp_floor = min(min_val - 0.5, clamp_floor)
+        boundary_hit = abs(new_log_scale - min_val) < 1e-6 or abs(new_log_scale - max_val) < 1e-6
+        if boundary_hit and abs(bias - 1.0) > bias_eps:
+            expand_amount = 0.5
+            if abs(new_log_scale - min_val) < 1e-6 and bias > 1.0:
+                next_min = max(min_val - expand_amount, clamp_floor)
+                if next_min < min_val - 1e-6:
+                    min_val = next_min
+                    clamp_expanded = True
+            elif abs(new_log_scale - max_val) < 1e-6 and bias < 1.0:
+                max_val += expand_amount
+                clamp_expanded = True
+            if clamp_expanded:
+                desired = float(np.clip(target_log_scale, min_val, max_val))
+                model.p2r_head.log_scale.data.fill_(desired)
+                new_log_scale = float(model.p2r_head.log_scale.detach().item())
+                new_scale = torch.exp(model.p2r_head.log_scale.detach()).item()
+                effective_clamp[0], effective_clamp[1] = min_val, max_val
+                direction = "inferiore" if bias > 1.0 else "superiore"
+                print(
+                    "ℹ️ Calibrazione: clamp {} espanso automaticamente a [{:.4f}, {:.4f}] per ridurre il bias residuo.".format(
+                        direction,
+                        min_val,
+                        max_val,
+                    )
+                )
+                if min_val <= clamp_floor + 1e-6 and bias > 1.0:
+                    print(
+                        "ℹ️ Clamp inferiore fissato a {:.2f}: ulteriori espansioni bloccate per evitare scale eccessivamente piccole.".format(
+                            clamp_floor
+                        )
+                    )
         if abs(new_log_scale - min_val) < 1e-6 or abs(new_log_scale - max_val) < 1e-6:
             print("⚠️ Calibrazione limitata da LOG_SCALE_CLAMP: valuta di allargare il range se necessario.")
+        model.p2r_head._dynamic_clamp = (float(min_val), float(max_val))
+
+    if effective_clamp is not None and clamp_expanded:
+        print(
+            "ℹ️ Nuova scala densità dopo espansione clamp: log_scale={:.4f}, scala={:.4f}".format(
+                new_log_scale,
+                new_scale,
+            )
+        )
 
     return bias
 
@@ -252,19 +464,26 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
 
 # -----------------------------------------------------------
-def main():
-    with open("config.yaml", 'r') as f:
-        cfg = yaml.safe_load(f)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Stage 2 (P2R)")
+    parser.add_argument("--config", default="config.yaml", help="Path al file di configurazione YAML")
+    return parser.parse_args()
+
+
+def main(config_path: str):
+    cfg = load_config(config_path)
 
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
     print(f"✅ Avvio Stage 2 (P2R Training) su {device}")
+    print(f"ℹ️ Config in uso: {config_path}")
 
     # --- Config ---
     optim_cfg = cfg["OPTIM_P2R"]
     data_cfg = cfg["DATA"]
     p2r_loss_cfg = cfg["P2R_LOSS"]
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    early_stop_patience = max(0, int(optim_cfg.get("EARLY_STOPPING_PATIENCE", 0)))
 
     # --- Dataset + transforms ---
     stage2_crop = data_cfg.get("CROP_SIZE_STAGE2", data_cfg.get("CROP_SIZE", 256))
@@ -415,8 +634,12 @@ def main():
         loss_kwargs["max_radius"] = float(p2r_loss_cfg["MAX_RADIUS"])
     p2r_loss_fn = P2RLoss(**loss_kwargs).to(device)
 
+    count_l1_weight = float(p2r_loss_cfg.get("COUNT_L1_WEIGHT", 0.0))
+    density_l1_weight = float(p2r_loss_cfg.get("DENSITY_L1_WEIGHT", 0.0))
+
     log_scale_reg_weight = float(p2r_loss_cfg.get("LOG_SCALE_REG_WEIGHT", 0.0))
     log_scale_reg_target = float(p2r_loss_cfg.get("LOG_SCALE_REG_TARGET", 0.0))
+    log_scale_recalibrate_thr = float(p2r_loss_cfg.get("LOG_SCALE_RECALIBRATE_THR", 0.0))
 
     # --- Setup esperimento ---
     exp_dir = os.path.join(stage1_dir, "stage2")
@@ -455,28 +678,44 @@ def main():
     max_adjust = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
     calibrate_trim = float(p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_TRIM", 0.0))
     calibrate_stat = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_STAT", "median")
-    if start_ep == 1:
-        calibrate_density_scale(
-            model,
-            dl_val,
-            device,
-            default_down,
-            max_batches=calibrate_max_batches,
-            clamp_range=clamp_cfg,
-            max_adjust=max_adjust,
-            trim_ratio=calibrate_trim,
-            stat=calibrate_stat,
-        )
+    calibrate_min_samples = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_SAMPLES")
+    calibrate_min_bias = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_BIAS")
+    calibrate_max_bias = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_BIAS")
+    calibrate_dynamic_floor = p2r_loss_cfg.get("LOG_SCALE_DYNAMIC_FLOOR")
+    calibrate_density_scale(
+        model,
+        dl_val,
+        device,
+        default_down,
+        max_batches=calibrate_max_batches,
+        clamp_range=clamp_cfg,
+        max_adjust=max_adjust,
+        min_samples=calibrate_min_samples,
+        min_bias=calibrate_min_bias,
+        max_bias=calibrate_max_bias,
+        trim_ratio=calibrate_trim,
+        stat=calibrate_stat,
+        dynamic_floor=calibrate_dynamic_floor,
+    )
 
     # --- Training loop ---
+    if count_l1_weight > 0.0:
+        print(f"ℹ️ Stage 2: penalità L1 sui conteggi attiva (peso={count_l1_weight:.3f}).")
+    if density_l1_weight > 0.0:
+        print(f"ℹ️ Stage 2: penalità L1 sulla densità attiva (peso={density_l1_weight:.3e}).")
+
+    no_improve_rounds = 0
+    stop_training = False
+
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
     for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(enumerate(dl_train, start=1), total=len(dl_train), desc=f"[P2R Train] Epoch {ep}/{optim_cfg['EPOCHS']}")
 
-        for batch_idx, (images, _, points) in pbar:
+        for batch_idx, (images, gt_density, points) in pbar:
             images = images.to(device)
+            gt_density = gt_density.to(device)
             points_list = [p.to(device) for p in points]
 
             out = model(images)
@@ -495,6 +734,43 @@ def main():
 
             # ✅ ORA loss coerente con ReLU/(upscale²) — niente più logit
             loss = p2r_loss_fn(pred_density, points_list, down=down_tuple)
+
+            down_h, down_w = down_tuple
+            cell_area = down_h * down_w
+            cell_area_tensor = pred_density.new_tensor(cell_area)
+
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
+            gt_counts = []
+            for p in points_list:
+                if p is None:
+                    gt_counts.append(0.0)
+                else:
+                    gt_counts.append(float(p.shape[0]))
+            gt_count = pred_density.new_tensor(gt_counts)
+
+            count_l1 = None
+            if count_l1_weight > 0.0:
+                count_l1 = torch.abs(pred_count - gt_count).mean()
+                loss = loss + count_l1_weight * count_l1
+
+            density_l1 = None
+            if density_l1_weight > 0.0:
+                gt_density = gt_density.to(dtype=pred_density.dtype)
+                if gt_density.shape[-2:] != pred_density.shape[-2:]:
+                    original_h, original_w = gt_density.shape[-2], gt_density.shape[-1]
+                    gt_resized = F.interpolate(
+                        gt_density,
+                        size=pred_density.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    original_area = float(original_h * original_w)
+                    target_area = float(pred_density.shape[-2] * pred_density.shape[-1])
+                    gt_resized = gt_resized * (original_area / max(target_area, 1.0))
+                else:
+                    gt_resized = gt_density
+                density_l1 = F.l1_loss(pred_density, gt_resized)
+                loss = loss + density_l1_weight * density_l1
 
             reg_penalty_weighted = None
             if log_scale_reg_weight > 0.0 and hasattr(model.p2r_head, "log_scale"):
@@ -522,7 +798,13 @@ def main():
                     if len(clamp_cfg) != 2:
                         raise ValueError("LOG_SCALE_CLAMP deve essere una lista o tupla di due valori [min, max].")
                     min_val, max_val = float(clamp_cfg[0]), float(clamp_cfg[1])
+                    dyn_clamp = getattr(model.p2r_head, "_dynamic_clamp", None)
+                    if dyn_clamp is not None and len(dyn_clamp) == 2:
+                        min_val = min(min_val, float(dyn_clamp[0]))
+                        max_val = max(max_val, float(dyn_clamp[1]))
                     model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+                    model.p2r_head._dynamic_clamp = (float(min_val), float(max_val))
+                global_step = None
                 if hasattr(model.p2r_head, "log_scale"):
                     ds_val = float(torch.exp(model.p2r_head.log_scale.detach()).item())
                     if writer:
@@ -535,11 +817,31 @@ def main():
                                 float(reg_penalty_weighted.detach().item()),
                                 global_step,
                             )
+                if writer:
+                    if global_step is None:
+                        global_step = (ep - 1) * len(dl_train) + batch_idx
+                    batch_pred_sum = float(pred_count.detach().sum().item())
+                    batch_gt_sum = float(gt_count.detach().sum().item())
+                    batch_ratio = batch_pred_sum / batch_gt_sum if batch_gt_sum > 1e-6 else 0.0
+                    dens_mean = float(pred_density.detach().mean().item())
+                    writer.add_scalar("train/batch_pred_gt_ratio", batch_ratio, global_step)
+                    writer.add_scalar("train/density_mean", dens_mean, global_step)
+                    if count_l1 is not None:
+                        writer.add_scalar("loss/count_l1", float(count_l1.detach().item()), global_step)
+                    if density_l1 is not None:
+                        writer.add_scalar("loss/density_l1", float(density_l1.detach().item()), global_step)
 
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "lr": f"{opt.param_groups[0]['lr']:.6f}",
+            }
             if ds_val is not None:
-                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}", dens_scale=f"{ds_val:.6f}")
-            else:
-                pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.6f}")
+                postfix["dens_scale"] = f"{ds_val:.6f}"
+            if count_l1 is not None:
+                postfix["cnt"] = f"{count_l1.item():.2f}"
+            if density_l1 is not None:
+                postfix["dens"] = f"{density_l1.item():.4f}"
+            pbar.set_postfix(postfix)
 
         # --- Scheduler step ---
         if scheduler:
@@ -556,12 +858,49 @@ def main():
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:
             val_loss, mae, mse, tot_pred, tot_gt = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
             orig_bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
+
+            recalibrated = False
+            if (
+                log_scale_recalibrate_thr > 0.0
+                and tot_gt > 0
+                and np.isfinite(orig_bias)
+                and abs(orig_bias - 1.0) > log_scale_recalibrate_thr
+                and hasattr(model.p2r_head, "log_scale")
+            ):
+                print(
+                    "🔁 Stage 2: Pred/GT {:.3f} fuori soglia ±{:.3f}. Ricalibro log_scale prima di proseguire.".format(
+                        orig_bias,
+                        log_scale_recalibrate_thr,
+                    )
+                )
+                recalib_bias = calibrate_density_scale(
+                    model,
+                    dl_val,
+                    device,
+                    default_down,
+                    max_batches=calibrate_max_batches,
+                    clamp_range=clamp_cfg,
+                    max_adjust=max_adjust,
+                    min_samples=calibrate_min_samples,
+                    min_bias=calibrate_min_bias,
+                    max_bias=calibrate_max_bias,
+                    trim_ratio=calibrate_trim,
+                    stat=calibrate_stat,
+                    dynamic_floor=calibrate_dynamic_floor,
+                )
+                if recalib_bias is not None:
+                    print(f"   ↳ Bias stimato dopo ricalibrazione: {recalib_bias:.3f}")
+                val_loss, mae, mse, tot_pred, tot_gt = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
+                orig_bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
+                recalibrated = True
+
             if writer:
                 writer.add_scalar("val/loss_p2r", val_loss, ep)
                 writer.add_scalar("val/MAE", mae, ep)
                 writer.add_scalar("val/MSE", mse, ep)
                 if tot_gt > 0:
                     writer.add_scalar("val/pred_gt_ratio", orig_bias, ep)
+                writer.add_scalar("val/recalibration_performed", 1.0 if recalibrated else 0.0, ep)
 
             # --- Best model ---
             is_best = mae < best_mae
@@ -583,8 +922,12 @@ def main():
                             max_batches=None,
                             clamp_range=clamp_cfg,
                             max_adjust=max_adjust,
+                            min_samples=calibrate_min_samples,
+                            min_bias=calibrate_min_bias,
+                            max_bias=calibrate_max_bias,
                             trim_ratio=calibrate_trim,
                             stat=calibrate_stat,
+                            dynamic_floor=calibrate_dynamic_floor,
                         )
                         calibrated_metrics = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
                         cal_loss, cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = calibrated_metrics
@@ -610,6 +953,16 @@ def main():
             # Aggiorna il tracker del best MAE con il candidato (calibrato se disponibile)
             if is_best:
                 best_mae = min(best_mae, best_candidate)
+                no_improve_rounds = 0
+            else:
+                if early_stop_patience > 0:
+                    no_improve_rounds += 1
+                    if no_improve_rounds >= early_stop_patience:
+                        print(
+                            f"⛔ Early stopping: nessun miglioramento MAE per "
+                            f"{no_improve_rounds} validazioni consecutive."
+                        )
+                        stop_training = True
 
             save_checkpoint(model, opt, ep, mae, best_mae, exp_dir, is_best=is_best)
 
@@ -626,6 +979,9 @@ def main():
                     )
                 )
 
+            if stop_training:
+                break
+
             # --- Debug ogni 50 epoche ---
             if ep % 50 == 0:
                 with torch.no_grad():
@@ -638,6 +994,6 @@ def main():
     print("✅ Stage 2 completato.")
 
 
-# -----------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args.config)

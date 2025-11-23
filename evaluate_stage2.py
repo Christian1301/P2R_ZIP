@@ -181,6 +181,12 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
+    calibrate_trim = float(loss_cfg.get("LOG_SCALE_CALIBRATION_TRIM", 0.0))
+    calibrate_stat = loss_cfg.get("LOG_SCALE_CALIBRATION_STAT", "median")
+    calibrate_min_samples = loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_SAMPLES")
+    calibrate_min_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_BIAS")
+    calibrate_max_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_BIAS")
+    calibrate_dynamic_floor = loss_cfg.get("LOG_SCALE_DYNAMIC_FLOOR")
     calibrate_density_scale(
         model,
         val_loader,
@@ -189,6 +195,12 @@ def main(config_path: str, checkpoint_override: Optional[str] = None):
         max_batches=None,
         clamp_range=clamp_cfg,
         max_adjust=max_adjust,
+        min_samples=calibrate_min_samples,
+        min_bias=calibrate_min_bias,
+        max_bias=calibrate_max_bias,
+        trim_ratio=calibrate_trim,
+        stat=calibrate_stat,
+        dynamic_floor=calibrate_dynamic_floor,
     )
     evaluate_p2r(model, val_loader, loss_fn, device, cfg)
 

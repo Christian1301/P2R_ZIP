@@ -77,6 +77,8 @@ def train_one_epoch(
     default_down,
     clamp_cfg=None,
     zip_scale: float = 1.0,
+    count_l1_weight: float = 0.0,
+    density_l1_weight: float = 0.0,
 ):
     model.train()
     total_loss = 0.0
@@ -96,9 +98,44 @@ def train_one_epoch(
         pred_density, down_tuple, _ = canonicalize_p2r_grid(
             pred_density, (h_in, w_in), default_down, warn_tag="stage3_train"
         )
+        down_h, down_w = down_tuple
+        cell_area = down_h * down_w
+        cell_area_tensor = pred_density.new_tensor(cell_area)
+        gt_density = gt_density.to(dtype=pred_density.dtype)
 
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
+
+        pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
+        gt_counts = []
+        for p in points:
+            if p is None:
+                gt_counts.append(0.0)
+            else:
+                gt_counts.append(float(p.shape[0]))
+        gt_count = pred_density.new_tensor(gt_counts)
+        count_l1 = torch.abs(pred_count - gt_count).mean()
+
+        density_l1 = pred_density.new_tensor(0.0)
+        if density_l1_weight > 0.0:
+            _, _, h_gt, w_gt = gt_density.shape
+            if (h_gt, w_gt) != pred_density.shape[-2:]:
+                gt_resized = F.interpolate(
+                    gt_density,
+                    size=pred_density.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                scale_ratio = (h_gt * w_gt) / (pred_density.shape[-2] * pred_density.shape[-1])
+                gt_resized = gt_resized * scale_ratio
+            else:
+                gt_resized = gt_density
+            density_l1 = F.l1_loss(pred_density, gt_resized)
+
         combined_loss = scaled_loss_zip + alpha * loss_p2r
+        if count_l1_weight > 0.0:
+            combined_loss = combined_loss + count_l1_weight * count_l1
+        if density_l1_weight > 0.0:
+            combined_loss = combined_loss + density_l1_weight * density_l1
         combined_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -111,16 +148,26 @@ def train_one_epoch(
             if len(clamp_cfg) != 2:
                 raise ValueError("LOG_SCALE_CLAMP deve avere due valori [min, max].")
             min_val, max_val = float(clamp_cfg[0]), float(clamp_cfg[1])
+            dyn_clamp = getattr(model.p2r_head, "_dynamic_clamp", None)
+            if dyn_clamp is not None and len(dyn_clamp) == 2:
+                min_val = min(min_val, float(dyn_clamp[0]))
+                max_val = max(max_val, float(dyn_clamp[1]))
             model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+            model.p2r_head._dynamic_clamp = (float(min_val), float(max_val))
 
         total_loss += combined_loss.item()
         current_lr = max(group['lr'] for group in optimizer.param_groups)
-        progress_bar.set_postfix({
+        postfix = {
             "total": f"{combined_loss.item():.4f}",
             "zip": f"{scaled_loss_zip.item():.4f}",
             "p2r": f"{loss_p2r.item():.4f}",
             "lr": f"{current_lr:.6f}"
-        })
+        }
+        if count_l1_weight > 0.0:
+            postfix["cnt"] = f"{count_l1.item():.2f}"
+        if density_l1_weight > 0.0:
+            postfix["dens"] = f"{density_l1.item():.4f}"
+        progress_bar.set_postfix(postfix)
 
     return total_loss / len(dataloader)
 
@@ -178,6 +225,11 @@ def main(config_path: str):
     loss_cfg = config.get("P2R_LOSS", {})
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
+    log_scale_recalibrate_thr = float(loss_cfg.get("LOG_SCALE_RECALIBRATE_THR", 0.0))
+    calibrate_min_samples = loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_SAMPLES")
+    calibrate_min_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_BIAS")
+    calibrate_max_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_BIAS")
+    calibrate_dynamic_floor = loss_cfg.get("LOG_SCALE_DYNAMIC_FLOOR")
 
     dataset_name = config["DATASET"]
     model_cfg = config["MODEL"]
@@ -265,6 +317,13 @@ def main(config_path: str):
     criterion_p2r = P2RLoss(**loss_kwargs).to(device)
     alpha = float(config["JOINT_LOSS"]["ALPHA"])
     zip_scale = float(config["JOINT_LOSS"].get("ZIP_SCALE", 1.0))
+    count_l1_weight = float(
+        config["JOINT_LOSS"].get(
+            "P2R_COUNT_L1_W",
+            config["JOINT_LOSS"].get("COUNT_L1_W", 0.0),
+        )
+    )
+    density_l1_weight = float(config["JOINT_LOSS"].get("DENSITY_L1_W", 0.0))
 
     param_groups = [
         {'params': model.backbone.parameters(), 'lr': optim_cfg["LR_BACKBONE"]},
@@ -357,6 +416,9 @@ def main(config_path: str):
         except (TypeError, ValueError):
             calibrate_max_batches = None
 
+    calibrate_trim = float(loss_cfg.get("LOG_SCALE_CALIBRATION_TRIM", 0.0))
+    calibrate_stat = loss_cfg.get("LOG_SCALE_CALIBRATION_STAT", "median")
+
     if hasattr(model, "p2r_head") and hasattr(model.p2r_head, "log_scale"):
         print("🔧 Calibrazione iniziale Stage 3...")
         calibrate_density_scale(
@@ -367,6 +429,12 @@ def main(config_path: str):
             max_batches=calibrate_max_batches,
             clamp_range=clamp_cfg,
             max_adjust=max_adjust,
+            min_samples=calibrate_min_samples,
+            min_bias=calibrate_min_bias,
+            max_bias=calibrate_max_bias,
+            trim_ratio=calibrate_trim,
+            stat=calibrate_stat,
+            dynamic_floor=calibrate_dynamic_floor,
         )
 
     best_mae = float("inf")
@@ -375,6 +443,12 @@ def main(config_path: str):
     patience = max(0, int(optim_cfg.get("EARLY_STOPPING_PATIENCE", 0)))
     early_delta = max(0.0, float(optim_cfg.get("EARLY_STOPPING_DELTA", 0.0)))
     no_improve_rounds = 0
+    bias_exceed_streak = 0
+
+    if count_l1_weight > 0.0:
+        print(f"ℹ️ Stage 3: penalità L1 sui conteggi attiva (peso={count_l1_weight:.3f}).")
+    if density_l1_weight > 0.0:
+        print(f"ℹ️ Stage 3: penalità L1 sulla densità attiva (peso={density_l1_weight:.3e}).")
 
     print(f"🚀 Inizio Stage 3 — Fine-tuning congiunto per {epochs_stage3} epoche...")
 
@@ -393,6 +467,8 @@ def main(config_path: str):
             default_down,
             clamp_cfg=clamp_cfg,
             zip_scale=zip_scale,
+            count_l1_weight=count_l1_weight,
+            density_l1_weight=density_l1_weight,
         )
 
         if scheduler and schedule_step_mode == "epoch":
@@ -401,9 +477,54 @@ def main(config_path: str):
         if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:
             val_mae, val_rmse, tot_pred, tot_gt = validate(model, val_loader, device, default_down)
             bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
+
+            recalibrated = False
+            bias_exceed = (
+                log_scale_recalibrate_thr > 0.0
+                and tot_gt > 0
+                and np.isfinite(bias)
+                and abs(bias - 1.0) > log_scale_recalibrate_thr
+            )
+            bias_exceed_streak = bias_exceed_streak + 1 if bias_exceed else 0
+
+            if (
+                bias_exceed
+                and bias_exceed_streak >= 2
+                and hasattr(model, "p2r_head")
+                and hasattr(model.p2r_head, "log_scale")
+            ):
+                print(
+                    "🔁 Stage 3: Pred/GT {:.3f} fuori soglia ±{:.3f}. Ricalibro log_scale prima di aggiornare il best.".format(
+                        bias,
+                        log_scale_recalibrate_thr,
+                    )
+                )
+                recalib_bias = calibrate_density_scale(
+                    model,
+                    calibrate_loader,
+                    device,
+                    default_down,
+                    max_batches=calibrate_max_batches,
+                    clamp_range=clamp_cfg,
+                    max_adjust=max_adjust,
+                    min_samples=calibrate_min_samples,
+                    min_bias=calibrate_min_bias,
+                    max_bias=calibrate_max_bias,
+                    trim_ratio=calibrate_trim,
+                    stat=calibrate_stat,
+                    dynamic_floor=calibrate_dynamic_floor,
+                )
+                if recalib_bias is not None:
+                    print(f"   ↳ Bias stimato dopo ricalibrazione: {recalib_bias:.3f}")
+                val_mae, val_rmse, tot_pred, tot_gt = validate(model, val_loader, device, default_down)
+                bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
+                recalibrated = True
+                bias_exceed_streak = 0
+
+            recalib_note = " (ricalibrato)" if recalibrated else ""
             print(
                 f"Epoch {epoch + 1}: Train Loss {train_loss:.4f} | Val MAE {val_mae:.2f} | "
-                f"RMSE {val_rmse:.2f} | Pred/GT {bias:.3f}"
+                f"RMSE {val_rmse:.2f} | Pred/GT {bias:.3f}{recalib_note}"
             )
 
             improvement_margin = best_mae - val_mae
@@ -425,6 +546,12 @@ def main(config_path: str):
                             max_batches=None,
                             clamp_range=clamp_cfg,
                             max_adjust=max_adjust,
+                            min_samples=calibrate_min_samples,
+                            min_bias=calibrate_min_bias,
+                            max_bias=calibrate_max_bias,
+                            trim_ratio=calibrate_trim,
+                            stat=calibrate_stat,
+                            dynamic_floor=calibrate_dynamic_floor,
                         )
                         cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = validate(
                             model, val_loader, device, default_down

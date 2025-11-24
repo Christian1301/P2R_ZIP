@@ -230,6 +230,16 @@ def main(config_path: str):
     calibrate_min_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MIN_BIAS")
     calibrate_max_bias = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_BIAS")
     calibrate_dynamic_floor = loss_cfg.get("LOG_SCALE_DYNAMIC_FLOOR")
+    calibrate_damping = loss_cfg.get("LOG_SCALE_CALIBRATION_DAMPING", 1.0)
+
+    joint_loss_cfg = config.get("JOINT_LOSS", {})
+
+    joint_recalib_thr = joint_loss_cfg.get("LOG_SCALE_RECALIBRATE_THR")
+    if joint_recalib_thr is not None:
+        try:
+            log_scale_recalibrate_thr = float(joint_recalib_thr)
+        except (TypeError, ValueError):
+            pass
 
     dataset_name = config["DATASET"]
     model_cfg = config["MODEL"]
@@ -306,6 +316,10 @@ def main(config_path: str):
     loss_kwargs = {}
     if "SCALE_WEIGHT" in loss_cfg:
         loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
+    if "SCALE_PENALTY_HUBER_DELTA" in loss_cfg:
+        loss_kwargs["scale_huber_delta"] = float(loss_cfg["SCALE_PENALTY_HUBER_DELTA"])
+    if "SCALE_PENALTY_CAP" in loss_cfg:
+        loss_kwargs["scale_penalty_cap"] = float(loss_cfg["SCALE_PENALTY_CAP"])
     if "POS_WEIGHT" in loss_cfg:
         loss_kwargs["pos_weight"] = float(loss_cfg["POS_WEIGHT"])
     if "CHUNK_SIZE" in loss_cfg:
@@ -435,6 +449,7 @@ def main(config_path: str):
             trim_ratio=calibrate_trim,
             stat=calibrate_stat,
             dynamic_floor=calibrate_dynamic_floor,
+            adjust_damping=calibrate_damping,
         )
 
     best_mae = float("inf")
@@ -513,6 +528,7 @@ def main(config_path: str):
                     trim_ratio=calibrate_trim,
                     stat=calibrate_stat,
                     dynamic_floor=calibrate_dynamic_floor,
+                    adjust_damping=calibrate_damping,
                 )
                 if recalib_bias is not None:
                     print(f"   ↳ Bias stimato dopo ricalibrazione: {recalib_bias:.3f}")
@@ -552,6 +568,7 @@ def main(config_path: str):
                             trim_ratio=calibrate_trim,
                             stat=calibrate_stat,
                             dynamic_floor=calibrate_dynamic_floor,
+                            adjust_damping=calibrate_damping,
                         )
                         cal_mae, cal_rmse, cal_tot_pred, cal_tot_gt = validate(
                             model, val_loader, device, default_down

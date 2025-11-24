@@ -65,6 +65,8 @@ class P2RLoss(nn.Module):
         reduction: "mean" o "sum" (default "mean")
         chunk_size: numero di pixel per chunk nel matching punto-pixel
         scale_weight: peso della penalità di scala sui conteggi globali
+        scale_huber_delta: soglia Huber (in conteggi) per rendere la penalità meno sensibile agli outlier
+        scale_penalty_cap: clamp massimo (in conteggi) applicato alla penalità di scala prima di pesarla
         min_radius: soglia in pixel (nello spazio input) per classificare un pixel come positivo (vicino a un punto)
         max_radius: clamp superiore per la scala distanze (utile a stabilizzare i pesi)
         cost_point: peso del costo punto
@@ -80,6 +82,8 @@ class P2RLoss(nn.Module):
         max_radius: float = 96.0,
         cost_point: float = 8.0,
         cost_class: float = 1.0,
+        scale_huber_delta: Optional[float] = None,
+        scale_penalty_cap: Optional[float] = None,
     ):
         super().__init__()
         self.cost = L2DIS(1.0)
@@ -91,6 +95,12 @@ class P2RLoss(nn.Module):
         self.chunk_size = int(chunk_size)
         self.scale_weight = float(scale_weight)
         self.pos_weight = float(pos_weight)
+        self.scale_huber_delta = (
+            float(scale_huber_delta) if scale_huber_delta is not None and float(scale_huber_delta) > 0 else None
+        )
+        self.scale_penalty_cap = (
+            float(scale_penalty_cap) if scale_penalty_cap is not None and float(scale_penalty_cap) > 0 else None
+        )
 
     @torch.no_grad()
     def _min_distances_streaming(
@@ -265,7 +275,22 @@ class P2RLoss(nn.Module):
             _check_no_nan_inf(pred_counts_t, "pred_counts")
             _check_no_nan_inf(gt_counts_t, "gt_counts")
 
-            scale_penalty = self.scale_weight * torch.abs(pred_counts_t - gt_counts_t).mean()
+            diff_counts = torch.abs(pred_counts_t - gt_counts_t)
+            if self.scale_huber_delta is not None:
+                delta = max(self.scale_huber_delta, 1e-6)
+                huber = torch.where(
+                    diff_counts <= delta,
+                    0.5 * (diff_counts ** 2) / delta,
+                    diff_counts - 0.5 * delta,
+                )
+                penalty_core = huber
+            else:
+                penalty_core = diff_counts
+
+            if self.scale_penalty_cap is not None:
+                penalty_core = torch.clamp(penalty_core, max=self.scale_penalty_cap)
+
+            scale_penalty = self.scale_weight * penalty_core.mean()
             total_loss = total_loss + 1.0 * scale_penalty
         else:
             scale_penalty = dens.new_tensor(0.0)

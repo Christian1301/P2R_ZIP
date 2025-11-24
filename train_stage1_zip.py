@@ -3,7 +3,8 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 import os
 
@@ -35,7 +36,60 @@ def zip_regularization(
 
     return reg_loss
 
-def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, reg_params, clip_grad_norm=1.0):
+
+def build_count_sampler(dataset, sampler_cfg):
+    if not sampler_cfg or not sampler_cfg.get("ENABLE", False):
+        return None
+    if not hasattr(dataset, "image_list") or not hasattr(dataset, "load_points"):
+        print("ℹ️ Sampler ZIP disattivato: il dataset non supporta image_list/load_points.")
+        return None
+
+    counts = []
+    for img_path in dataset.image_list:
+        try:
+            pts = dataset.load_points(img_path)
+            counts.append(len(pts))
+        except Exception as exc:
+            print(f"⚠️ Count sampler: errore nel caricare {img_path}: {exc}")
+            counts.append(0)
+
+    if not counts:
+        print("ℹ️ Sampler ZIP disattivato: nessun campione disponibile.")
+        return None
+
+    counts_arr = np.array(counts, dtype=np.float64)
+    log_offset = max(1e-3, float(sampler_cfg.get("LOG_OFFSET", 1.0)))
+    base_weight = max(1e-6, float(sampler_cfg.get("BASE_WEIGHT", 1.0)))
+    power = float(sampler_cfg.get("POWER", 1.0))
+
+    scaled = np.log1p(counts_arr + log_offset)
+    if power != 1.0:
+        scaled = np.power(scaled, power)
+    weights = base_weight * scaled
+    weights = np.clip(weights, 1e-6, None)
+
+    torch_weights = torch.as_tensor(weights, dtype=torch.double)
+    sampler = WeightedRandomSampler(torch_weights, num_samples=len(dataset), replacement=True)
+    print(
+        "ℹ️ Count-aware sampler attivo: avg_w={:.3f}, max_count={:.1f}, min_count={:.1f}".format(
+            float(weights.mean()),
+            float(counts_arr.max()),
+            float(counts_arr.min()),
+        )
+    )
+    return sampler
+
+def train_one_epoch(
+    model,
+    criterion,
+    dataloader,
+    optimizer,
+    scheduler,
+    device,
+    reg_params,
+    count_weight: float = 0.0,
+    clip_grad_norm: float = 1.0,
+):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
@@ -50,6 +104,16 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         reg_loss = zip_regularization(predictions, **reg_params)
         total = loss + reg_loss
 
+        count_loss = None
+        if count_weight > 0.0:
+            pi_maps = predictions["logit_pi_maps"].softmax(dim=1)
+            pi_zero = pi_maps[:, 0:1]
+            lam = predictions["lambda_maps"]
+            pred_count = torch.sum((1 - pi_zero) * lam, dim=(1, 2, 3))
+            gt_count = torch.sum(gt_density, dim=(1, 2, 3))
+            count_loss = F.smooth_l1_loss(pred_count, gt_count)
+            total = total + count_weight * count_loss
+
         total.backward()
         if clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
@@ -57,14 +121,17 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
 
         total_loss += total.item()
 
-        progress_bar.set_postfix({
+        postfix = {
             'loss': f"{total.item():.4f}",
             'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}",
             'count': f"{loss_dict['zip_count_loss']:.4f}",
             'reg': f"{reg_loss.item():.4f}",
             'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
-        })
+        }
+        if count_loss is not None:
+            postfix['cnt_reg'] = f"{count_loss.item():.4f}"
+        progress_bar.set_postfix(postfix)
 
     if scheduler:
         scheduler.step()
@@ -192,14 +259,17 @@ def main(config_path: str):
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
         transforms=val_tf,
     )
+    sampler_cfg = data_cfg.get("COUNT_SAMPLER", {})
+    train_sampler = build_count_sampler(train_set, sampler_cfg)
     train_loader = DataLoader(
         train_set,
         batch_size=optim_cfg["BATCH_SIZE"],
-        shuffle=True,
+        shuffle=train_sampler is None,
         num_workers=optim_cfg["NUM_WORKERS"],
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
+        sampler=train_sampler,
     )
     val_loader = DataLoader(
         val_set,
@@ -223,6 +293,7 @@ def main(config_path: str):
         "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
         "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
     }
+    count_reg_weight = float(zip_reg_cfg.get("COUNT_WEIGHT", 0.0))
 
     max_epochs = optim_cfg.get("EPOCHS", 1300)
     no_improve_count = 0
@@ -240,6 +311,7 @@ def main(config_path: str):
             scheduler,
             device,
             zip_reg_params,
+            count_weight=count_reg_weight,
             clip_grad_norm=clip_grad,
         )
 

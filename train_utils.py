@@ -92,8 +92,12 @@ def get_scheduler(optimizer, optim_config, max_epochs):
     return None
 
 
-def collate_fn(batch):
+def collate_fn(batch, return_meta=False):
+    if not batch:
+        raise ValueError("Batch vuoto passato a collate_fn")
+
     item = batch[0]
+    meta_list = [] if return_meta else None
 
     if 'density' in item and isinstance(item['points'], torch.Tensor):
         max_h = max(b['image'].shape[1] for b in batch)
@@ -108,16 +112,31 @@ def collate_fn(batch):
             padded_densities.append(F.pad(den, pad))
             points_list.append(pts)
 
-        return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
+            if meta_list is not None:
+                meta_list.append({
+                    "img_path": b.get("img_path"),
+                    "orig_shape": tuple(img.shape[-2:]),
+                    "points_count": int(pts.shape[0]) if isinstance(pts, torch.Tensor) else 0,
+                })
+
+        batch_out = (torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list)
 
     elif 'zip_blocks' in item and isinstance(item['points'], torch.Tensor):
         warnings.warn("collate_fn: rilevato formato 'zip_blocks' (solo per retrocompatibilità).")
         imgs = torch.stack([b["image"] for b in batch], 0)
         blocks = torch.stack([b["zip_blocks"] for b in batch], 0)
         points = [b["points"] for b in batch]
-        return imgs, blocks, points
+        if meta_list is not None:
+            for b in batch:
+                meta_list.append({"img_path": b.get("img_path")})
+        batch_out = (imgs, blocks, points)
 
-    raise TypeError(f"Formato batch non riconosciuto in collate_fn: {item.keys()}")
+    else:
+        raise TypeError(f"Formato batch non riconosciuto in collate_fn: {item.keys()}")
+
+    if meta_list is not None:
+        return (*batch_out, meta_list)
+    return batch_out
 
 
 def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, warn_tol=0.15):

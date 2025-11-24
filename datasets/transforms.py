@@ -96,9 +96,7 @@ class RandomResizedCrop(object):
         j = (width - w) // 2
         return i, j, h, w
 
-    def __call__(self, img, pts=None, den=None):
-        i, j, h, w = self.get_params(img, self.scale, self.ratio)
-
+    def _apply_crop(self, img, pts, den, i, j, h, w):
         img = F.resized_crop(img, i, j, h, w, self.size, self.interpolation)
 
         new_pts = None
@@ -124,6 +122,49 @@ class RandomResizedCrop(object):
                  new_den = np.zeros(self.size, dtype=np.float32)
 
         return img, new_pts, new_den
+
+    def __call__(self, img, pts=None, den=None):
+        i, j, h, w = self.get_params(img, self.scale, self.ratio)
+        return self._apply_crop(img, pts, den, i, j, h, w)
+
+
+class CrowdAwareRandomResizedCrop(RandomResizedCrop):
+    """Versione di RandomResizedCrop che cerca di preservare una quota di punti nelle scene dense."""
+
+    def __init__(
+        self,
+        size,
+        scale=(0.3, 1.0),
+        ratio=(3. / 4., 4. / 3.),
+        min_keep_ratio=0.7,
+        dense_points=600,
+        max_attempts=6,
+    ):
+        super().__init__(size=size, scale=scale, ratio=ratio)
+        self.min_keep_ratio = float(np.clip(min_keep_ratio, 0.0, 1.0))
+        self.dense_points = max(1, int(dense_points))
+        self.max_attempts = max(1, int(max_attempts))
+
+    def __call__(self, img, pts=None, den=None):
+        if pts is None or len(pts) < self.dense_points or self.min_keep_ratio <= 0.0:
+            return super().__call__(img, pts, den)
+
+        chosen_params = None
+        total_pts = max(len(pts), 1)
+        for _ in range(self.max_attempts):
+            candidate = self.get_params(img, self.scale, self.ratio)
+            i, j, h, w = candidate
+            mask = (pts[:, 0] >= j) & (pts[:, 0] < j + w) & (pts[:, 1] >= i) & (pts[:, 1] < i + h)
+            keep_ratio = float(mask.sum()) / float(total_pts)
+            if keep_ratio >= self.min_keep_ratio:
+                chosen_params = candidate
+                break
+
+        if chosen_params is None:
+            chosen_params = self.get_params(img, self.scale, self.ratio)
+
+        i, j, h, w = chosen_params
+        return self._apply_crop(img, pts, den, i, j, h, w)
 
 class ImageOnlyTransform(object):
     """Wrapper per trasformazioni torchvision che operano solo sull'immagine."""
@@ -151,8 +192,20 @@ def build_transforms(cfg_data, is_train=True, override_crop_size=None, override_
         except (TypeError, ValueError, IndexError):
             crop_scale = (0.3, 1.0)
 
+        scene_crop_cfg = cfg_data.get('SCENE_AWARE_CROP', {}) or {}
+        use_scene_crop = bool(scene_crop_cfg.get('ENABLE', False))
+        crop_cls = CrowdAwareRandomResizedCrop if use_scene_crop else RandomResizedCrop
+        crop_kwargs = {
+            'size': crop_size,
+            'scale': crop_scale,
+        }
+        if use_scene_crop:
+            crop_kwargs['min_keep_ratio'] = float(scene_crop_cfg.get('KEEP_RATIO', 0.7))
+            crop_kwargs['dense_points'] = int(scene_crop_cfg.get('DENSE_POINT_THRESHOLD', 600))
+            crop_kwargs['max_attempts'] = int(scene_crop_cfg.get('MAX_ATTEMPTS', 6))
+
         return Compose([
-            RandomResizedCrop(size=crop_size, scale=crop_scale),
+            crop_cls(**crop_kwargs),
             RandomHorizontalFlip(p=0.5),
 
             ImageOnlyTransform(transforms.TrivialAugmentWide()),

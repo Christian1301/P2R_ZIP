@@ -98,7 +98,7 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.06
+  SCALE_WEIGHT: 0.055
   SCALE_PENALTY_HUBER_DELTA: 120.0
   SCALE_PENALTY_CAP: 800.0
   SCALE_PENALTY_NORM: "sqrt_gt"
@@ -136,8 +136,12 @@ P2R_DIAGNOSTICS:
 
 P2R_HARD_REPLAY:
   ENABLE: true
-  IMAGES: []
-  REPEAT_FACTOR: 3
+  IMAGES:
+    - "part_A/val_data/images/IMG_267.jpg"
+    - "part_A/val_data/images/IMG_11.jpg"
+    - "part_A/val_data/images/IMG_58.jpg"
+    - "part_A/val_data/images/IMG_53.jpg"
+  REPEAT_FACTOR: 6
   AUTO_DENSE:
     ENABLE: true
     MIN_POINTS: 700
@@ -148,7 +152,15 @@ P2R_SCENE_PRIORITIES:
   ENABLE: true
   DEFAULT_COUNT_WEIGHT: 0.20
   DEFAULT_COUNT_THRESHOLD: 200.0
-  TARGETS: []
+  TARGETS:
+    - match: "img_267"
+      count_weight: 0.80
+      count_threshold: 0.0
+      loss_boost: 0.0
+    - match: "img_11"
+      count_weight: 0.80
+      count_threshold: 0.0
+      loss_boost: 0.0
   AUTO_COUNT_BOOST:
     ENABLE: true
     THRESHOLD: 600.0

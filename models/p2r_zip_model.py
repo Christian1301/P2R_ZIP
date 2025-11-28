@@ -38,7 +38,10 @@ class P2R_ZIP_Model(nn.Module):
         self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins, **zip_head_kwargs)
         p2r_head_kwargs = p2r_head_kwargs or {}
         if "in_channel" not in p2r_head_kwargs:
-            p2r_head_kwargs["in_channel"] = 512
+            c_in = self.backbone.out_channels
+            if gate == "concat":
+                c_in += 1 
+            p2r_head_kwargs["in_channel"] = c_in
         if "fea_channel" not in p2r_head_kwargs:
             p2r_head_kwargs["fea_channel"] = 64
         if "up_scale" not in p2r_head_kwargs:

@@ -1,5 +1,5 @@
 # ========================================
-# CONFIGURAZIONE FINALE P2R + ZIP
+# CONFIGURAZIONE FINALE P2R + ZIP (HYBRID)
 # ========================================
 
 RUN_NAME: "shha_test" 
@@ -16,7 +16,7 @@ DATA:
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
-  CROP_SIZE: 256 # default per Stage 2 / Stage 3 P2R
+  CROP_SIZE: 256
   CROP_SCALE: [0.75, 2.0]
   CROP_SIZE_STAGE1: 448
   CROP_SCALE_STAGE1: [0.75, 2.0]
@@ -35,14 +35,14 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn" 
-  ZIP_PI_THRESH: 0.15
+  BACKBONE: "vgg16_bn"
+  ZIP_PI_THRESH: 0.10
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
   ZIP_PI_SOFT: true
   ZIP_PI_SOFT_MIN: 0.05
   ZIP_PI_SOFT_POWER: 1.0
-  ZIP_PI_APPLY_TO_P2R: true
+  ZIP_PI_APPLY_TO_P2R: false    
 
 ZIP_HEAD:
   LAMBDA_SCALE: 0.5
@@ -52,7 +52,7 @@ ZIP_HEAD:
 
 # === STAGE 1: ZIP TRAINING  ===
 OPTIM_ZIP:
-  BATCH_SIZE: 8 # MODIFICATO (da 4) - Allineato a sha.yaml
+  BATCH_SIZE: 8 
   NUM_WORKERS: 4
   EPOCHS: 1300 
   WEIGHT_DECAY: 1.0e-4
@@ -64,8 +64,8 @@ OPTIM_ZIP:
   SAVE_BEST: true
   EARLY_STOPPING_PATIENCE: 200
   CLIP_GRAD_NORM: 1.0
-  BASE_LR: 1.0e-4 # MODIFICATO (da 2.0e-5) - Allineato a sha.yaml
-  LR_BACKBONE: 1.0e-4 # MODIFICATO (da 5.0e-6) - Allineato a sha.yaml
+  BASE_LR: 1.0e-4 
+  LR_BACKBONE: 1.0e-4 
 
 ZIP_LOSS:
   WEIGHT_CE: 3.0
@@ -84,9 +84,10 @@ OPTIM_P2R:
   BATCH_SIZE: 16
   NUM_WORKERS: 4
   EPOCHS: 1500
-  LR: 5.0e-5 # MODIFICATO (da 1.0e-4) - Allineato a config.py
-  FINETUNE_BACKBONE: true
-  LR_BACKBONE: 1.0e-5 # MODIFICATO (da 5.0e-6) - Allineato a config.py
+  # MODIFICA: Alzato leggermente (da 5e-5 a 8e-5) perché "multiply" rende il training più stabile
+  LR: 8.0e-5                    
+  FINETUNE_BACKBONE: true       
+  LR_BACKBONE: 1.0e-5
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 10
@@ -98,31 +99,34 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.055
+  # CRITICO: Peso mantenuto molto basso (1e-3) per forzare l'apprendimento spaziale e non scalare
+  SCALE_WEIGHT: 1.0e-3
   SCALE_PENALTY_HUBER_DELTA: 120.0
   SCALE_PENALTY_CAP: 800.0
   SCALE_PENALTY_NORM: "sqrt_gt"
   POS_WEIGHT: 3.2
   CHUNK_SIZE: 2048
-  MIN_RADIUS: 6.0
+  MIN_RADIUS: 4.0
   MAX_RADIUS: 72.0
   GRAD_REG_WEIGHT: 5.0e-4
   LOG_SCALE_INIT: -2.5
-  LOG_SCALE_LR_FACTOR: 0.25
-  LOG_SCALE_CLAMP: [-8.5, -0.1]
-  LOG_SCALE_DYNAMIC_FLOOR: -8.0
+  # Rallentiamo l'aggiornamento della scala globale
+  LOG_SCALE_LR_FACTOR: 0.05
+  # Range ampio per evitare blocchi numerici
+  LOG_SCALE_CLAMP: [-20.0, 5.0]
+  LOG_SCALE_DYNAMIC_FLOOR: -20.0
   LOG_SCALE_CALIBRATION_DAMPING: 0.9
   LOG_SCALE_CALIBRATION_TRIM: 0.12
   LOG_SCALE_CALIBRATION_STAT: "median"
-  LOG_SCALE_REG_WEIGHT: 0.08
-  LOG_SCALE_REG_TARGET: -4.50
+  LOG_SCALE_REG_WEIGHT: 0.01
+  LOG_SCALE_REG_TARGET: -3.0
   LOG_SCALE_CALIBRATION_MIN_SAMPLES: 10
   LOG_SCALE_CALIBRATION_MIN_BIAS: 0.4
   LOG_SCALE_CALIBRATION_MAX_BIAS: 2.2
   LOG_SCALE_CALIBRATION_MAX_DELTA: 1.0
   LOG_SCALE_RECALIBRATE_THR: 0.10
   DENSITY_L1_WEIGHT: 3.0e-3
-  COUNT_L1_WEIGHT: 1.00
+  COUNT_L1_WEIGHT: 0.80
   CALIBRATE_BATCHES: 10
   COUNT_DRIFT_PENALTY:
     ENABLE: true
@@ -141,7 +145,7 @@ P2R_HARD_REPLAY:
     - "part_A/val_data/images/IMG_11.jpg"
     - "part_A/val_data/images/IMG_58.jpg"
     - "part_A/val_data/images/IMG_53.jpg"
-  REPEAT_FACTOR: 6
+  REPEAT_FACTOR: 4
   AUTO_DENSE:
     ENABLE: true
     MIN_POINTS: 700
@@ -154,11 +158,11 @@ P2R_SCENE_PRIORITIES:
   DEFAULT_COUNT_THRESHOLD: 200.0
   TARGETS:
     - match: "img_267"
-      count_weight: 0.80
+      count_weight: 0.60
       count_threshold: 0.0
       loss_boost: 0.0
     - match: "img_11"
-      count_weight: 0.80
+      count_weight: 0.60
       count_threshold: 0.0
       loss_boost: 0.0
   AUTO_COUNT_BOOST:
@@ -180,7 +184,7 @@ P2R_AUTO_RECOVER:
   MAX_BATCHES: 6
 
 P2R_CURRICULUM:
-  ENABLE: true
+  ENABLE: false
   EPOCHS: 60
   MIN_POINTS: 500
   BATCH_SIZE_SCALE: 1.0

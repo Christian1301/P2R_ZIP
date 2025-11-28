@@ -848,24 +848,22 @@ def main(config_path: str):
         p.requires_grad = False
 
     if finetune_backbone:
-        print("🔓 Fine-tuning del backbone ATTIVO per Stage 2 (usa solo in casi particolari).")
+        print("🔓 Fine-tuning del backbone ATTIVO...")
         for p in model.backbone.parameters():
             p.requires_grad = True
     else:
-        print("🧊 Backbone congelato per tutto lo Stage 2 (comportamento consigliato).")
+        print("🧊 Backbone congelato.")
         for p in model.backbone.parameters():
             p.requires_grad = False
 
     for p in model.p2r_head.parameters():
-        p.requires_grad = True  # P2RHead sempre addestrabile
+        p.requires_grad = True  
 
-    # Reinizializza il log_scale per contenere la scala iniziale se richiesto
     log_scale_init = p2r_loss_cfg.get("LOG_SCALE_INIT")
     if log_scale_init is not None and hasattr(model.p2r_head, "log_scale"):
         model.p2r_head.log_scale.data.fill_(float(log_scale_init))
         print(f"ℹ️ log_scale inizializzato a {float(log_scale_init):.3f}")
 
-    # --- Ottimizzatore + Scheduler ---
     head_params, log_scale_params = [], []
     for name, param in model.p2r_head.named_parameters():
         if not param.requires_grad:

@@ -17,10 +17,13 @@ from train_utils import (
     save_checkpoint, canonicalize_p2r_grid, load_config
 )
 from train_stage2_p2r import calibrate_density_scale
+from train_stage1_zip import zip_regularization  # <-- AGGIUNTO
 import torch.nn.functional as F
+
 
 def _round_up_8(x: int) -> int:
     return (x + 7) // 8 * 8
+
 
 def collate_joint(batch):
     """
@@ -44,11 +47,19 @@ def collate_joint(batch):
         _, H, W = im.shape
         sy, sx = H_tgt / H, W_tgt / W
 
-        im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
-                               mode='bilinear', align_corners=False).squeeze(0)
+        im_res = F.interpolate(
+            im.unsqueeze(0),
+            size=(H_tgt, W_tgt),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
 
-        den_res = F.interpolate(den.unsqueeze(0), size=(H_tgt, W_tgt),
-                                mode='bilinear', align_corners=False).squeeze(0)
+        den_res = F.interpolate(
+            den.unsqueeze(0),
+            size=(H_tgt, W_tgt),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
         den_res *= (H * W) / (H_tgt * W_tgt)
 
         if p is None or (hasattr(p, "numel") and p.numel() == 0):
@@ -64,6 +75,7 @@ def collate_joint(batch):
 
     return torch.stack(imgs_out), torch.stack(dens_out), pts_out
 
+
 def train_one_epoch(
     model,
     criterion_zip,
@@ -75,6 +87,7 @@ def train_one_epoch(
     schedule_step_mode,
     device,
     default_down,
+    zip_reg_params=None,        # <-- AGGIUNTO
     clamp_cfg=None,
     zip_scale: float = 1.0,
     count_l1_weight: float = 0.0,
@@ -90,9 +103,18 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         outputs = model(images)
-        loss_zip, _ = criterion_zip(outputs, gt_density)
-        scaled_loss_zip = loss_zip * zip_scale
 
+        # --- ZIP loss + regularization ---
+        loss_zip, _ = criterion_zip(outputs, gt_density)
+
+        reg_loss = 0.0
+        if zip_reg_params is not None:
+            # Usa la stessa reg del primo stage
+            reg_loss = zip_regularization(outputs, **zip_reg_params)
+
+        scaled_loss_zip = (loss_zip + reg_loss) * zip_scale
+
+        # --- P2R branch ---
         pred_density = outputs["p2r_density"]
         _, _, h_in, w_in = images.shape
         pred_density, down_tuple, _ = canonicalize_p2r_grid(
@@ -105,6 +127,7 @@ def train_one_epoch(
 
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
 
+        # --- conteggi ---
         pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
         gt_counts = []
         for p in points:
@@ -115,6 +138,7 @@ def train_one_epoch(
         gt_count = pred_density.new_tensor(gt_counts)
         count_l1 = torch.abs(pred_count - gt_count).mean()
 
+        # --- L1 sulla densità opzionale ---
         density_l1 = pred_density.new_tensor(0.0)
         if density_l1_weight > 0.0:
             _, _, h_gt, w_gt = gt_density.shape
@@ -131,11 +155,13 @@ def train_one_epoch(
                 gt_resized = gt_density
             density_l1 = F.l1_loss(pred_density, gt_resized)
 
+        # --- combinazione finale ---
         combined_loss = scaled_loss_zip + alpha * loss_p2r
         if count_l1_weight > 0.0:
             combined_loss = combined_loss + count_l1_weight * count_l1
         if density_l1_weight > 0.0:
             combined_loss = combined_loss + density_l1_weight * density_l1
+
         combined_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -163,6 +189,8 @@ def train_one_epoch(
             "p2r": f"{loss_p2r.item():.4f}",
             "lr": f"{current_lr:.6f}"
         }
+        if isinstance(reg_loss, torch.Tensor):
+            postfix["zip_reg"] = f"{reg_loss.item():.4f}"
         if count_l1_weight > 0.0:
             postfix["cnt"] = f"{count_l1.item():.2f}"
         if density_l1_weight > 0.0:
@@ -170,6 +198,7 @@ def train_one_epoch(
         progress_bar.set_postfix(postfix)
 
     return total_loss / len(dataloader)
+
 
 @torch.no_grad()
 def validate(model, dataloader, device, default_down):
@@ -179,7 +208,7 @@ def validate(model, dataloader, device, default_down):
 
     for images, gt_density, points in tqdm(dataloader, desc="Validate Stage 3"):
         images, gt_density = images.to(device), gt_density.to(device)
-       
+
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
@@ -192,10 +221,10 @@ def validate(model, dataloader, device, default_down):
         cell_area_tensor = pred_density.new_tensor(cell_area)
 
         pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area_tensor
-        
+
         gt_count_list = [len(p) for p in points if p is not None]
         if not gt_count_list:
-             gt_count_list = [0] 
+            gt_count_list = [0]
         gt_count = torch.tensor(gt_count_list, dtype=torch.float32, device=device)
 
         mae += torch.abs(pred_count - gt_count).sum().item()
@@ -207,6 +236,7 @@ def validate(model, dataloader, device, default_down):
     mae /= n
     rmse = np.sqrt(mse / n)
     return mae, rmse, total_pred, total_gt
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Stage 3 (Joint)")
@@ -223,6 +253,16 @@ def main(config_path: str):
 
     default_down = config["DATA"].get("P2R_DOWNSAMPLE", 8)
     loss_cfg = config.get("P2R_LOSS", {})
+
+    # --- ZIP regularization per Stage 3 ---
+    zip_reg_cfg = config.get("ZIP_REG", {})
+    zip_reg_params = {
+        "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),
+        "pi_weight": zip_reg_cfg.get("PI_WEIGHT", 1e-3),
+        "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
+        "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
+    }
+
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
     log_scale_recalibrate_thr = float(loss_cfg.get("LOG_SCALE_RECALIBRATE_THR", 0.0))
@@ -255,7 +295,7 @@ def main(config_path: str):
     zip_head_kwargs = {
         "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
         "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
-        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
+        "use_softplus": True if zip_head_cfg.get("USE_SOFTPLUS", True) else False,
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
@@ -328,6 +368,7 @@ def main(config_path: str):
         loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
     if "MAX_RADIUS" in loss_cfg:
         loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
+
     criterion_p2r = P2RLoss(**loss_kwargs).to(device)
     alpha = float(config["JOINT_LOSS"]["ALPHA"])
     zip_scale = float(config["JOINT_LOSS"].get("ZIP_SCALE", 1.0))
@@ -341,8 +382,10 @@ def main(config_path: str):
 
     param_groups = [
         {'params': model.backbone.parameters(), 'lr': optim_cfg["LR_BACKBONE"]},
-        {'params': list(model.zip_head.parameters()) + list(model.p2r_head.parameters()),
-        'lr': optim_cfg["LR_HEADS"]}
+        {
+            'params': list(model.zip_head.parameters()) + list(model.p2r_head.parameters()),
+            'lr': optim_cfg["LR_HEADS"],
+        },
     ]
 
     fine_tune_factor = float(optim_cfg.get("FINE_TUNE_LR_SCALE", 1.0))
@@ -480,6 +523,7 @@ def main(config_path: str):
             schedule_step_mode,
             device,
             default_down,
+            zip_reg_params=zip_reg_params,   # <-- PASSATO QUI
             clamp_cfg=clamp_cfg,
             zip_scale=zip_scale,
             count_l1_weight=count_l1_weight,
@@ -509,9 +553,9 @@ def main(config_path: str):
                 and hasattr(model.p2r_head, "log_scale")
             ):
                 print(
-                    "🔁 Stage 3: Pred/GT {:.3f} fuori soglia ±{:.3f}. Ricalibro log_scale prima di aggiornare il best.".format(
-                        bias,
-                        log_scale_recalibrate_thr,
+                    "🔁 Stage 3: Pred/GT {:.3f} fuori soglia ±{:.3f}. "
+                    "Ricalibro log_scale prima di aggiornare il best.".format(
+                        bias, log_scale_recalibrate_thr
                     )
                 )
                 recalib_bias = calibrate_density_scale(
@@ -600,6 +644,7 @@ def main(config_path: str):
                 break
 
     print(f"✅ Stage 3 completato con successo! Miglior MAE {best_mae:.2f} (epoch {best_epoch}).")
+
 
 if __name__ == "__main__":
     args = parse_args()

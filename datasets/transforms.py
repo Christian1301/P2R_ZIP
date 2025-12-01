@@ -207,11 +207,7 @@ def build_transforms(cfg_data, is_train=True, override_crop_size=None, override_
         return Compose([
             crop_cls(**crop_kwargs),
             RandomHorizontalFlip(p=0.5),
-
-            ImageOnlyTransform(transforms.TrivialAugmentWide()),
-
             ToTensor(),
-
             Normalize(mean=mean, std=std),
         ])
     else:

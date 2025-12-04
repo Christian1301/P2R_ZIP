@@ -875,11 +875,12 @@ def main(config_path: str):
 
     params_to_train = []
     backbone_group_idx = None
+    base_lr = float(optim_cfg.get('LR', 1e-4))
     if head_params:
-        params_to_train.append({'params': head_params, 'lr': optim_cfg['LR']})
+        params_to_train.append({'params': head_params, 'lr': base_lr})
     if log_scale_params:
         lr_factor = float(p2r_loss_cfg.get("LOG_SCALE_LR_FACTOR", 0.1))
-        params_to_train.append({'params': log_scale_params, 'lr': optim_cfg['LR'] * lr_factor})
+        params_to_train.append({'params': log_scale_params, 'lr': base_lr * lr_factor})
         print(f"ℹ️ LR log_scale ridotto di un fattore {lr_factor:.2f}")
 
     backbone_lr = optim_cfg.get("LR_BACKBONE")

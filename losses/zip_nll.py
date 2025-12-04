@@ -15,8 +15,6 @@ def zip_nll(pi, lam, target_counts, eps=1e-8, reduction="mean"):
     """
     
     # --- CODICE AGGIUNTO PER GESTIRE DIMENSIONI DIVERSE ---
-    # Controlla se le dimensioni spaziali dell'output (pi, lam) corrispondono a quelle del target.
-    # Se non corrispondono, ridimensiona l'output per allinearlo al target.
     target_h, target_w = target_counts.shape[-2:]
     if pi.shape[-2:] != (target_h, target_w):
         pi = F.interpolate(pi, size=(target_h, target_w), mode='bilinear', align_corners=False)

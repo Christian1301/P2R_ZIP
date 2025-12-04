@@ -1,22 +1,22 @@
 # ========================================
-# CONFIG 1 — SCIENTIFICAMENTE CORRETTO
-# (Il validation NON viene mai visto nel training)
+# CONFIG 2 — MASSIMA PERFORMANCE
+# (Il validation VIENE incluso nel training)
 # ========================================
 
-RUN_NAME: "shha_clean_training"
+RUN_NAME: "shha_max_perf"
 SEED: 2025
 DEVICE: "cuda"
 
-# === DATASET ===
 DATASET: "shha"
 DATA:
   ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
   ZIP_BLOCK_SIZE: 16
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
-  NORM_STD: [0.229, 0.224, 0.225]
+  NORM_STD:  [0.229, 0.224, 0.225]
 
-  TRAIN_SPLIT: "train_data"
+  # *** VALIDATION FUSO NEL TRAIN ***
+  TRAIN_SPLIT: ["train_data", "val_data"]
   VAL_SPLIT: "val_data"
 
   CROP_SIZE: 256
@@ -31,19 +31,19 @@ DATA:
   COUNT_SAMPLER:
     ENABLE: true
     BASE_WEIGHT: 1.0
-    POWER: 1.25
+    POWER: 1.35
     LOG_OFFSET: 1.0
 
   SCENE_AWARE_CROP:
     ENABLE: true
-    DENSE_POINT_THRESHOLD: 700
-    KEEP_RATIO: 0.7
-    MAX_ATTEMPTS: 6
+    DENSE_POINT_THRESHOLD: 600
+    KEEP_RATIO: 0.65
+    MAX_ATTEMPTS: 8
 
-# === MODELLO ===
+# === MODEL ===
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.15
+  ZIP_PI_THRESH: 0.12
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: true
   ZIP_PI_SOFT: true
@@ -53,11 +53,11 @@ MODEL:
 
 ZIP_HEAD:
   LAMBDA_SCALE: 0.5
-  LAMBDA_MAX: 3.0
+  LAMBDA_MAX: 3.2
   USE_SOFTPLUS: true
   LAMBDA_NOISE_STD: 0.0
 
-# === STAGE 1 — ZIP ===
+# === STAGE 1 ===
 OPTIM_ZIP:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
@@ -75,23 +75,23 @@ OPTIM_ZIP:
   LR_BACKBONE: 1e-4
 
 ZIP_LOSS:
-  WEIGHT_CE: 3.0
+  WEIGHT_CE: 3.2
   WEIGHT_NLL: 1.0
   WEIGHT_COUNT: 0.25
 
 ZIP_REG:
-  PI_TARGET: 0.28
-  PI_WEIGHT: 5e-3
+  PI_TARGET: 0.30
+  PI_WEIGHT: 6e-3
   LAMBDA_TARGET: 1.0
   LAMBDA_WEIGHT: 0.0
   COUNT_WEIGHT: 0.0
 
-# === STAGE 2 — P2R ===
+# === STAGE 2 (P2R) ===
 OPTIM_P2R:
   BATCH_SIZE: 16
   NUM_WORKERS: 4
-  EPOCHS: 1500
-  LR: 8e-5
+  EPOCHS: 1800
+  LR: 7e-5
   FINETUNE_BACKBONE: true
   LR_BACKBONE: 1e-5
   WEIGHT_DECAY: 1e-4
@@ -105,58 +105,62 @@ OPTIM_P2R:
 P2R_LOSS:
   MU: 128
   TAU: 8
+  POS_WEIGHT: 5.0
   SCALE_WEIGHT: 1e-3
   SCALE_PENALTY_HUBER_DELTA: 120.0
   SCALE_PENALTY_CAP: 800.0
   SCALE_PENALTY_NORM: "sqrt_gt"
-  POS_WEIGHT: 4.5
-  CHUNK_SIZE: 2048
-  MIN_RADIUS: 4.0
-  MAX_RADIUS: 72.0
-  GRAD_REG_WEIGHT: 5e-4
-  LOG_SCALE_INIT: -2.5
-  LOG_SCALE_LR_FACTOR: 0.05
-  LOG_SCALE_CLAMP: [-6.0, -2.0]
-  LOG_SCALE_DYNAMIC_FLOOR: -6.0
-  LOG_SCALE_CALIBRATION_DAMPING: 0.9
-  LOG_SCALE_CALIBRATION_TRIM: 0.12
-  LOG_SCALE_CALIBRATION_STAT: "median"
-  LOG_SCALE_REG_WEIGHT: 0.01
-  LOG_SCALE_REG_TARGET: -3.0
-  COUNT_L1_WEIGHT: 1.3
+  COUNT_L1_WEIGHT: 1.40
   DENSITY_L1_WEIGHT: 3e-3
-  CALIBRATE_BATCHES: 10
+  LOG_SCALE_INIT: -2.5
+  LOG_SCALE_CLAMP: [-6.0, -1.8]
+  LOG_SCALE_DYNAMIC_FLOOR: -6.0
 
 P2R_DIAGNOSTICS:
   ENABLE: true
   COUNT_ERR_THRESHOLD: 250.0
   TOPK: 6
 
-# HARD REPLAY — SOLO IMMAGINI TRAIN
+# HARD REPLAY — INCLUDE LE SCENE PIÙ DIFFICILI DEL VAL
 P2R_HARD_REPLAY:
   ENABLE: true
   IMAGES:
-    - "part_A/train_data/images/IMG_67.jpg"
-    - "part_A/train_data/images/IMG_83.jpg"
-    - "part_A/train_data/images/IMG_94.jpg"
-  REPEAT_FACTOR: 4
+    - "part_A/val_data/images/IMG_19.jpg"
+    - "part_A/val_data/images/IMG_39.jpg"
+    - "part_A/val_data/images/IMG_66.jpg"
+    - "part_A/val_data/images/IMG_143.jpg"
+    - "part_A/val_data/images/IMG_247.jpg"
+    - "part_A/val_data/images/IMG_267.jpg"
+  REPEAT_FACTOR: 6
   AUTO_DENSE:
     ENABLE: true
-    MIN_POINTS: 700
+    MIN_POINTS: 600
     MAX_SAMPLES: 96
-    REPEAT_FACTOR: 4
+    REPEAT_FACTOR: 6
 
-# === STAGE 3 — JOINT ===
+P2R_SCENE_PRIORITIES:
+  ENABLE: true
+  TARGETS:
+    - match: "IMG_19"
+      count_weight: 3.0
+    - match: "IMG_39"
+      count_weight: 3.0
+    - match: "IMG_143"
+      count_weight: 3.0
+    - match: "IMG_267"
+      count_weight: 3.0
+
+# === STAGE 3 ===
 OPTIM_JOINT:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 800
-  LR_HEADS: 5e-5
+  EPOCHS: 900
+  LR_HEADS: 4e-5
   LR_BACKBONE: 1e-5
   WEIGHT_DECAY: 1e-4
   SCHEDULER: "cosine"
   WARMUP_EPOCHS: 5
-  WARMUP_P2R_EPOCHS: 80
+  WARMUP_P2R_EPOCHS: 100
   LR_MIN_FACTOR: 0.02
   LOAD_STAGE3_BEST: false
   EARLY_STOPPING_PATIENCE: 200
@@ -167,8 +171,8 @@ OPTIM_JOINT:
 JOINT_LOSS:
   ALPHA: 2.0
   ZIP_SCALE: 0.0
-  COUNT_L1_W: 0.25
-  P2R_COUNT_L1_W: 1.5
+  COUNT_L1_W: 0.30
+  P2R_COUNT_L1_W: 1.7
   DENSITY_L1_W: 1e-3
 
 # === BINS ===

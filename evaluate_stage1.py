@@ -1,4 +1,5 @@
 # evaluate_stage1_diagnostics.py
+
 import argparse
 import torch
 import torch.nn as nn
@@ -18,13 +19,17 @@ from train_utils import init_seeds, collate_fn, load_config
 def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path):
     """
     Validazione dettagliata Stage 1 (ZIP) con diagnostica su pi/lambda.
+    Conteggi globali:
+        - pi_zero  = P(background)
+        - pi_occ   = 1 - pi_zero  (probabilità blocco occupato)
+        - pred_cnt = somma(pi_occ * lambda)
+        - gt_cnt   = somma densità GT
     """
     model.eval()
     total_loss, mae, mse = 0.0, 0.0, 0.0
-    block_size = criterion.zip_block_size
 
     print("\n===== DEBUG ZIP HEAD =====")
-    print("Controllo range di pi (probabilità blocco occupato) e lambda (intensità Poisson)")
+    print("Controllo range di pi_occ (probabilità blocco occupato) e lambda (intensità Poisson)")
     print("------------------------------------------------------")
 
     progress_bar = tqdm(dataloader, desc="Validating ZIP Stage 1")
@@ -36,31 +41,39 @@ def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint
         loss, loss_dict = criterion(preds, gt_density)
         total_loss += loss.item()
 
-        pi_logits = preds["logit_pi_maps"]       
-        lam_maps  = preds["lambda_maps"]        
+        pi_logits = preds["logit_pi_maps"]
+        lam_maps  = preds["lambda_maps"]
+
+        # --- pi_zero = P(background), pi_occ = P(blocco occupato) ---
         pi_softmax = torch.softmax(pi_logits, dim=1)
-        pi_not_zero = pi_softmax[:, 1:]       
-        pi_mean = pi_not_zero.mean().item()
-        pi_min, pi_max = pi_not_zero.min().item(), pi_not_zero.max().item()
+        pi_zero = pi_softmax[:, 0:1]     # background
+        pi_occ  = 1.0 - pi_zero          # prob. blocco occupato (tutte le classi > 0)
+
+        # Statistiche su pi_occ e lambda
+        pi_mean = pi_occ.mean().item()
+        pi_min, pi_max = pi_occ.min().item(), pi_occ.max().item()
         lam_mean = lam_maps.mean().item()
         lam_min, lam_max = lam_maps.min().item(), lam_maps.max().item()
-        pct_over_01 = (pi_not_zero > 0.1).float().mean().item() * 100
-        pct_over_05 = (pi_not_zero > 0.5).float().mean().item() * 100
+        pct_over_01 = (pi_occ > 0.1).float().mean().item() * 100
+        pct_over_05 = (pi_occ > 0.5).float().mean().item() * 100
 
-        pred_density_zip = pi_not_zero * lam_maps
-        pred_count = torch.sum(pred_density_zip).item()
+        # Conteggio ZIP previsto: somma(pi_occ * lambda) su tutti i blocchi
+        pred_density_zip = pi_occ * lam_maps
+        pred_count = pred_density_zip.sum().item()
 
-        gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size**2)
-        gt_count = torch.sum(gt_counts_per_block).item()
+        # Conteggio GT globale = somma densità
+        gt_count = gt_density.sum().item()
 
         mae += abs(pred_count - gt_count)
         mse += (pred_count - gt_count) ** 2
 
         if idx % 10 == 0:
-            print(f"[IMG {idx:03d}] pi:[{pi_min:.3f},{pi_max:.3f}] mean={pi_mean:.3f} "
-                  f"| λ:[{lam_min:.3f},{lam_max:.3f}] mean={lam_mean:.3f} "
-                  f"| >0.1={pct_over_01:.2f}% >0.5={pct_over_05:.2f}% "
-                  f"| pred={pred_count:.1f}, gt={gt_count:.1f}")
+            print(
+                f"[IMG {idx:03d}] pi_occ:[{pi_min:.3f},{pi_max:.3f}] mean={pi_mean:.3f} "
+                f"| λ:[{lam_min:.3f},{lam_max:.3f}] mean={lam_mean:.3f} "
+                f"| >0.1={pct_over_01:.2f}% >0.5={pct_over_05:.2f}% "
+                f"| pred={pred_count:.1f}, gt={gt_count:.1f}"
+            )
 
         progress_bar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -159,6 +172,7 @@ def main(config, checkpoint_path):
         collate_fn=collate_fn
     )
     validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Stage 1 (ZIP)")

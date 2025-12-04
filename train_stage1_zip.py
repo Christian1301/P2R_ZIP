@@ -1,7 +1,9 @@
-# P2R_ZIP/train_stage1_zip.py
+# ============================================
+# P2R_ZIP/train_stage1_zip.py (VERSIONE DEFINITIVA — FIXED)
+# ============================================
+
 import argparse
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -12,190 +14,221 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn, load_config
+from train_utils import (
+    init_seeds,
+    get_optimizer,
+    get_scheduler,
+    resume_if_exists,
+    save_checkpoint,
+    collate_fn,
+    load_config,
+)
 
-def zip_regularization(
-    preds,
-    pi_target: float = 0.12,
-    pi_weight: float = 1e-3,
-    lambda_target: float = 3.0,
-    lambda_weight: float = 5e-4,
-):
-    device = preds["lambda_maps"].device
-    reg_loss = preds["lambda_maps"].new_tensor(0.0, device=device)
 
+# -----------------------------------------------------------
+# Utility robusta per convertire qualsiasi LR in float
+# -----------------------------------------------------------
+def parse_lr(x, default=1e-4):
+    """
+    Converte x in float in modo sicuro.
+    Accetta: float, int, '1e-4', "0.0001", ecc.
+    """
+    if x is None:
+        return float(default)
+    if isinstance(x, (int, float)):
+        return float(x)
+    try:
+        return float(x)
+    except Exception:
+        return float(eval(str(x)))
+
+
+# -----------------------------------------------------------
+# ZIP regularization
+# -----------------------------------------------------------
+def zip_regularization(preds, gt_count: torch.Tensor, reg_cfg: dict):
+
+    pi_target = float(reg_cfg.get("PI_TARGET", 0.28))
+    pi_weight = float(reg_cfg.get("PI_WEIGHT", 0.0))
+    lambda_target = float(reg_cfg.get("LAMBDA_TARGET", 1.0))
+    lambda_weight = float(reg_cfg.get("LAMBDA_WEIGHT", 0.0))
+    count_weight = float(reg_cfg.get("COUNT_WEIGHT", 0.0))
+
+    pi_maps = preds["logit_pi_maps"].softmax(dim=1)
+    pi_zero = pi_maps[:, 0:1]
+    pi_occ = 1.0 - pi_zero
+
+    lam = preds["lambda_maps"]
+    reg_loss = lam.new_tensor(0.0)
+
+    # 1) Sparsità π
+    pi_mean = pi_occ.mean()
     if pi_weight > 0:
-        pi_soft = preds["logit_pi_maps"].softmax(dim=1)[:, 1:]
-        pi_reg = ((pi_soft - pi_target) ** 2).mean()
-        reg_loss = reg_loss + pi_weight * pi_reg
+        pi_excess = F.relu(pi_mean - pi_target)
+        loss_pi = (pi_excess ** 2) * pi_weight
+        reg_loss += loss_pi
+    else:
+        loss_pi = lam.new_tensor(0.0)
 
+    # 2) Reg λ
+    lambda_mean = lam.mean()
     if lambda_weight > 0:
-        lam = preds["lambda_maps"]
-        lambda_reg = torch.relu(lam - lambda_target).mean()
-        reg_loss = reg_loss + lambda_weight * lambda_reg
+        loss_lambda = (lambda_mean - lambda_target) ** 2 * lambda_weight
+        reg_loss += loss_lambda
+    else:
+        loss_lambda = lam.new_tensor(0.0)
 
-    return reg_loss
+    # 3) Count L1 ZIP
+    zip_count_pred = (pi_occ * lam).sum(dim=(1, 2, 3))
+    if gt_count.ndim > 1:
+        gt_count = gt_count.view(-1)
+
+    gt_count = gt_count.to(zip_count_pred.device)
+    if count_weight > 0:
+        loss_count = F.smooth_l1_loss(zip_count_pred, gt_count) * count_weight
+        reg_loss += loss_count
+    else:
+        loss_count = lam.new_tensor(0.0)
+
+    return reg_loss, {
+        "pi_mean": float(pi_mean),
+        "lambda_mean": float(lambda_mean),
+        "loss_pi": float(loss_pi),
+        "loss_lambda": float(loss_lambda),
+        "loss_count": float(loss_count),
+        "loss_reg": float(reg_loss),
+    }
 
 
-def build_count_sampler(dataset, sampler_cfg):
-    if not sampler_cfg or not sampler_cfg.get("ENABLE", False):
+# -----------------------------------------------------------
+# Count sampler
+# -----------------------------------------------------------
+def build_count_sampler(dataset, cfg):
+    if not cfg or not cfg.get("ENABLE", False):
         return None
-    if not hasattr(dataset, "image_list") or not hasattr(dataset, "load_points"):
-        print("ℹ️ Sampler ZIP disattivato: il dataset non supporta image_list/load_points.")
+    if not hasattr(dataset, "image_list"):
         return None
 
     counts = []
-    for img_path in dataset.image_list:
+    for p in dataset.image_list:
         try:
-            pts = dataset.load_points(img_path)
-            counts.append(len(pts))
-        except Exception as exc:
-            print(f"⚠️ Count sampler: errore nel caricare {img_path}: {exc}")
+            counts.append(len(dataset.load_points(p)))
+        except:
             counts.append(0)
 
-    if not counts:
-        print("ℹ️ Sampler ZIP disattivato: nessun campione disponibile.")
-        return None
+    c = np.array(counts, np.float32)
+    w = np.log1p(c + cfg.get("LOG_OFFSET", 1.0))
+    w = np.power(w, cfg.get("POWER", 1.0))
+    w = np.clip(w, 1e-6, None)
 
-    counts_arr = np.array(counts, dtype=np.float64)
-    log_offset = max(1e-3, float(sampler_cfg.get("LOG_OFFSET", 1.0)))
-    base_weight = max(1e-6, float(sampler_cfg.get("BASE_WEIGHT", 1.0)))
-    power = float(sampler_cfg.get("POWER", 1.0))
-
-    scaled = np.log1p(counts_arr + log_offset)
-    if power != 1.0:
-        scaled = np.power(scaled, power)
-    weights = base_weight * scaled
-    weights = np.clip(weights, 1e-6, None)
-
-    torch_weights = torch.as_tensor(weights, dtype=torch.double)
-    sampler = WeightedRandomSampler(torch_weights, num_samples=len(dataset), replacement=True)
-    print(
-        "ℹ️ Count-aware sampler attivo: avg_w={:.3f}, max_count={:.1f}, min_count={:.1f}".format(
-            float(weights.mean()),
-            float(counts_arr.max()),
-            float(counts_arr.min()),
-        )
+    return WeightedRandomSampler(
+        torch.tensor(w, dtype=torch.double),
+        num_samples=len(w),
+        replacement=True
     )
-    return sampler
 
-def train_one_epoch(
-    model,
-    criterion,
-    dataloader,
-    optimizer,
-    scheduler,
-    device,
-    reg_params,
-    count_weight: float = 0.0,
-    clip_grad_norm: float = 1.0,
-):
+
+# -----------------------------------------------------------
+# Train epoch
+# -----------------------------------------------------------
+def train_one_epoch(model, criterion, loader, optimizer, scheduler, device, reg_cfg, clip_grad):
+
     model.train()
     total_loss = 0.0
-    progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
 
-    for images, gt_density, _ in progress_bar:
+    for images, gt_density, _ in tqdm(loader, desc="Train Stage1 (ZIP)"):
+
         images, gt_density = images.to(device), gt_density.to(device)
 
         optimizer.zero_grad()
-        predictions = model(images)
-        loss, loss_dict = criterion(predictions, gt_density)
 
-        reg_loss = zip_regularization(predictions, **reg_params)
-        total = loss + reg_loss
+        preds = model(images)
+        base_loss, loss_dict = criterion(preds, gt_density)
 
-        count_loss = None
-        if count_weight > 0.0:
-            pi_maps = predictions["logit_pi_maps"].softmax(dim=1)
-            pi_zero = pi_maps[:, 0:1]
-            lam = predictions["lambda_maps"]
-            pred_count = torch.sum((1 - pi_zero) * lam, dim=(1, 2, 3))
-            gt_count = torch.sum(gt_density, dim=(1, 2, 3))
-            count_loss = F.smooth_l1_loss(pred_count, gt_count)
-            total = total + count_weight * count_loss
+        gt_count = gt_density.sum(dim=(1, 2, 3))
+        reg_loss, _ = zip_regularization(preds, gt_count, reg_cfg)
 
-        total.backward()
-        if clip_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+        loss = base_loss + reg_loss
+        loss.backward()
+
+        if clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
         optimizer.step()
-
-        total_loss += total.item()
-
-        postfix = {
-            'loss': f"{total.item():.4f}",
-            'nll': f"{loss_dict['zip_nll_loss']:.4f}",
-            'ce': f"{loss_dict['zip_ce_loss']:.4f}",
-            'count': f"{loss_dict['zip_count_loss']:.4f}",
-            'reg': f"{reg_loss.item():.4f}",
-            'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
-        }
-        if count_loss is not None:
-            postfix['cnt_reg'] = f"{count_loss.item():.4f}"
-        progress_bar.set_postfix(postfix)
+        total_loss += loss.item()
 
     if scheduler:
         scheduler.step()
-    return total_loss / len(dataloader)
 
-def validate(model, criterion, dataloader, device):
+    return total_loss / len(loader)
+
+
+# -----------------------------------------------------------
+# Validate
+# -----------------------------------------------------------
+def validate(model, criterion, loader, device):
+
     model.eval()
-    total_loss, mae, mse = 0.0, 0.0, 0.0
-    block_size = criterion.zip_block_size
+    total_loss = 0
+    mae = 0
+    mse = 0
 
     with torch.no_grad():
-        for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
+        for images, gt_density, _ in loader:
+
             images, gt_density = images.to(device), gt_density.to(device)
 
             preds = model(images)
             loss, _ = criterion(preds, gt_density)
             total_loss += loss.item()
 
-            pi_maps = preds["logit_pi_maps"].softmax(dim=1)
-            pi_zero = pi_maps[:, 0:1]
+            pi = preds["logit_pi_maps"].softmax(dim=1)
+            pi_occ = 1.0 - pi[:, 0:1]
             lam = preds["lambda_maps"]
 
-            pred_count = torch.sum((1 - pi_zero) * lam, dim=(1, 2, 3))
-            gt_count = torch.sum(
-                F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size ** 2),
-                dim=(1, 2, 3)
-            )
+            pred_count = (pi_occ * lam).sum(dim=(1, 2, 3))
+            gt_count = gt_density.sum(dim=(1, 2, 3))
 
             mae += torch.abs(pred_count - gt_count).sum().item()
-            mse += ((pred_count - gt_count) ** 2).sum().item()
+            mse += torch.pow(pred_count - gt_count, 2).sum().item()
 
-    avg_loss = total_loss / len(dataloader)
-    avg_mae = mae / len(dataloader.dataset)
-    avg_rmse = (mse / len(dataloader.dataset)) ** 0.5
-    return avg_loss, avg_mae, avg_rmse
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train Stage 1 (ZIP)")
-    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
-    return parser.parse_args()
+    n = len(loader.dataset)
+    return (
+        total_loss / len(loader),
+        mae / n,
+        (mse / n) ** 0.5
+    )
 
 
-def main(config_path: str):
+# -----------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------
+def main(config_path):
+
     config = load_config(config_path)
-
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
 
     dataset_name = config["DATASET"]
+    data_cfg = config["DATA"]
     model_cfg = config["MODEL"]
-    bin_cfg = config["BINS_CONFIG"][dataset_name]
-    bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
-    zip_head_cfg = config.get("ZIP_HEAD", {})
+    bins = config["BINS_CONFIG"][dataset_name]["bins"]
+    centers = config["BINS_CONFIG"][dataset_name]["bin_centers"]
+
+    # ZIP HEAD
+    zh = config.get("ZIP_HEAD", {})
     zip_head_kwargs = {
-        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
-        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
-        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
-        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+        "lambda_scale": parse_lr(zh.get("LAMBDA_SCALE", 0.5)),
+        "lambda_max": parse_lr(zh.get("LAMBDA_MAX", 8.0)),
+        "use_softplus": bool(zh.get("USE_SOFTPLUS", True)),
+        "lambda_noise_std": parse_lr(zh.get("LAMBDA_NOISE_STD", 0.0)),
     }
 
+    # MODEL
     model = P2R_ZIP_Model(
         bins=bins,
-        bin_centers=bin_centers,
+        bin_centers=centers,
         backbone_name=model_cfg["BACKBONE"],
         pi_thresh=model_cfg.get("ZIP_PI_THRESH"),
         gate=model_cfg.get("GATE", "multiply"),
@@ -207,138 +240,123 @@ def main(config_path: str):
         apply_gate_to_output=model_cfg.get("ZIP_PI_APPLY_TO_P2R", False),
     ).to(device)
 
+    # Freeze P2R head
     for p in model.p2r_head.parameters():
         p.requires_grad = False
 
+    # Loss ZIP
     criterion = ZIPCompositeLoss(
         bins=bins,
         weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
-        zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
-        count_weight=config["ZIP_LOSS"].get("WEIGHT_COUNT", 1.0),
+        weight_nll=config["ZIP_LOSS"]["WEIGHT_NLL"],
+        zip_block_size=data_cfg["ZIP_BLOCK_SIZE"],
+        count_weight=config["ZIP_LOSS"]["WEIGHT_COUNT"],
     ).to(device)
 
+    # OPTIMIZER
     optim_cfg = config["OPTIM_ZIP"]
-    lr_head = optim_cfg.get("LR", optim_cfg.get("BASE_LR", 5e-5))
-    lr_backbone = optim_cfg.get("LR_BACKBONE", optim_cfg.get("BACKBONE_LR", lr_head * 0.5))
-    clip_grad = optim_cfg.get("CLIP_GRAD_NORM", 1.0)
-    val_interval = optim_cfg.get("VAL_INTERVAL", 5)
-    early_stop_patience = optim_cfg.get("EARLY_STOPPING_PATIENCE")
-    resume_training = optim_cfg.get("RESUME_LAST", True)
 
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-    head_params = [p for p in model.zip_head.parameters() if p.requires_grad]
+    lr_head = parse_lr(optim_cfg.get("LR", optim_cfg.get("BASE_LR", 5e-5)))
+    lr_backbone = parse_lr(optim_cfg.get("LR_BACKBONE", lr_head * 0.5))
+    clip_grad = parse_lr(optim_cfg.get("CLIP_GRAD_NORM", 1.0))
 
     optimizer = get_optimizer(
         [
-            {"params": backbone_params, "lr": lr_backbone},
-            {"params": head_params, "lr": lr_head},
+            {"params": model.backbone.parameters(), "lr": lr_backbone},
+            {"params": model.zip_head.parameters(), "lr": lr_head},
         ],
         optim_cfg,
     )
-    scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg.get("EPOCHS", 1300))
-    data_cfg = config["DATA"]
-    stage1_crop = data_cfg.get("CROP_SIZE_STAGE1", data_cfg.get("CROP_SIZE", 256))
-    stage1_scale = data_cfg.get("CROP_SCALE_STAGE1", data_cfg.get("CROP_SCALE", (0.3, 1.0)))
+    scheduler = get_scheduler(optimizer, optim_cfg)
+
+    # DATA
     train_tf = build_transforms(
         data_cfg,
         is_train=True,
-        override_crop_size=stage1_crop,
-        override_crop_scale=stage1_scale,
+        override_crop_size=data_cfg.get("CROP_SIZE_STAGE1"),
+        override_crop_scale=data_cfg.get("CROP_SCALE_STAGE1"),
     )
     val_tf = build_transforms(data_cfg, is_train=False)
-    DatasetClass = get_dataset(config["DATASET"])
-    train_set = DatasetClass(
-        root=data_cfg["ROOT"],
-        split=data_cfg["TRAIN_SPLIT"],
-        block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=train_tf,
-    )
-    val_set = DatasetClass(
-        root=data_cfg["ROOT"],
-        split=data_cfg["VAL_SPLIT"],
-        block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=val_tf,
-    )
-    sampler_cfg = data_cfg.get("COUNT_SAMPLER", {})
-    train_sampler = build_count_sampler(train_set, sampler_cfg)
+
+    Dataset = get_dataset(dataset_name)
+
+    train_set = Dataset(data_cfg["ROOT"], data_cfg["TRAIN_SPLIT"],
+                        data_cfg["ZIP_BLOCK_SIZE"], train_tf)
+    val_set = Dataset(data_cfg["ROOT"], data_cfg["VAL_SPLIT"],
+                      data_cfg["ZIP_BLOCK_SIZE"], val_tf)
+
+    sampler = build_count_sampler(train_set, data_cfg.get("COUNT_SAMPLER"))
+
     train_loader = DataLoader(
         train_set,
         batch_size=optim_cfg["BATCH_SIZE"],
-        shuffle=train_sampler is None,
+        sampler=sampler if sampler else None,
+        shuffle=sampler is None,
         num_workers=optim_cfg["NUM_WORKERS"],
+        drop_last=True,
         collate_fn=collate_fn,
         pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler,
     )
+
     val_loader = DataLoader(
         val_set,
         batch_size=1,
         shuffle=False,
-        num_workers=optim_cfg["NUM_WORKERS"],
         collate_fn=collate_fn,
         pin_memory=True,
+        num_workers=optim_cfg["NUM_WORKERS"]
     )
+
+    # Resume
     out_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(out_dir, exist_ok=True)
-    if resume_training:
-        start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
-    else:
-        print("ℹ️ Ripartenza da zero richiesta: si parte dall'epoch 1.")
-        start_epoch, best_mae = 1, float("inf")
-    zip_reg_cfg = config.get("ZIP_REG", {})
-    zip_reg_params = {
-        "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),
-        "pi_weight": zip_reg_cfg.get("PI_WEIGHT", 1e-3),
-        "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
-        "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
-    }
-    count_reg_weight = float(zip_reg_cfg.get("COUNT_WEIGHT", 0.0))
+    resume = optim_cfg.get("RESUME_LAST", True)
+    start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device) if resume else (1, float("inf"))
 
-    max_epochs = optim_cfg.get("EPOCHS", 1300)
-    no_improve_count = 0
-    stop_training = False
+    max_epochs = int(optim_cfg["EPOCHS"])
+    val_interval = int(optim_cfg["VAL_INTERVAL"])
+    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", None)
+    no_improve = 0
 
-    print(f"🚀 Inizio addestramento Stage 1 per {max_epochs} epoche...")
+    print(f"🚀 Stage 1 Training START (max {max_epochs} epochs)")
 
     for epoch in range(start_epoch, max_epochs + 1):
-        print(f"\n--- Epoch {epoch}/{max_epochs} ---")
+
+        print(f"\n----- EPOCH {epoch}/{max_epochs} -----")
+
         train_loss = train_one_epoch(
-            model,
-            criterion,
-            train_loader,
-            optimizer,
-            scheduler,
-            device,
-            zip_reg_params,
-            count_weight=count_reg_weight,
-            clip_grad_norm=clip_grad,
+            model, criterion, train_loader,
+            optimizer, scheduler, device,
+            config.get("ZIP_REG", {}), clip_grad
         )
 
-        should_validate = (epoch % val_interval == 0) or (epoch == max_epochs)
-
-        if should_validate:
+        if epoch % val_interval == 0:
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)
-            print(f"Val → Loss {val_loss:.4f}, MAE {val_mae:.2f}, RMSE {val_rmse:.2f}")
+            print(f"VAL → loss={val_loss:.4f}, MAE={val_mae:.2f}, RMSE={val_rmse:.2f}")
 
             is_best = val_mae < best_mae
+            save_checkpoint(model, optimizer, epoch, val_mae, best_mae, out_dir, is_best=is_best)
+
             if is_best:
                 best_mae = val_mae
-
-            save_checkpoint(model, optimizer, epoch, val_mae, best_mae, out_dir, is_best=is_best)
-            if is_best:
-                print(f"✅ Saved new best model (MAE={best_mae:.2f})")
-                no_improve_count = 0
+                no_improve = 0
+                print(f"🔥 NEW BEST — MAE {best_mae:.2f}")
             else:
-                no_improve_count += 1
-                if early_stop_patience and no_improve_count >= early_stop_patience:
-                    print(f"🛑 Early stopping: nessun miglioramento per {no_improve_count} validazioni consecutive.")
-                    stop_training = True
+                no_improve += 1
+                if patience and no_improve >= patience:
+                    print("⛔ EARLY STOPPING")
+                    break
 
-        if stop_training:
-            break
+    print("✅ Stage 1 COMPLETED")
 
-    print("✅ Addestramento Stage 1 completato.")
+
+# -----------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------
+def parse_args():
+    a = argparse.ArgumentParser()
+    a.add_argument("--config", default="config.yaml")
+    return a.parse_args()
 
 
 if __name__ == "__main__":

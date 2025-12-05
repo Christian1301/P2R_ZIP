@@ -501,11 +501,21 @@ def main(config_path: str):
         print(f"ℹ️ Distillazione ZIP→P2R attiva (peso={distill_zip_weight:.3f}).")
 
     # Gruppi di parametri per backbone / heads
+    try:
+        lr_backbone = float(optim_cfg["LR_BACKBONE"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("OPTIM_JOINT.LR_BACKBONE deve essere un valore numerico")
+
+    try:
+        lr_heads = float(optim_cfg["LR_HEADS"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("OPTIM_JOINT.LR_HEADS deve essere un valore numerico")
+
     param_groups = [
-        {"params": model.backbone.parameters(), "lr": optim_cfg["LR_BACKBONE"]},
+        {"params": model.backbone.parameters(), "lr": lr_backbone},
         {
             "params": list(model.zip_head.parameters()) + list(model.p2r_head.parameters()),
-            "lr": optim_cfg["LR_HEADS"],
+            "lr": lr_heads,
         },
     ]
 

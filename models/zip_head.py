@@ -49,8 +49,9 @@ class ZIPHead(nn.Module):
         
         if self.pi_head.bias is not None and self.pi_head.bias.numel() == 2:
             with torch.no_grad():
-                self.pi_head.bias[0] = 1.5
-                self.pi_head.bias[1] = -1.5
+                # Start from a mild prior that favors "occupied" blocks.
+                self.pi_head.bias[0] = -1.2
+                self.pi_head.bias[1] = 1.2
 
     def forward(self, feat: torch.Tensor, bin_centers: torch.Tensor):
         h = self.shared(feat)

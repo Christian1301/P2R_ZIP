@@ -6,22 +6,35 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import yaml
 import os
+import numpy as np
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, get_optimizer, get_scheduler, resume_if_exists, save_checkpoint, collate_fn
+from train_utils import (
+    init_seeds,
+    get_optimizer,
+    get_scheduler,
+    resume_if_exists,
+    save_checkpoint,
+    collate_fn,
+)
+
 
 def zip_regularization(
     preds,
-    pi_target: float = 0.12,
+    pi_target: float = 0.18,
     pi_weight: float = 1e-3,
     lambda_target: float = 3.0,
     lambda_weight: float = 5e-4,
 ):
+    """Light prior to keep π away from zero and λ below saturation."""
     device = preds["lambda_maps"].device
     reg_loss = preds["lambda_maps"].new_tensor(0.0, device=device)
+
+    pi_weight = max(pi_weight, 5e-4)
+    lambda_weight = max(lambda_weight, 5e-4)
 
     if pi_weight > 0:
         pi_soft = preds["logit_pi_maps"].softmax(dim=1)[:, 1:]
@@ -35,11 +48,43 @@ def zip_regularization(
 
     return reg_loss
 
-def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, reg_params, clip_grad_norm=1.0):
+
+def train_one_epoch(
+    model,
+    criterion,
+    dataloader,
+    optimizer,
+    scheduler,
+    device,
+    reg_params,
+    epoch=1,
+    warmup_epochs=50,
+    clip_grad_norm=1.0,
+    count_align_weight: float = 0.0,
+):
     model.train()
     total_loss = 0.0
-    progress_bar = tqdm(dataloader, desc="Train Stage 1 (ZIP)")
+    block_size = criterion.zip_block_size
+    progress_bar = tqdm(dataloader, desc=f"Train Stage 1 (ZIP) - Epoch {epoch}")
 
+    warmup_active = warmup_epochs > 0 and epoch <= warmup_epochs
+    if warmup_active:
+        warmup_factor = epoch / warmup_epochs
+        effective_reg_params = {}
+        for k, v in reg_params.items():
+            if "weight" in k:
+                effective_reg_params[k] = max(v * warmup_factor, 5e-4)
+            else:
+                effective_reg_params[k] = v
+        if epoch == 1:
+            print(f"🔥 Warmup attivo: regolarizzazione scalata di {warmup_factor:.2f}x")
+    else:
+        effective_reg_params = {
+            k: (max(v, 5e-4) if "weight" in k else v)
+            for k, v in reg_params.items()
+        }
+
+    pi_means, lambda_means = [], []
     for images, gt_density, _ in progress_bar:
         images, gt_density = images.to(device), gt_density.to(device)
 
@@ -47,8 +92,21 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
         predictions = model(images)
         loss, loss_dict = criterion(predictions, gt_density)
 
-        reg_loss = zip_regularization(predictions, **reg_params)
-        total = loss + reg_loss
+        reg_loss = zip_regularization(predictions, **effective_reg_params)
+        align_loss = torch.tensor(0.0, device=device)
+
+        if count_align_weight > 0 and "pred_density_zip" in predictions:
+            with torch.no_grad():
+                gt_blocks = (
+                    F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size ** 2)
+                )
+            pred_blocks = predictions["pred_density_zip"]
+            align_loss = F.l1_loss(
+                pred_blocks.sum(dim=(1, 2, 3)),
+                gt_blocks.sum(dim=(1, 2, 3))
+            )
+
+        total = loss + reg_loss + count_align_weight * align_loss
 
         total.backward()
         if clip_grad_norm > 0:
@@ -57,23 +115,33 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scheduler, device, 
 
         total_loss += total.item()
 
+        pi_soft = predictions["logit_pi_maps"].softmax(dim=1)[:, 1:]
+        pi_means.append(pi_soft.mean().detach().item())
+        lambda_means.append(predictions["lambda_maps"].mean().detach().item())
+
         progress_bar.set_postfix({
             'loss': f"{total.item():.4f}",
             'nll': f"{loss_dict['zip_nll_loss']:.4f}",
             'ce': f"{loss_dict['zip_ce_loss']:.4f}",
             'count': f"{loss_dict['zip_count_loss']:.4f}",
             'reg': f"{reg_loss.item():.4f}",
+            'align': f"{align_loss.item():.4f}",
             'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
         })
 
     if scheduler:
         scheduler.step()
+    if pi_means and lambda_means:
+        print(
+            f"   ↪ π_mean={np.mean(pi_means):.3f} | λ_mean={np.mean(lambda_means):.3f}"
+        )
     return total_loss / len(dataloader)
 
 def validate(model, criterion, dataloader, device):
     model.eval()
     total_loss, mae, mse = 0.0, 0.0, 0.0
     block_size = criterion.zip_block_size
+    pi_values, lambda_values = [], []
 
     with torch.no_grad():
         for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
@@ -95,6 +163,33 @@ def validate(model, criterion, dataloader, device):
 
             mae += torch.abs(pred_count - gt_count).sum().item()
             mse += ((pred_count - gt_count) ** 2).sum().item()
+
+            pi_values.append(pi_maps[:, 1:].reshape(-1).cpu())
+            lambda_values.append(lam.reshape(-1).cpu())
+
+    if pi_values and lambda_values:
+        pi_values_np = torch.cat(pi_values).numpy()
+        lambda_values_np = torch.cat(lambda_values).numpy()
+
+        print("\n📊 ZIP Head Statistics:")
+        print(
+            "  π (occupancy): mean={:.3f}, std={:.3f}, P10={:.3f}, P90={:.3f}".format(
+                pi_values_np.mean(),
+                pi_values_np.std(),
+                np.percentile(pi_values_np, 10),
+                np.percentile(pi_values_np, 90),
+            )
+        )
+        print(
+            "  λ (intensity): mean={:.3f}, std={:.3f}, P10={:.3f}, P90={:.3f}".format(
+                lambda_values_np.mean(),
+                lambda_values_np.std(),
+                np.percentile(lambda_values_np, 10),
+                np.percentile(lambda_values_np, 90),
+            )
+        )
+        active_ratio = (pi_values_np > 0.5).mean() * 100.0
+        print(f"  Active blocks (π>0.5): {active_ratio:.1f}%\n")
 
     avg_loss = total_loss / len(dataloader)
     avg_mae = mae / len(dataloader.dataset)
@@ -198,8 +293,12 @@ def main():
         "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
         "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
     }
+    warmup_epochs = optim_cfg.get("WARMUP_EPOCHS", 0)
 
     print(f"🚀 Inizio addestramento Stage 1 per {optim_cfg['EPOCHS']} epoche...")
+
+    count_align_weight = config["ZIP_LOSS"].get("WEIGHT_ALIGN", 0.0)
+    val_interval = max(1, optim_cfg.get("VAL_INTERVAL", 3))
 
     for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         print(f"\n--- Epoch {epoch}/{optim_cfg['EPOCHS']} ---")
@@ -211,9 +310,12 @@ def main():
             scheduler,
             device,
             zip_reg_params,
+            epoch=epoch,
+            warmup_epochs=warmup_epochs,
+            count_align_weight=count_align_weight,
         )
 
-        if epoch % optim_cfg["VAL_INTERVAL"] == 0 or epoch == optim_cfg["EPOCHS"]:
+        if epoch % val_interval == 0 or epoch == optim_cfg["EPOCHS"]:
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)
             print(f"Val → Loss {val_loss:.4f}, MAE {val_mae:.2f}, RMSE {val_rmse:.2f}")
 

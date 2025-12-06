@@ -5,7 +5,7 @@ import torch
 import torchvision.transforms.functional as F
 from torchvision import transforms
 import cv2
-from PIL import Image
+from PIL import Image, ImageFilter
 
 class Compose(object):
     """Applica una sequenza di trasformazioni."""
@@ -125,6 +125,57 @@ class RandomResizedCrop(object):
 
         return img, new_pts, new_den
 
+class RandomScaleJitter(object):
+    """Jitter casuale di scala per robustezza multi-scala."""
+    def __init__(self, scale_range=(0.9, 1.1)):
+        self.scale_range = scale_range
+    
+    def __call__(self, img, pts=None, den=None):
+        scale = random.uniform(*self.scale_range)
+        w, h = img.size
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        if new_w < 10 or new_h < 10:  # Evita immagini troppo piccole
+            return img, pts, den
+        
+        img = img.resize((new_w, new_h), Image.BILINEAR)
+        
+        if pts is not None and len(pts) > 0:
+            pts = pts * scale
+        
+        if den is not None:
+            den = cv2.resize(den, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            # Conserva l'integrale della densità
+            den = den * (scale ** 2)
+        
+        return img, pts, den
+
+class RandomGaussianNoise(object):
+    """Rumore gaussiano per robustezza."""
+    def __init__(self, p=0.2, std_range=(0.01, 0.05)):
+        self.p = p
+        self.std_range = std_range
+    
+    def __call__(self, img, pts=None, den=None):
+        if random.random() < self.p and isinstance(img, Image.Image):
+            img_array = np.array(img).astype(np.float32) / 255.0
+            noise = np.random.normal(0, random.uniform(*self.std_range), img_array.shape)
+            img_array = np.clip(img_array + noise, 0, 1)
+            img = Image.fromarray((img_array * 255).astype(np.uint8))
+        return img, pts, den
+
+class RandomGaussianBlur(object):
+    """Gaussian blur casuale."""
+    def __init__(self, p=0.2, radius_range=(0.1, 1.5)):
+        self.p = p
+        self.radius_range = radius_range
+    
+    def __call__(self, img, pts=None, den=None):
+        if random.random() < self.p and isinstance(img, Image.Image):
+            radius = random.uniform(*self.radius_range)
+            img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+        return img, pts, den
+
 class ImageOnlyTransform(object):
     """Wrapper per trasformazioni torchvision che operano solo sull'immagine."""
     def __init__(self, transform):
@@ -141,20 +192,25 @@ def build_transforms(cfg_data, is_train=True):
 
     if is_train:
         crop_size = cfg_data.get('CROP_SIZE', 256)
-        crop_scale_cfg = cfg_data.get('CROP_SCALE', (0.3, 1.0))
+        crop_scale_cfg = cfg_data.get('CROP_SCALE', (0.5, 1.0))
         try:
             crop_scale = (float(crop_scale_cfg[0]), float(crop_scale_cfg[1]))
         except (TypeError, ValueError, IndexError):
-            crop_scale = (0.3, 1.0)
+            crop_scale = (0.5, 1.0)
 
         return Compose([
+            # Augmentation geometriche
+            RandomScaleJitter(scale_range=(0.9, 1.1)),
             RandomResizedCrop(size=crop_size, scale=crop_scale),
             RandomHorizontalFlip(p=0.5),
-
+            
+            # Augmentation visive (solo immagine)
+            RandomGaussianNoise(p=0.2, std_range=(0.01, 0.03)),
+            ImageOnlyTransform(transforms.ColorJitter(0.3, 0.3, 0.3, 0.1)),
             ImageOnlyTransform(transforms.TrivialAugmentWide()),
 
+            # Conversione e normalizzazione
             ToTensor(),
-
             Normalize(mean=mean, std=std),
         ])
     else:

@@ -182,6 +182,53 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
     return avg_loss, mae, rmse, total_pred, total_gt
 
+
+@torch.no_grad()
+def evaluate_p2r_stratified(model, loader, loss_fn, device, cfg):
+    """Valutazione separata per crowd sparsi, medi e densi."""
+    model.eval()
+    default_down = cfg["DATA"].get("P2R_DOWNSAMPLE", 8)
+    sparse_errors, medium_errors, dense_errors = [], [], []
+
+    for images, _, points in tqdm(loader, desc="[Stratified Eval]"):
+        images = images.to(device)
+        points_list = [p.to(device) for p in points]
+
+        out = model(images)
+        pred_density = out.get("p2r_density", out.get("density"))
+        if pred_density is None:
+            raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
+
+        _, _, H_in, W_in = images.shape
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (H_in, W_in), default_down, warn_tag="stage2_strat"
+        )
+        down_h, down_w = down_tuple
+        H_out, W_out = pred_density.shape[-2:]
+        if H_out == H_in and W_out == W_in:
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3))
+        else:
+            cell_area = down_h * down_w
+            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
+
+        for idx, pts in enumerate(points_list):
+            gt_count = len(pts)
+            error = abs(pred_count[idx].item() - gt_count)
+            if gt_count <= 50:
+                sparse_errors.append(error)
+            elif gt_count <= 150:
+                medium_errors.append(error)
+            else:
+                dense_errors.append(error)
+
+    print("\n📊 Stratified Validation:")
+    if sparse_errors:
+        print(f"  Sparse (0-50):   MAE={np.mean(sparse_errors):.2f} ({len(sparse_errors)} imgs)")
+    if medium_errors:
+        print(f"  Medium (51-150): MAE={np.mean(medium_errors):.2f} ({len(medium_errors)} imgs)")
+    if dense_errors:
+        print(f"  Dense (151+):    MAE={np.mean(dense_errors):.2f} ({len(dense_errors)} imgs)")
+
 def main():
     with open("config.yaml", 'r') as f:
         cfg = yaml.safe_load(f)
@@ -253,51 +300,75 @@ def main():
         model.load_state_dict(state_dict, strict=False)
     print(f"✅ Checkpoint Stage1 caricato da {zip_ckpt}")
 
-    print("🧊 Congelamento ZIPHead e sblocco parziale del backbone...")
+    print("🧊 Congelamento ZIPHead e sblocco GRADUALE del backbone...")
     for p in model.zip_head.parameters():
         p.requires_grad = False
 
     for p in model.backbone.parameters():
         p.requires_grad = False
-    if hasattr(model.backbone, "body"):
+
+    backbone_body = getattr(model.backbone, "body", None)
+    total_backbone_layers = len(backbone_body) if backbone_body is not None else 0
+    phase1_unfreeze_idx = int(total_backbone_layers * 0.75) if total_backbone_layers else None
+    phase2_unfreeze_idx = int(total_backbone_layers * 0.5) if total_backbone_layers else None
+
+    def enable_backbone_layers(from_idx):
+        if from_idx is None or not hasattr(model.backbone, "body"):
+            return
         for idx, module in enumerate(model.backbone.body):
-            if idx >= 34:
+            if idx >= from_idx:
                 for param in module.parameters():
                     param.requires_grad = True
 
+    if backbone_body is not None and total_backbone_layers > 0:
+        print(f"📌 Backbone: {total_backbone_layers} layers totali")
+        print(f"📌 Phase 1 (ep 1-500): trainable da layer {phase1_unfreeze_idx}")
+        print(f"📌 Phase 2 (ep 501+): trainable da layer {phase2_unfreeze_idx}")
+        enable_backbone_layers(phase1_unfreeze_idx)
+    else:
+        print("ℹ️ Backbone privo di attributo 'body': impossibile applicare sblocco progressivo.")
+
     for p in model.p2r_head.parameters():
-        p.requires_grad = True  
+        p.requires_grad = True
 
     log_scale_init = p2r_loss_cfg.get("LOG_SCALE_INIT")
     if log_scale_init is not None and hasattr(model.p2r_head, "log_scale"):
         model.p2r_head.log_scale.data.fill_(float(log_scale_init))
         print(f"ℹ️ log_scale inizializzato a {float(log_scale_init):.3f}")
 
-    head_params, log_scale_params = [], []
-    for name, param in model.p2r_head.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "log_scale" in name:
-            log_scale_params.append(param)
-        else:
-            head_params.append(param)
+    log_scale_lr_factor = float(p2r_loss_cfg.get("LOG_SCALE_LR_FACTOR", 0.1))
 
-    params_to_train = []
-    if head_params:
-        params_to_train.append({'params': head_params, 'lr': optim_cfg['LR']})
-    if log_scale_params:
-        lr_factor = float(p2r_loss_cfg.get("LOG_SCALE_LR_FACTOR", 0.1))
-        params_to_train.append({'params': log_scale_params, 'lr': optim_cfg['LR'] * lr_factor})
-        print(f"ℹ️ LR log_scale ridotto di un fattore {lr_factor:.2f}")
+    def build_optimizer(announce: bool = True):
+        head_params, log_scale_params, backbone_params = [], [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "p2r_head" in name and "log_scale" in name:
+                log_scale_params.append(param)
+            elif "p2r_head" in name:
+                head_params.append(param)
+            elif "backbone" in name:
+                backbone_params.append(param)
 
-    backbone_lr = optim_cfg.get("LR_BACKBONE")
-    if backbone_lr is not None:
-        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-        if backbone_params:
+        params_to_train = []
+        if head_params:
+            params_to_train.append({'params': head_params, 'lr': optim_cfg['LR']})
+        if log_scale_params:
+            params_to_train.append({'params': log_scale_params, 'lr': optim_cfg['LR'] * log_scale_lr_factor})
+            if announce:
+                print(f"ℹ️ LR log_scale ridotto di un fattore {log_scale_lr_factor:.2f}")
+        backbone_lr = optim_cfg.get("LR_BACKBONE")
+        if backbone_params and backbone_lr:
             params_to_train.append({'params': backbone_params, 'lr': float(backbone_lr)})
-            print(f"ℹ️ Backbone fine-tuning attivo con LR {float(backbone_lr):.2e}")
+            if announce:
+                print(f"ℹ️ Backbone fine-tuning attivo con LR {float(backbone_lr):.2e}")
+        if not params_to_train:
+            raise RuntimeError("Nessun parametro trainabile per Stage 2.")
+        return get_optimizer(params_to_train, optim_cfg)
 
-    opt = get_optimizer(params_to_train, optim_cfg)
+    phase2_unlocked = False
+
+    opt = build_optimizer()
     scheduler = get_scheduler(opt, optim_cfg, max_epochs=optim_cfg["EPOCHS"])
 
     loss_kwargs = {}
@@ -333,6 +404,14 @@ def main():
             start_ep, best_mae = 1, float("inf")
     else:
         start_ep, best_mae = 1, float("inf")
+
+    if start_ep > 500 and phase2_unfreeze_idx is not None and not phase2_unlocked:
+        enable_backbone_layers(phase2_unfreeze_idx)
+        phase2_unlocked = True
+        print(f"ℹ️ Ripartenza oltre epoch 500: backbone sbloccato fino al layer {phase2_unfreeze_idx}")
+        remaining_epochs = max(optim_cfg["EPOCHS"] - 500, 1)
+        opt = build_optimizer()
+        scheduler = get_scheduler(opt, optim_cfg, max_epochs=remaining_epochs)
     calibrate_batches_cfg = p2r_loss_cfg.get("CALIBRATE_BATCHES", 6)
     calibrate_max_batches = None
     if calibrate_batches_cfg is not None:
@@ -345,17 +424,40 @@ def main():
     clamp_cfg = p2r_loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = p2r_loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
     if start_ep == 1:
-        calibrate_density_scale(
+        print("🔧 Calibrazione iniziale Stage 2 (multi-step)...")
+        step1_batches = calibrate_max_batches if calibrate_max_batches is not None else 30
+        bias_1 = calibrate_density_scale(
             model,
             dl_val,
             device,
             default_down,
-            max_batches=calibrate_max_batches,
+            max_batches=step1_batches,
             clamp_range=clamp_cfg,
             max_adjust=max_adjust,
         )
+
+        bias_2 = calibrate_density_scale(
+            model,
+            dl_val,
+            device,
+            default_down,
+            max_batches=None,
+            clamp_range=clamp_cfg,
+            max_adjust=1.0,
+        )
+
+        fmt_bias = lambda b: "n/a" if b is None else f"{b:.3f}"
+        print(f"✅ Calibrazione completata: bias_1={fmt_bias(bias_1)}, bias_2={fmt_bias(bias_2)}")
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
     for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
+        if not phase2_unlocked and phase2_unfreeze_idx is not None and ep == 501:
+            print(f"\n🔓 Epoch 501: sblocco backbone fino a layer {phase2_unfreeze_idx}")
+            enable_backbone_layers(phase2_unfreeze_idx)
+            phase2_unlocked = True
+            remaining_epochs = max(optim_cfg["EPOCHS"] - 500, 1)
+            opt = build_optimizer()
+            scheduler = get_scheduler(opt, optim_cfg, max_epochs=remaining_epochs)
+
         model.train()
         total_loss = 0.0
         pbar = tqdm(enumerate(dl_train, start=1), total=len(dl_train), desc=f"[P2R Train] Epoch {ep}/{optim_cfg['EPOCHS']}")
@@ -410,6 +512,7 @@ def main():
 
         if ep % optim_cfg["VAL_INTERVAL"] == 0 or ep == optim_cfg["EPOCHS"]:
             val_loss, mae, mse, tot_pred, tot_gt = evaluate_p2r(model, dl_val, p2r_loss_fn, device, cfg)
+            evaluate_p2r_stratified(model, dl_val, p2r_loss_fn, device, cfg)
             orig_bias = (tot_pred / tot_gt) if tot_gt > 0 else float("nan")
             if writer:
                 writer.add_scalar("val/loss_p2r", val_loss, ep)

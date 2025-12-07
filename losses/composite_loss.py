@@ -1,117 +1,60 @@
-# P2R_ZIP/losses/composite_loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple
-from einops import rearrange
 
-EPS = 1e-8
-
-def _bin_count(gt_den_maps: torch.Tensor, bins: List[Tuple[float, float]]) -> torch.Tensor:
+class PiHeadLoss(nn.Module):
     """
-    Assigns each value in gt_den_maps to a bin index [0, N-1].
-    Handles counts exactly equal to bin edges correctly.
+    Loss per Stage 1 ispirata a ZIP-CLIP-EBC.
+    Si concentra sulla classificazione binaria (Vuoto vs Pieno).
     """
-    if not bins or bins[0][0] != 0 or bins[0][1] != 0:
-        raise ValueError("Bins must start with [[0, 0]].")
-
-    bin_edges = torch.tensor([b[0] for b in bins] + [bins[-1][1] + EPS], device=gt_den_maps.device)
-
-    gt_counts_flat = gt_den_maps.flatten() 
-    binned_indices_1_based = torch.bucketize(gt_counts_flat, bin_edges, right=False)
-
-    binned_indices_0_based = binned_indices_1_based - 1
-
-    num_bins = len(bins)
-    binned_indices_clamped = torch.clamp(binned_indices_0_based, 0, num_bins - 1)
-
-    return binned_indices_clamped.reshape(gt_den_maps.shape[0], gt_den_maps.shape[2], gt_den_maps.shape[3]).long()
-
-
-class ZIPCompositeLoss(nn.Module):
     def __init__(
         self,
-        bins: List[Tuple[float, float]],
-        weight_ce: float = 1.0,
-        zip_block_size: int = 16,
-        count_weight: float = 1.0,
+        pos_weight: float = 3.0,  # Peso maggiore per i blocchi pieni (che sono pochi)
+        block_size: int = 8,      # Assicurati che combaci con il tuo modello (es. 8 o 16)
     ):
         super().__init__()
-        if not bins or bins[0][0] != 0 or bins[0][1] != 0:
-            raise ValueError("Bins must start with [[0, 0]] for ZIP loss.")
-        self.bins = bins
-        self.num_bins = len(bins)
-        self.num_ce_classes = self.num_bins - 1
-        if self.num_ce_classes <= 0:
-            raise ValueError("At least two bins (including [[0, 0]]) are required for CE loss.")
-        self.weight_ce = weight_ce
-        self.zip_block_size = zip_block_size
-        self.count_weight = float(count_weight)
-        self.ce_loss_fn = nn.CrossEntropyLoss(reduction="none")
-
-    def forward(self, pred: dict, target_density: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        logit_pi_maps = pred["logit_pi_maps"]         
-        logit_bin_maps = pred["logit_bin_maps"]       
-        lambda_maps = pred["lambda_maps"]             
-
-        if logit_bin_maps.shape[1] != self.num_ce_classes:
-            raise ValueError(f"Prediction dimension mismatch: logit_bin_maps has {logit_bin_maps.shape[1]} channels, expected {self.num_ce_classes} (num_bins - 1)")
-
-        target_counts = F.avg_pool2d(target_density, kernel_size=self.zip_block_size) * (self.zip_block_size**2) # [B, 1, Hb, Wb]
-
-        B, _, Hb, Wb = target_counts.shape
-        pi_maps = logit_pi_maps.softmax(dim=1)
-        pi_zero = pi_maps[:, 0:1]
-        pi_not_zero = pi_maps[:, 1:]
-
-        is_zero_gt = (target_counts < 0.5).float() 
-
-        log_p0 = torch.log(pi_zero + pi_not_zero * torch.exp(-torch.clamp(lambda_maps, max=80)) + EPS) 
-        zero_loss = -log_p0 * is_zero_gt
-
-        safe_lambda = torch.clamp(lambda_maps, min=EPS)
-        safe_target_counts = torch.clamp(target_counts, min=0.0) 
-        log_py_positive = (torch.log(pi_not_zero + EPS)
-                           - safe_lambda
-                           + safe_target_counts * torch.log(safe_lambda)
-                           - torch.lgamma(safe_target_counts + 1.0))
-        nonzero_loss = -log_py_positive * (1.0 - is_zero_gt)
-
-        nll_loss = (zero_loss + nonzero_loss).sum(dim=(-1, -2)).mean() 
-
-        gt_bin_indices = _bin_count(target_counts, bins=self.bins) 
-
-        target_ce_indices = gt_bin_indices - 1 
-
-        target_ce_flat = rearrange(target_ce_indices, "B H W -> (B H W)")
-        logit_bin_maps_flat = rearrange(logit_bin_maps, "B C H W -> (B H W) C") 
-
-        mask_positive_gt = rearrange(target_counts > 0.5, "B C H W -> (B C H W)") 
-        mask_valid_ce_target = target_ce_flat >= 0
-        final_ce_mask = mask_positive_gt & mask_valid_ce_target
-
-        ce_loss = torch.tensor(0.0, device=target_counts.device)
-        num_valid_targets = final_ce_mask.sum()
-
-        if num_valid_targets > 0:
-            valid_target_ce = target_ce_flat[final_ce_mask] 
-            valid_pred_ce = logit_bin_maps_flat[final_ce_mask] 
-
-            ce_loss_per_element = self.ce_loss_fn(valid_pred_ce, valid_target_ce)
-
-            ce_loss = ce_loss_per_element.mean()
-
-        pred_expected_count_per_block = (1.0 - pi_zero) * lambda_maps
-        pred_total_count = torch.sum(pred_expected_count_per_block, dim=(1, 2, 3)) 
-        gt_total_count = torch.sum(target_counts, dim=(1, 2, 3))
-        count_loss = F.l1_loss(pred_total_count, gt_total_count)
-
-        total_loss = nll_loss + self.weight_ce * ce_loss + self.count_weight * count_loss
-
-        loss_dict = {
-            "zip_total_loss": total_loss.detach(),
-            "zip_nll_loss": nll_loss.detach(),
-            "zip_ce_loss": ce_loss.detach(),
-            "zip_count_loss": count_loss.detach()
-        }
-        return total_loss, loss_dict
+        self.pos_weight = pos_weight
+        self.block_size = block_size
+        
+        # BCE con pos_weight per bilanciare le classi
+        self.bce = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight]),
+            reduction='mean'
+        )
+    
+    def compute_gt_occupancy(self, gt_density):
+        """Genera la maschera binaria GT dai punti/densità."""
+        # Somma la densità nel blocco
+        gt_counts_per_block = F.avg_pool2d(
+            gt_density,
+            kernel_size=self.block_size,
+            stride=self.block_size
+        ) * (self.block_size ** 2)
+        
+        # Se c'è almeno mezza persona (o soglia minima), è "pieno"
+        gt_occupancy = (gt_counts_per_block > 1e-3).float()
+        return gt_occupancy
+    
+    def forward(self, predictions, gt_density):
+        # [B, 2, H, W] -> Canale 1 è la probabilità di "pieno"
+        logit_pi_maps = predictions["logit_pi_maps"]
+        logit_pieno = logit_pi_maps[:, 1:2, :, :] 
+        
+        # Calcola GT
+        gt_occupancy = self.compute_gt_occupancy(gt_density)
+        
+        # Allinea dimensioni se necessario (es. padding o arrotondamenti diversi)
+        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
+            gt_occupancy = F.interpolate(
+                gt_occupancy, 
+                size=logit_pieno.shape[-2:], 
+                mode='nearest'
+            )
+        
+        # Sposta il peso sul device corretto
+        if self.bce.pos_weight.device != logit_pieno.device:
+            self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
+            
+        loss = self.bce(logit_pieno, gt_occupancy)
+        
+        return loss, {"pi_bce_loss": loss.detach()}

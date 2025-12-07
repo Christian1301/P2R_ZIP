@@ -1,9 +1,10 @@
 # ========================================
-# CONFIGURAZIONE OTTIMIZZATA P2R + ZIP
-# Target: MAE ~60 dopo Stage 3
+# CONFIGURAZIONE FINAL: P2R + ZIP (FROZEN BACKBONE - v3 AGGRESSIVE)
+# Obiettivo: Abbattere il Bias (Soppressione Sfondo)
+# Strategia: ZIP_SCALE alto, L1 basso, Backbone fisso
 # ========================================
 
-RUN_NAME: "shha_optimized_v2" 
+RUN_NAME: "shha_target60_v1"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -18,129 +19,132 @@ DATA:
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
-  CROP_SIZE: 256 
-  CROP_SCALE: [0.5, 1.0]
+  CROP_SIZE: 384
+  CROP_SCALE: [0.7, 1.0]
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn" 
+  BACKBONE: "vgg16_bn"
   ZIP_PI_THRESH: 0.5
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
 
 # === ZIP HEAD CONFIGURATION ===
 ZIP_HEAD:
-  LAMBDA_SCALE: 0.8           # ↑ Da 0.5
-  LAMBDA_MAX: 5.0             # ↓ Per evitare saturazione
+  LAMBDA_SCALE: 1.2
+  LAMBDA_MAX: 8.0
   USE_SOFTPLUS: true
-  LAMBDA_NOISE_STD: 0.15      # ↑ Da 0.0
+  LAMBDA_NOISE_STD: 0.05
 
 # === STAGE 1: ZIP TRAINING ===
 OPTIM_ZIP:
-  BATCH_SIZE: 8               # ↑ Da 4
+  BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 1500                # ↑ Da 1300
-  WEIGHT_DECAY: 5.0e-5        # ↓ Da 1.0e-4
-  SCHEDULER: "cosine"         # Cambiato da "multistep"
-  SCHEDULER_STEPS: []         # Non più usato
-  VAL_INTERVAL: 3             # ↓ per monitor più stretto
+  EPOCHS: 2000
+  WEIGHT_DECAY: 3.0e-5
+  SCHEDULER: "cosine"
+  SCHEDULER_STEPS: []
+  VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
-  BASE_LR: 6.0e-5             # ↑ Da 4.0e-5
-  LR_BACKBONE: 3.0e-5         # ↑ Da 2.0e-5
-  WARMUP_EPOCHS: 50           # NUOVO
+  BASE_LR: 8.0e-5
+  LR_BACKBONE: 4.0e-5
+  WARMUP_EPOCHS: 100
+  EARLY_STOPPING_PATIENCE: 120
+  EARLY_STOPPING_DELTA: 0.001
 
 ZIP_LOSS:
-  WEIGHT_CE: 2.0              # ↓ Da 3.0
+  WEIGHT_CE: 1.5
   WEIGHT_NLL: 1.0
-  WEIGHT_COUNT: 0.5           # ↑ Da 0.2
-  WEIGHT_ALIGN: 0.25          # nuovo: count L1 per batch
+  WEIGHT_COUNT: 0.8
+  WEIGHT_ALIGN: 0.4
 
 ZIP_REG:
-  PI_TARGET: 0.08             # ↑ Da 0.06
-  PI_WEIGHT: 8.0e-4           # ↓ Da 1.4e-3
-  LAMBDA_TARGET: 4.0          # ↑ Da 3.0
-  LAMBDA_WEIGHT: 2.0e-4       # ↓ Da 4.0e-4
+  PI_TARGET: 0.15
+  PI_WEIGHT: 5.0e-4
+  LAMBDA_TARGET: 5.0
+  LAMBDA_WEIGHT: 1.0e-4
 
 # === STAGE 2: P2R TRAINING ===
 OPTIM_P2R:
-  BATCH_SIZE: 12              # ↓ Da 16
+  BATCH_SIZE: 10
   NUM_WORKERS: 4
-  EPOCHS: 2000                # ↑ Da 1500
-  LR: 1.5e-4                  # ↓ Da 3.0e-4
-  LR_BACKBONE: 8.0e-6         # ↑ Da 5.0e-6
-  WEIGHT_DECAY: 5.0e-5        # ↓ Da 1.0e-4
-  SCHEDULER: "cosine" 
-  VAL_INTERVAL: 10
+  EPOCHS: 2500
+  LR: 1.2e-4
+  LR_BACKBONE: 1.0e-6
+  WEIGHT_DECAY: 1.0e-4
+  SCHEDULER: "cosine"
+  VAL_INTERVAL: 8
   RESUME_LAST: true
   SAVE_BEST: true
+  EARLY_STOPPING_PATIENCE: 500
+  EARLY_STOPPING_DELTA: 1.0
 
 P2R_LOSS:
   MU: 128
   TAU: 8
-  SCALE_WEIGHT: 0.15          # ↑ Da 0.08
-  POS_WEIGHT: 5.0             # ↑ Da 3.2
+  SCALE_WEIGHT: 0.20
+  POS_WEIGHT: 6.0
   CHUNK_SIZE: 2048
-  MIN_RADIUS: 4.5             # ↓ Da 6.0
-  MAX_RADIUS: 60.0            # ↓ Da 72.0
-  LOG_SCALE_INIT: -1.0        # ↓ Da -0.2
-  LOG_SCALE_LR_FACTOR: 0.15   # ↑ Da 0.05
-  LOG_SCALE_CLAMP: [-3.5, 2.5]  # ↓ Da [-6.0, 7.0]
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0  # ↓ Da 12.0
-  CALIBRATE_BATCHES: 30       # ↑ Da 10
+  MIN_RADIUS: 4.0
+  MAX_RADIUS: 50.0
+  LOG_SCALE_INIT: -0.8
+  LOG_SCALE_LR_FACTOR: 0.20
+  LOG_SCALE_CLAMP: [-3.0, 2.0]
+  LOG_SCALE_CALIBRATION_MAX_DELTA: 2.0
+  CALIBRATE_BATCHES: 40
 
-# === STAGE 3: JOINT TRAINING ===
+# === STAGE 3: JOINT TRAINING (CLEANING) ===
 OPTIM_JOINT:
-  BATCH_SIZE: 6               # ↓ Da 8
+  BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 1200                # ↑ Da 800
-  LR_HEADS: 8.0e-5            # ↓ Da 1.5e-4
-  LR_BACKBONE: 8.0e-6         # ↓ Da 1.5e-5
-  WEIGHT_DECAY: 5.0e-5        # ↓ Da 1.0e-4
+  EPOCHS: 500
+  LR_BACKBONE: 0.0            # Backbone congelato
+  LR_HEADS: 5.0e-5            # LR medio per pulizia
+  WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 20           # ↑ Da 5
-  LR_MIN_FACTOR: 0.005        # ↓ Da 0.02
-  FINE_TUNE_LR_SCALE: 0.5     # ↓ Da 1.0
-  LOAD_STAGE3_BEST: false
-  EARLY_STOPPING_PATIENCE: 100  # ↑ Da 50
-  EARLY_STOPPING_DELTA: 0.3     # NUOVO
-  VAL_INTERVAL: 5
-  RESUME_LAST: false
-  SAVE_BEST: true
+  WARMUP_EPOCHS: 0
+  LR_MIN_FACTOR: 0.01
+  FINE_TUNE_LR_SCALE: 1.0
+  LOAD_STAGE3_BEST: true
+  EARLY_STOPPING_PATIENCE: 50
+  EARLY_STOPPING_DELTA: 0.1
+  VAL_INTERVAL: 2
 
 JOINT_LOSS:
-  ALPHA: 1.2                  # ↓ Da 2.0 (sarà adattivo)
-  COUNT_L1_W: 0.15            # ↑ Da 0.05
-  ZIP_SCALE: 0.8              # ↑ Da 0.6 (sarà adattivo)
-  ADAPTIVE_BALANCING: true    # NUOVO
-  BALANCING_STRATEGY: "progressive"  # NUOVO
+  ALPHA: 1.0
+  COUNT_L1_W: 0.1             # Basso: Priorità pulizia
+  ZIP_SCALE: 2.0              # Alto: Priorità maschera
+  ADAPTIVE_BALANCING: false
 
-# === BIN CONFIGURATION (OTTIMIZZATA) ===
+# === STAGE 4: RECOVERY & POLISHING (NUOVO) ===
+OPTIM_STAGE4:
+  BATCH_SIZE: 6
+  NUM_WORKERS: 4
+  EPOCHS: 300                 # Epoche per il recupero finale
+  LR_BACKBONE: 1.0e-7           # Ancora congelato per sicurezza (o 1e-7 se vuoi rischiare)
+  LR_HEADS: 1.0e-4            # Alto: le teste devono riadattarsi velocemente
+  WEIGHT_DECAY: 1.0e-4
+  SCHEDULER: "cosine"
+  SCHEDULER_STEP: "epoch"
+  WARMUP_EPOCHS: 0
+  VAL_INTERVAL: 2
+  EARLY_STOPPING_PATIENCE: 40
+
+STAGE4_LOSS:
+  ALPHA: 1.0
+  COUNT_L1_W: 5.0             # 🔥 ALTISSIMO: Ora il conteggio è tutto
+  ZIP_SCALE: 0.5              # Basso: Mantenimento maschera
+
+# === BIN CONFIGURATION ===
 BINS_CONFIG:
   shha:
-    # Vecchia (14 bins) - troppo granulare
-    # bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,9999]]
-    
-    # Nuova (10 bins) - più robusta
-    bins: [
-      [0, 0],      # Bin 0: vuoto
-      [1, 2],      # Bin 1: molto sparse
-      [3, 4],      # Bin 2: sparse
-      [5, 6],      # Bin 3: moderate-low
-      [7, 9],      # Bin 4: moderate
-      [10, 12],    # Bin 5: moderate-high
-      [13, 16],    # Bin 6: dense
-      [17, 21],    # Bin 7: molto dense
-      [22, 30],    # Bin 8: estremamente dense
-      [31, 9999]   # Bin 9: massima densità
-    ]
-    bin_centers: [0.0, 1.5, 3.5, 5.5, 8.0, 11.0, 14.5, 19.0, 26.0, 40.0]
-  
+    bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
+    bin_centers: [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0]
   shhb:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
     bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  
   qnrf:
     bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
     bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
@@ -148,4 +152,4 @@ BINS_CONFIG:
 EXP:
   OUT_DIR: "exp"
   SAVE_BEST: true
-  SAVE_WORST_CASES: true  # NUOVO
+  SAVE_WORST_CASES: true

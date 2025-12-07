@@ -9,7 +9,6 @@ import os
 import numpy as np
 
 from models.p2r_zip_model import P2R_ZIP_Model
-from losses.composite_loss import ZIPCompositeLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import (
@@ -21,34 +20,73 @@ from train_utils import (
     collate_fn,
 )
 
+# ============================================================
+# NUOVA LOSS PER STAGE 1 (BCE - Ispirata a ZIP-CLIP-EBC)
+# ============================================================
+class PiHeadLoss(nn.Module):
+    """
+    Loss per Stage 1: Classificazione Binaria (Vuoto vs Pieno).
+    Si concentra sull'imparare una maschera di occupazione pulita
+    prima di stimare la densità.
+    Inserita qui per sostituire la vecchia logica NLL.
+    """
+    def __init__(
+        self,
+        pos_weight: float = 5.0,  # Peso maggiore per i blocchi pieni (classe rara)
+        block_size: int = 16,
+    ):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.block_size = block_size
+        
+        # BCE con pos_weight per bilanciare le classi (foreground vs background)
+        self.bce = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight]),
+            reduction='mean'
+        )
+    
+    def compute_gt_occupancy(self, gt_density):
+        """Genera la maschera binaria GT dai punti/densità."""
+        # Somma la densità nel blocco per vedere se contiene persone
+        gt_counts_per_block = F.avg_pool2d(
+            gt_density,
+            kernel_size=self.block_size,
+            stride=self.block_size
+        ) * (self.block_size ** 2)
+        
+        # Se c'è almeno una frazione di persona (soglia bassa), il blocco è "pieno"
+        gt_occupancy = (gt_counts_per_block > 1e-3).float()
+        return gt_occupancy
+    
+    def forward(self, predictions, gt_density):
+        # [B, 2, H, W] -> Il canale 1 è il logit per "pieno"
+        logit_pi_maps = predictions["logit_pi_maps"]
+        logit_pieno = logit_pi_maps[:, 1:2, :, :] 
+        
+        # Calcola la Ground Truth binaria
+        gt_occupancy = self.compute_gt_occupancy(gt_density)
+        
+        # Allinea dimensioni se necessario (gestione arrotondamenti pooling)
+        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
+            gt_occupancy = F.interpolate(
+                gt_occupancy, 
+                size=logit_pieno.shape[-2:], 
+                mode='nearest'
+            )
+        
+        # Sposta il peso sul device corretto se necessario
+        if self.bce.pos_weight.device != logit_pieno.device:
+            self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
+            
+        loss = self.bce(logit_pieno, gt_occupancy)
+        
+        # Restituisce loss scalare e dizionario per logging
+        return loss, {"pi_bce_loss": loss.detach()}
 
-def zip_regularization(
-    preds,
-    pi_target: float = 0.18,
-    pi_weight: float = 1e-3,
-    lambda_target: float = 3.0,
-    lambda_weight: float = 5e-4,
-):
-    """Light prior to keep π away from zero and λ below saturation."""
-    device = preds["lambda_maps"].device
-    reg_loss = preds["lambda_maps"].new_tensor(0.0, device=device)
 
-    pi_weight = max(pi_weight, 5e-4)
-    lambda_weight = max(lambda_weight, 5e-4)
-
-    if pi_weight > 0:
-        pi_soft = preds["logit_pi_maps"].softmax(dim=1)[:, 1:]
-        pi_reg = ((pi_soft - pi_target) ** 2).mean()
-        reg_loss = reg_loss + pi_weight * pi_reg
-
-    if lambda_weight > 0:
-        lam = preds["lambda_maps"]
-        lambda_reg = torch.relu(lam - lambda_target).mean()
-        reg_loss = reg_loss + lambda_weight * lambda_reg
-
-    return reg_loss
-
-
+# ============================================================
+# TRAINING LOOP
+# ============================================================
 def train_one_epoch(
     model,
     criterion,
@@ -56,92 +94,58 @@ def train_one_epoch(
     optimizer,
     scheduler,
     device,
-    reg_params,
     epoch=1,
-    warmup_epochs=50,
     clip_grad_norm=1.0,
-    count_align_weight: float = 0.0,
 ):
     model.train()
     total_loss = 0.0
-    block_size = criterion.zip_block_size
-    progress_bar = tqdm(dataloader, desc=f"Train Stage 1 (ZIP) - Epoch {epoch}")
+    progress_bar = tqdm(dataloader, desc=f"Train Stage 1 (Pi-Head BCE) - Epoch {epoch}")
 
-    warmup_active = warmup_epochs > 0 and epoch <= warmup_epochs
-    if warmup_active:
-        warmup_factor = epoch / warmup_epochs
-        effective_reg_params = {}
-        for k, v in reg_params.items():
-            if "weight" in k:
-                effective_reg_params[k] = max(v * warmup_factor, 5e-4)
-            else:
-                effective_reg_params[k] = v
-        if epoch == 1:
-            print(f"🔥 Warmup attivo: regolarizzazione scalata di {warmup_factor:.2f}x")
-    else:
-        effective_reg_params = {
-            k: (max(v, 5e-4) if "weight" in k else v)
-            for k, v in reg_params.items()
-        }
-
-    pi_means, lambda_means = [], []
+    pi_means = []
+    
     for images, gt_density, _ in progress_bar:
         images, gt_density = images.to(device), gt_density.to(device)
 
         optimizer.zero_grad()
         predictions = model(images)
+        
+        # Calcolo Loss (Solo BCE su Pi-Head)
         loss, loss_dict = criterion(predictions, gt_density)
 
-        reg_loss = zip_regularization(predictions, **effective_reg_params)
-        align_loss = torch.tensor(0.0, device=device)
-
-        if count_align_weight > 0 and "pred_density_zip" in predictions:
-            with torch.no_grad():
-                gt_blocks = (
-                    F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size ** 2)
-                )
-            pred_blocks = predictions["pred_density_zip"]
-            align_loss = F.l1_loss(
-                pred_blocks.sum(dim=(1, 2, 3)),
-                gt_blocks.sum(dim=(1, 2, 3))
-            )
-
-        total = loss + reg_loss + count_align_weight * align_loss
-
-        total.backward()
+        loss.backward()
+        
         if clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
         optimizer.step()
 
-        total_loss += total.item()
+        total_loss += loss.item()
 
+        # Monitoraggio media probabilità "pieno"
         pi_soft = predictions["logit_pi_maps"].softmax(dim=1)[:, 1:]
         pi_means.append(pi_soft.mean().detach().item())
-        lambda_means.append(predictions["lambda_maps"].mean().detach().item())
 
         progress_bar.set_postfix({
-            'loss': f"{total.item():.4f}",
-            'nll': f"{loss_dict['zip_nll_loss']:.4f}",
-            'ce': f"{loss_dict['zip_ce_loss']:.4f}",
-            'count': f"{loss_dict['zip_count_loss']:.4f}",
-            'reg': f"{reg_loss.item():.4f}",
-            'align': f"{align_loss.item():.4f}",
-            'lr_head': f"{optimizer.param_groups[-1]['lr']:.6f}"
+            'loss': f"{loss.item():.4f}",
+            'bce': f"{loss_dict.get('pi_bce_loss', 0):.4f}",
+            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
         })
 
     if scheduler:
         scheduler.step()
-    if pi_means and lambda_means:
-        print(
-            f"   ↪ π_mean={np.mean(pi_means):.3f} | λ_mean={np.mean(lambda_means):.3f}"
-        )
+        
+    if pi_means:
+        print(f"   ↪ π_mean (avg prob. occupied)={np.mean(pi_means):.3f}")
+        
     return total_loss / len(dataloader)
+
 
 def validate(model, criterion, dataloader, device):
     model.eval()
-    total_loss, mae, mse = 0.0, 0.0, 0.0
-    block_size = criterion.zip_block_size
-    pi_values, lambda_values = [], []
+    total_loss = 0.0
+    mae, mse = 0.0, 0.0
+    
+    # Metriche per la maschera
+    pi_values = []
 
     with torch.no_grad():
         for images, gt_density, _ in tqdm(dataloader, desc="Validate Stage 1"):
@@ -151,54 +155,50 @@ def validate(model, criterion, dataloader, device):
             loss, _ = criterion(preds, gt_density)
             total_loss += loss.item()
 
+            # Estrai probabilità occupazione (canale 1)
             pi_maps = preds["logit_pi_maps"].softmax(dim=1)
-            pi_zero = pi_maps[:, 0:1]
+            pi_pieno = pi_maps[:, 1:2] 
+            
+            # Nota: In questo stage, Lambda (densità) non è allenato dalla loss BCE.
+            # Il conteggio predetto sarà probabilmente errato (Lambda è random o inizializzato),
+            # ma lo calcoliamo per monitoraggio.
             lam = preds["lambda_maps"]
-
-            pred_count = torch.sum((1 - pi_zero) * lam, dim=(1, 2, 3))
-            gt_count = torch.sum(
-                F.avg_pool2d(gt_density, kernel_size=block_size) * (block_size ** 2),
-                dim=(1, 2, 3)
-            )
+            pred_count = torch.sum(pi_pieno * lam, dim=(1, 2, 3))
+            gt_count = torch.sum(gt_density, dim=(1, 2, 3))
 
             mae += torch.abs(pred_count - gt_count).sum().item()
             mse += ((pred_count - gt_count) ** 2).sum().item()
 
-            pi_values.append(pi_maps[:, 1:].reshape(-1).cpu())
-            lambda_values.append(lam.reshape(-1).cpu())
+            pi_values.append(pi_pieno.reshape(-1).cpu())
 
-    if pi_values and lambda_values:
+    # Statistiche Maschera
+    if pi_values:
         pi_values_np = torch.cat(pi_values).numpy()
-        lambda_values_np = torch.cat(lambda_values).numpy()
-
-        print("\n📊 ZIP Head Statistics:")
-        print(
-            "  π (occupancy): mean={:.3f}, std={:.3f}, P10={:.3f}, P90={:.3f}".format(
-                pi_values_np.mean(),
-                pi_values_np.std(),
-                np.percentile(pi_values_np, 10),
-                np.percentile(pi_values_np, 90),
-            )
-        )
-        print(
-            "  λ (intensity): mean={:.3f}, std={:.3f}, P10={:.3f}, P90={:.3f}".format(
-                lambda_values_np.mean(),
-                lambda_values_np.std(),
-                np.percentile(lambda_values_np, 10),
-                np.percentile(lambda_values_np, 90),
-            )
-        )
         active_ratio = (pi_values_np > 0.5).mean() * 100.0
-        print(f"  Active blocks (π>0.5): {active_ratio:.1f}%\n")
+        
+        print("\n📊 ZIP Head Statistics (Mask):")
+        print(f"  Active blocks (π>0.5): {active_ratio:.2f}% (Target approx: 5-20% per folle sparse)")
+        print(
+            "  π distribution: mean={:.3f}, std={:.3f}".format(
+                pi_values_np.mean(), pi_values_np.std()
+            )
+        )
+        print("  ⚠️ Nota: λ non è ottimizzato in Stage 1. Ignora MAE/RMSE se alti; guarda la Loss BCE.\n")
 
     avg_loss = total_loss / len(dataloader)
     avg_mae = mae / len(dataloader.dataset)
     avg_rmse = (mse / len(dataloader.dataset)) ** 0.5
+    
     return avg_loss, avg_mae, avg_rmse
 
+
 def main():
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+    if os.path.exists("config.yaml"):
+        with open("config.yaml", "r") as f:
+            config = yaml.safe_load(f)
+    else:
+        print("❌ ERRORE: config.yaml non trovato.")
+        return
 
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
@@ -207,6 +207,7 @@ def main():
     bin_cfg = config["BINS_CONFIG"][dataset_name]
     bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
+    # Configurazione Modello
     zip_head_cfg = config.get("ZIP_HEAD", {})
     zip_head_kwargs = {
         "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
@@ -225,19 +226,28 @@ def main():
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
+    # Congelamento: Congeliamo la P2R head e la parte Lambda della ZIP head.
+    # Alleniamo SOLO la Pi-Head (classificazione) e il Backbone.
     for p in model.p2r_head.parameters():
         p.requires_grad = False
+    
+    # La loss PiHeadLoss userà solo logit_pi_maps, quindi i gradienti per lambda
+    # saranno implicitamente zero, ma è buona norma saperlo.
 
-    criterion = ZIPCompositeLoss(
-        bins=bins,
-        weight_ce=config["ZIP_LOSS"]["WEIGHT_CE"],
-        zip_block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
-        count_weight=config["ZIP_LOSS"].get("WEIGHT_COUNT", 1.0),
+    # Configurazione Loss Stage 1 (BCE)
+    # Usa POS_WEIGHT_BCE dal config o default a 5.0 (buono per bilanciare background/foreground)
+    pos_weight = config.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
+    print(f"🔧 Loss Config: PiHeadLoss (BCE) con pos_weight={pos_weight}")
+    
+    criterion = PiHeadLoss(
+        pos_weight=pos_weight,
+        block_size=config["DATA"]["ZIP_BLOCK_SIZE"],
     ).to(device)
 
+    # Optimizer
     optim_cfg = config["OPTIM_ZIP"]
-    lr_head = optim_cfg.get("LR", optim_cfg.get("BASE_LR", 5e-5))
-    lr_backbone = optim_cfg.get("LR_BACKBONE", optim_cfg.get("BACKBONE_LR", lr_head * 0.5))
+    lr_head = optim_cfg.get("LR", optim_cfg.get("BASE_LR", 1e-4))
+    lr_backbone = optim_cfg.get("LR_BACKBONE", lr_head * 0.1) # Backbone più lento
 
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = [p for p in model.zip_head.parameters() if p.requires_grad]
@@ -249,11 +259,14 @@ def main():
         ],
         optim_cfg,
     )
-    scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg.get("EPOCHS", 1300))
+    scheduler = get_scheduler(optimizer, optim_cfg, max_epochs=optim_cfg.get("EPOCHS", 100))
+
+    # Dataset & Dataloader
     data_cfg = config["DATA"]
     train_tf = build_transforms(data_cfg, is_train=True)
     val_tf = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(config["DATASET"])
+    
     train_set = DatasetClass(
         root=data_cfg["ROOT"],
         split=data_cfg["TRAIN_SPLIT"],
@@ -266,6 +279,7 @@ def main():
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
         transforms=val_tf,
     )
+    
     train_loader = DataLoader(
         train_set,
         batch_size=optim_cfg["BATCH_SIZE"],
@@ -283,25 +297,29 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
     )
+
+    # Output Dir
     out_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(out_dir, exist_ok=True)
-    start_epoch, best_mae = resume_if_exists(model, optimizer, out_dir, device)
-    zip_reg_cfg = config.get("ZIP_REG", {})
-    zip_reg_params = {
-        "pi_target": zip_reg_cfg.get("PI_TARGET", 0.12),
-        "pi_weight": zip_reg_cfg.get("PI_WEIGHT", 1e-3),
-        "lambda_target": zip_reg_cfg.get("LAMBDA_TARGET", 3.0),
-        "lambda_weight": zip_reg_cfg.get("LAMBDA_WEIGHT", 5e-4),
-    }
-    warmup_epochs = optim_cfg.get("WARMUP_EPOCHS", 0)
+    
+    # Resume
+    start_epoch, best_metric = resume_if_exists(model, optimizer, out_dir, device)
+    
+    # Se riprendiamo da 0 o cambiamo logica, resettiamo la metrica migliore.
+    # Qui usiamo la Validation Loss (BCE) come metrica migliore perché il MAE non è affidabile.
+    if start_epoch == 1:
+        best_metric = float('inf')
 
-    print(f"🚀 Inizio addestramento Stage 1 per {optim_cfg['EPOCHS']} epoche...")
-
-    count_align_weight = config["ZIP_LOSS"].get("WEIGHT_ALIGN", 0.0)
-    val_interval = max(1, optim_cfg.get("VAL_INTERVAL", 3))
+    print(f"🚀 Inizio addestramento Stage 1 (BCE Mode) per {optim_cfg['EPOCHS']} epoche...")
+    val_interval = max(1, optim_cfg.get("VAL_INTERVAL", 1))
+    es_patience = max(0, int(optim_cfg.get("EARLY_STOPPING_PATIENCE", 0)))
+    es_delta = float(optim_cfg.get("EARLY_STOPPING_DELTA", 0.0))
+    epochs_no_improve = 0
+    early_stop_triggered = False
 
     for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         print(f"\n--- Epoch {epoch}/{optim_cfg['EPOCHS']} ---")
+        
         train_loss = train_one_epoch(
             model,
             criterion,
@@ -309,25 +327,48 @@ def main():
             optimizer,
             scheduler,
             device,
-            zip_reg_params,
             epoch=epoch,
-            warmup_epochs=warmup_epochs,
-            count_align_weight=count_align_weight,
+            clip_grad_norm=1.0,
         )
 
         if epoch % val_interval == 0 or epoch == optim_cfg["EPOCHS"]:
+            # Validazione
             val_loss, val_mae, val_rmse = validate(model, criterion, val_loader, device)
-            print(f"Val → Loss {val_loss:.4f}, MAE {val_mae:.2f}, RMSE {val_rmse:.2f}")
+            print(f"Val → Loss (BCE) {val_loss:.4f} | MAE {val_mae:.2f}")
 
-            is_best = val_mae < best_mae
+            # Salvataggio basato sulla Loss (BCE), non sul MAE
+            current_metric = val_loss
+            improvement = current_metric < (best_metric - es_delta)
+            is_best = improvement
+
+            if improvement:
+                best_metric = current_metric
+                epochs_no_improve = 0
+            elif es_patience > 0:
+                epochs_no_improve += 1
+
+            save_checkpoint(
+                model, optimizer, epoch, current_metric, best_metric, out_dir, is_best=is_best
+            )
+            
             if is_best:
-                best_mae = val_mae
+                print(f"✅ Saved new best model (Loss={best_metric:.4f})")
+            elif es_patience > 0:
+                remaining = es_patience - epochs_no_improve
+                print(
+                    f"Nessun miglioramento (delta<{es_delta:.4f}). Early stop tra {max(remaining, 0)} validazioni."
+                )
+                if epochs_no_improve >= es_patience:
+                    print("⛔ Early stopping attiva per Stage 1.")
+                    early_stop_triggered = True
 
-            save_checkpoint(model, optimizer, epoch, val_mae, best_mae, out_dir, is_best=is_best)
-            if is_best:
-                print(f"✅ Saved new best model (MAE={best_mae:.2f})")
+            if early_stop_triggered:
+                break
 
-    print("✅ Addestramento Stage 1 completato.")
+    if early_stop_triggered:
+        print("✅ Stage 1 terminato per early stopping.")
+    else:
+        print("✅ Addestramento Stage 1 completato.")
 
 
 if __name__ == "__main__":

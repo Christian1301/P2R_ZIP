@@ -449,6 +449,11 @@ def main():
         fmt_bias = lambda b: "n/a" if b is None else f"{b:.3f}"
         print(f"✅ Calibrazione completata: bias_1={fmt_bias(bias_1)}, bias_2={fmt_bias(bias_2)}")
     print(f"🚀 Inizio training Stage 2 per {optim_cfg['EPOCHS']} epoche...")
+    es_patience = max(0, int(optim_cfg.get("EARLY_STOPPING_PATIENCE", 0)))
+    es_delta = float(optim_cfg.get("EARLY_STOPPING_DELTA", 0.0))
+    epochs_no_improve = 0
+    early_stop_triggered = False
+
     for ep in range(start_ep, optim_cfg["EPOCHS"] + 1):
         if not phase2_unlocked and phase2_unfreeze_idx is not None and ep == 501:
             print(f"\n🔓 Epoch 501: sblocco backbone fino a layer {phase2_unfreeze_idx}")
@@ -521,11 +526,12 @@ def main():
                 if tot_gt > 0:
                     writer.add_scalar("val/pred_gt_ratio", orig_bias, ep)
 
-            is_best = mae < best_mae
+            improvement = mae < (best_mae - es_delta)
+            is_best = improvement
             best_candidate = best_mae
             calibrated_metrics = None
 
-            if is_best:
+            if improvement:
                 best_candidate = mae
                 if cfg["EXP"].get("SAVE_BEST", False):
                     best_path = os.path.join(stage1_dir, "stage2_best.pth")
@@ -562,8 +568,11 @@ def main():
                         torch.save(model.state_dict(), best_path)
                         print(f"💾 Nuovo best Stage 2 salvato in {best_path} (MAE={mae:.2f})")
 
-            if is_best:
+            if improvement:
                 best_mae = min(best_mae, best_candidate)
+                epochs_no_improve = 0
+            elif es_patience > 0:
+                epochs_no_improve += 1
 
             save_checkpoint(model, opt, ep, mae, best_mae, exp_dir, is_best=is_best)
 
@@ -580,15 +589,31 @@ def main():
                     )
                 )
 
+            if not improvement and es_patience > 0:
+                remaining = es_patience - epochs_no_improve
+                print(
+                    f"Nessun miglioramento MAE (delta<{es_delta:.3f}). Early stop tra {max(remaining, 0)} validazioni."
+                )
+                if epochs_no_improve >= es_patience:
+                    print("⛔ Early stopping attiva per Stage 2.")
+                    early_stop_triggered = True
+                    break
+
             if ep % 50 == 0:
                 with torch.no_grad():
                     sample_out = model(images[:1])
                     dens = sample_out["p2r_density"]
                     print(f"[DEBUG Epoch {ep}] Mean dens: {dens.mean().item():.4f}, Max: {dens.max().item():.4f}")
 
+        if early_stop_triggered:
+            break
+
     if writer:
         writer.close()
-    print("✅ Stage 2 completato.")
+    if early_stop_triggered:
+        print("✅ Stage 2 terminato per early stopping.")
+    else:
+        print("✅ Stage 2 completato.")
 
 if __name__ == "__main__":
     main()

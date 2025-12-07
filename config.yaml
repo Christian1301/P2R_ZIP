@@ -1,7 +1,5 @@
 # ========================================
-# CONFIGURAZIONE FINAL: P2R + ZIP (FROZEN BACKBONE - v3 AGGRESSIVE)
-# Obiettivo: Abbattere il Bias (Soppressione Sfondo)
-# Strategia: ZIP_SCALE alto, L1 basso, Backbone fisso
+# CONFIGURAZIONE FINAL: P2R + ZIP (SAFE PIPELINE)
 # ========================================
 
 RUN_NAME: "shha_target60_v1"
@@ -24,7 +22,7 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
+  BACKBONE: "vgg16_bn" 
   ZIP_PI_THRESH: 0.5
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
@@ -94,37 +92,49 @@ P2R_LOSS:
   LOG_SCALE_CALIBRATION_MAX_DELTA: 2.0
   CALIBRATE_BATCHES: 40
 
-# === STAGE 3: JOINT TRAINING (CLEANING) ===
+# === STAGE 3: JOINT TRAINING (SAFE CLEANING) ===
+# Ripartiamo da Stage 2, ma con parametri che impediscono il collasso
 OPTIM_JOINT:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
   EPOCHS: 500
-  LR_BACKBONE: 0.0            # Backbone congelato
-  LR_HEADS: 5.0e-5            # LR medio per pulizia
+  
+  LR_BACKBONE: 0.0            # Congelato
+  LR_HEADS: 5.0e-5            # Medio
+  
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"
   WARMUP_EPOCHS: 0
   LR_MIN_FACTOR: 0.01
   FINE_TUNE_LR_SCALE: 1.0
-  LOAD_STAGE3_BEST: true
+  
+  LOAD_STAGE3_BEST: false     # Ricarica Stage 2 (MAE 79)
   EARLY_STOPPING_PATIENCE: 50
   EARLY_STOPPING_DELTA: 0.1
   VAL_INTERVAL: 2
 
 JOINT_LOSS:
   ALPHA: 1.0
-  COUNT_L1_W: 0.1             # Basso: Priorità pulizia
-  ZIP_SCALE: 2.0              # Alto: Priorità maschera
+  
+  # ⚖️ BILANCIAMENTO SAFE (Evita Bias 0.03)
+  COUNT_L1_W: 2.0             # ↑ Alzato a 2.0 (era 0.1). Impedisce di andare a zero.
+  ZIP_SCALE: 0.5              # ↓ Abbassato a 0.5 (era 2.0). Pulisce senza aggredire.
+  
   ADAPTIVE_BALANCING: false
 
-# === STAGE 4: RECOVERY & POLISHING (NUOVO) ===
+# === STAGE 4: RECOVERY (SAFE MODE) ===
 OPTIM_STAGE4:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 300                 # Epoche per il recupero finale
-  LR_BACKBONE: 1.0e-7           # Ancora congelato per sicurezza (o 1e-7 se vuoi rischiare)
-  LR_HEADS: 1.0e-4            # Alto: le teste devono riadattarsi velocemente
+  EPOCHS: 300
+  
+  # 🔒 BACKBONE BLOCCATO (Torniamo alla sicurezza)
+  LR_BACKBONE: 0.0
+  
+  # Teste veloci
+  LR_HEADS: 1.0e-4
+  
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"
@@ -134,8 +144,9 @@ OPTIM_STAGE4:
 
 STAGE4_LOSS:
   ALPHA: 1.0
-  COUNT_L1_W: 5.0             # 🔥 ALTISSIMO: Ora il conteggio è tutto
-  ZIP_SCALE: 0.5              # Basso: Mantenimento maschera
+  # ⚖️ Bilanciamento più prudente
+  COUNT_L1_W: 2.0             # Abbassato da 5.0
+  ZIP_SCALE: 1.0              # Alzato da 0.5 per proteggere la pulizia
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

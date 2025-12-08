@@ -21,21 +21,24 @@ DEFAULT_STAGE_FILES = {
     "stage1": "best_model.pth",
     "stage2": "stage2_best.pth",
     "stage3": "stage3_best.pth",
+    "stage4": "stage4_best.pth",
 }
 
 DEFAULT_TAU_VALUES: List[float] = [0.2, 0.4, 0.6, 0.8]
 
 def normalize_stage(label: Optional[str]) -> str:
-    """Normalizza la dicitura dello stage (accetta anche 1/2/3)."""
+    """Normalizza la dicitura dello stage (accetta anche 1/2/3/4)."""
     if label is None:
-        return "stage3"
+        return "stage4"
     stage_map = {
         "1": "stage1",
         "2": "stage2",
         "3": "stage3",
+        "4": "stage4",
         "stage1": "stage1",
         "stage2": "stage2",
         "stage3": "stage3",
+        "stage4": "stage4",
     }
     key = str(label).strip().lower()
     if key not in stage_map:
@@ -73,8 +76,8 @@ def get_model(config: dict, device: torch.device, stage: str) -> P2R_ZIP_Model:
     }
 
     upsample_flag = config["MODEL"].get("UPSAMPLE_TO_INPUT", False)
-    if stage in {"stage2", "stage3"} and upsample_flag:
-        print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per coerenza con l'addestramento Stage 2/3.")
+    if stage in {"stage2", "stage3", "stage4"} and upsample_flag:
+        print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per coerenza con l'addestramento Stage 2/3/4.")
         upsample_flag = False
 
     p2r_head_kwargs = config.get("P2R_HEAD", {})
@@ -295,8 +298,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualizza le mappe di gating P2R-ZIP.")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Percorso del checkpoint da caricare. Se omesso usa RUN_NAME/OUT_DIR da config.")
-    parser.add_argument("--stage", type=str, default="stage3",
-                        help="Stage di riferimento (1/2/3 oppure stage1/stage2/stage3).")
+    parser.add_argument("--stage", type=str, default="stage4",
+                        help="Stage di riferimento (1/2/3/4 oppure stage1/stage2/stage3/stage4).")
     parser.add_argument("--index", type=int, default=None,
                         help="Indice del campione di validazione da visualizzare (default: random).")
     parser.add_argument("--seed", type=int, default=None,

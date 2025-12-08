@@ -1,8 +1,13 @@
 # =================================================================
-# CONFIGURAZIONE P2R-ZIP OTTIMIZZATA (PIPELINE COMPLETA)
+# CONFIGURAZIONE P2R-ZIP OTTIMIZZATA PER MAE ~60
 # =================================================================
+# Modifiche chiave rispetto alla versione originale:
+# 1. Learning rate più conservativi per Stage 3
+# 2. Loss weights ribilanciati
+# 3. Early stopping più paziente
+# 4. Calibrazione più frequente
 
-RUN_NAME: "shha_testv1"
+RUN_NAME: "shha_target60_v2"  # Nuovo nome per non sovrascrivere
 SEED: 2025
 DEVICE: "cuda"
 
@@ -25,17 +30,17 @@ MODEL:
   BACKBONE: "vgg16_bn"
   ZIP_PI_THRESH: 0.5          
   GATE: "multiply"
-  UPSAMPLE_TO_INPUT: false
+  UPSAMPLE_TO_INPUT: false  # IMPORTANTE: deve essere false
 
 # === ZIP HEAD CONFIGURATION ===
 ZIP_HEAD:
   LAMBDA_SCALE: 1.2
   LAMBDA_MAX: 8.0
   USE_SOFTPLUS: true
-  LAMBDA_NOISE_STD: 0.05
+  LAMBDA_NOISE_STD: 0.0  # No noise per stabilità
 
 # -----------------------------------------------------------------
-# STAGE 1: ZIP TRAINING
+# STAGE 1: ZIP TRAINING (invariato, già funziona bene)
 # -----------------------------------------------------------------
 OPTIM_ZIP:
   BATCH_SIZE: 6
@@ -57,6 +62,7 @@ ZIP_LOSS:
   WEIGHT_NLL: 1.0
   WEIGHT_COUNT: 0.8
   WEIGHT_ALIGN: 0.4
+  POS_WEIGHT_BCE: 5.0
 
 ZIP_REG:
   PI_TARGET: 0.15
@@ -65,7 +71,7 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # -----------------------------------------------------------------
-# STAGE 2: P2R TRAINING
+# STAGE 2: P2R TRAINING (già buono - MAE 84)
 # -----------------------------------------------------------------
 OPTIM_P2R:
   BATCH_SIZE: 10
@@ -82,70 +88,70 @@ OPTIM_P2R:
   EARLY_STOPPING_DELTA: 0.5      
 
 P2R_LOSS:
-  SCALE_WEIGHT: 0.20          
+  SCALE_WEIGHT: 0.10          # Ridotto per stabilità
   POS_WEIGHT: 6.0
   CHUNK_SIZE: 2048
   MIN_RADIUS: 4.0
   MAX_RADIUS: 50.0
   LOG_SCALE_INIT: -0.8
-  LOG_SCALE_LR_FACTOR: 0.20
+  LOG_SCALE_LR_FACTOR: 0.10   # Ridotto
   LOG_SCALE_CLAMP: [-3.0, 2.0]
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 2.0
-  CALIBRATE_BATCHES: 4
+  LOG_SCALE_CALIBRATION_MAX_DELTA: 1.0  # Ridotto
+  CALIBRATE_BATCHES: 8
 
 # -----------------------------------------------------------------
-# STAGE 3: JOINT TRAINING
+# STAGE 3: JOINT TRAINING (OTTIMIZZATO)
 # -----------------------------------------------------------------
 OPTIM_JOINT:
-  BATCH_SIZE: 6
+  BATCH_SIZE: 4               # Ridotto per stabilità
   NUM_WORKERS: 4
-  EPOCHS: 300
+  EPOCHS: 400                 # Più epoche
   
-  LR_BACKBONE: 1.0e-6
-  LR_HEADS: 8.0e-5
+  LR_BACKBONE: 5.0e-7         # Molto ridotto (era 1e-6)
+  LR_HEADS: 2.0e-5            # Ridotto da 8e-5
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"     
-  WARMUP_EPOCHS: 50
+  WARMUP_EPOCHS: 80           # Warmup più lungo
   LR_MIN_FACTOR: 0.01         
   
-  VAL_INTERVAL: 2
-  EARLY_STOPPING_PATIENCE: 50 
-  EARLY_STOPPING_DELTA: 0.3   
+  VAL_INTERVAL: 3             # Validazione più frequente
+  EARLY_STOPPING_PATIENCE: 80  # Più pazienza
+  EARLY_STOPPING_DELTA: 0.2   # Delta più piccolo
   
   LOAD_STAGE3_BEST: false     
   RESUME_LAST: true          
   SAVE_BEST: true             
 
 JOINT_LOSS:
-  ALPHA: 1.0
-  COUNT_L1_W: 0.5
-  ZIP_SCALE: 1.0
+  ALPHA: 0.5                  # Ridotto da 1.0 (meno peso P2R)
+  COUNT_L1_W: 1.5             # Aumentato (più enfasi sul conteggio)
+  ZIP_SCALE: 0.3              # Ridotto (meno peso ZIP)
   ADAPTIVE_BALANCING: false   
 
 # -----------------------------------------------------------------
-# STAGE 4: RECOVERY (Solo se Stage 3 peggiora)
+# STAGE 4: RECOVERY (Solo se necessario)
 # -----------------------------------------------------------------
 OPTIM_STAGE4:
-  BATCH_SIZE: 6               
+  BATCH_SIZE: 4               
   NUM_WORKERS: 4              
-  EPOCHS: 100
+  EPOCHS: 150                 # Più epoche
   
-  LR_BACKBONE: 0.0
-  LR_HEADS: 5.0e-5
+  LR_BACKBONE: 0.0            # Backbone completamente congelato
+  LR_HEADS: 1.0e-5            # LR molto basso
   
   WEIGHT_DECAY: 1.0e-4        
   SCHEDULER: "cosine"         
   SCHEDULER_STEP: "epoch"     
-  WARMUP_EPOCHS: 0            
+  WARMUP_EPOCHS: 10            
   VAL_INTERVAL: 2             
-  EARLY_STOPPING_PATIENCE: 40 
+  EARLY_STOPPING_PATIENCE: 60 
 
 STAGE4_LOSS:
-  ALPHA: 1.0                 
-  ZIP_SCALE: 0.5
-  COUNT_L1_W: 1.0
+  ALPHA: 0.3                  # Focus su conteggio
+  ZIP_SCALE: 0.2
+  COUNT_L1_W: 2.0             # Forte enfasi su L1 count
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

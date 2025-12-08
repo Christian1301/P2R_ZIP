@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e  
+rm -rf logs
 mkdir -p logs
 
 echo "🚀 Avvio Stage 1 (ZIP)..."
@@ -27,6 +28,9 @@ echo "✅ Valutazione 2 completata!"
 
 python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
 echo "✅ Valutazione 3 completata!"
+
+python3 evaluate_stage4.py > logs/ev_stage4.log 2>&1
+echo "✅ Valutazione 4 completata!"
 
 python3 visualize_gating.py > logs/visualize_gating.log 2>&1
 echo "✅ Visualizzazione completata!"

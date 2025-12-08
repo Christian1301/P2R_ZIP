@@ -1,8 +1,8 @@
-# ========================================
-# CONFIGURAZIONE FINAL: P2R + ZIP (SAFE PIPELINE)
-# ========================================
+# =================================================================
+# CONFIGURAZIONE P2R-ZIP OTTIMIZZATA (PIPELINE COMPLETA)
+# =================================================================
 
-RUN_NAME: "shha_target60_v1"
+RUN_NAME: "shha_testv1"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -22,8 +22,8 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn" 
-  ZIP_PI_THRESH: 0.5
+  BACKBONE: "vgg16_bn"
+  ZIP_PI_THRESH: 0.5          
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
 
@@ -34,14 +34,15 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
   LAMBDA_NOISE_STD: 0.05
 
-# === STAGE 1: ZIP TRAINING ===
+# -----------------------------------------------------------------
+# STAGE 1: ZIP TRAINING
+# -----------------------------------------------------------------
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
   EPOCHS: 2000
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
-  SCHEDULER_STEPS: []
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
@@ -63,25 +64,25 @@ ZIP_REG:
   LAMBDA_TARGET: 5.0
   LAMBDA_WEIGHT: 1.0e-4
 
-# === STAGE 2: P2R TRAINING ===
+# -----------------------------------------------------------------
+# STAGE 2: P2R TRAINING
+# -----------------------------------------------------------------
 OPTIM_P2R:
   BATCH_SIZE: 10
   NUM_WORKERS: 4
-  EPOCHS: 2500
+  EPOCHS: 2000               
   LR: 1.2e-4
   LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
-  VAL_INTERVAL: 8
+  VAL_INTERVAL: 5            
   RESUME_LAST: true
   SAVE_BEST: true
-  EARLY_STOPPING_PATIENCE: 500
-  EARLY_STOPPING_DELTA: 1.0
+  EARLY_STOPPING_PATIENCE: 300   
+  EARLY_STOPPING_DELTA: 0.5      
 
 P2R_LOSS:
-  MU: 128
-  TAU: 8
-  SCALE_WEIGHT: 0.20
+  SCALE_WEIGHT: 0.20          
   POS_WEIGHT: 6.0
   CHUNK_SIZE: 2048
   MIN_RADIUS: 4.0
@@ -90,63 +91,61 @@ P2R_LOSS:
   LOG_SCALE_LR_FACTOR: 0.20
   LOG_SCALE_CLAMP: [-3.0, 2.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 2.0
-  CALIBRATE_BATCHES: 40
+  CALIBRATE_BATCHES: 4
 
-# === STAGE 3: JOINT TRAINING (SAFE CLEANING) ===
-# Ripartiamo da Stage 2, ma con parametri che impediscono il collasso
+# -----------------------------------------------------------------
+# STAGE 3: JOINT TRAINING
+# -----------------------------------------------------------------
 OPTIM_JOINT:
-  BATCH_SIZE: 6
-  NUM_WORKERS: 4
-  EPOCHS: 500
-  
-  LR_BACKBONE: 0.0            # Congelato
-  LR_HEADS: 5.0e-5            # Medio
-  
-  WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 0
-  LR_MIN_FACTOR: 0.01
-  FINE_TUNE_LR_SCALE: 1.0
-  
-  LOAD_STAGE3_BEST: false     # Ricarica Stage 2 (MAE 79)
-  EARLY_STOPPING_PATIENCE: 50
-  EARLY_STOPPING_DELTA: 0.1
-  VAL_INTERVAL: 2
-
-JOINT_LOSS:
-  ALPHA: 1.0
-  
-  # ⚖️ BILANCIAMENTO SAFE (Evita Bias 0.03)
-  COUNT_L1_W: 2.0             # ↑ Alzato a 2.0 (era 0.1). Impedisce di andare a zero.
-  ZIP_SCALE: 0.5              # ↓ Abbassato a 0.5 (era 2.0). Pulisce senza aggredire.
-  
-  ADAPTIVE_BALANCING: false
-
-# === STAGE 4: RECOVERY (SAFE MODE) ===
-OPTIM_STAGE4:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
   EPOCHS: 300
   
-  # 🔒 BACKBONE BLOCCATO (Torniamo alla sicurezza)
-  LR_BACKBONE: 0.0
-  
-  # Teste veloci
-  LR_HEADS: 1.0e-4
+  LR_BACKBONE: 1.0e-6
+  LR_HEADS: 8.0e-5
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
-  SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 0
+  SCHEDULER_STEP: "epoch"     
+  WARMUP_EPOCHS: 50
+  LR_MIN_FACTOR: 0.01         
+  
   VAL_INTERVAL: 2
-  EARLY_STOPPING_PATIENCE: 40
+  EARLY_STOPPING_PATIENCE: 50 
+  EARLY_STOPPING_DELTA: 0.3   
+  
+  LOAD_STAGE3_BEST: false     
+  RESUME_LAST: true          
+  SAVE_BEST: true             
+
+JOINT_LOSS:
+  ALPHA: 1.0
+  COUNT_L1_W: 0.5
+  ZIP_SCALE: 1.0
+  ADAPTIVE_BALANCING: false   
+
+# -----------------------------------------------------------------
+# STAGE 4: RECOVERY (Solo se Stage 3 peggiora)
+# -----------------------------------------------------------------
+OPTIM_STAGE4:
+  BATCH_SIZE: 6               
+  NUM_WORKERS: 4              
+  EPOCHS: 100
+  
+  LR_BACKBONE: 0.0
+  LR_HEADS: 5.0e-5
+  
+  WEIGHT_DECAY: 1.0e-4        
+  SCHEDULER: "cosine"         
+  SCHEDULER_STEP: "epoch"     
+  WARMUP_EPOCHS: 0            
+  VAL_INTERVAL: 2             
+  EARLY_STOPPING_PATIENCE: 40 
 
 STAGE4_LOSS:
-  ALPHA: 1.0
-  # ⚖️ Bilanciamento più prudente
-  COUNT_L1_W: 2.0             # Abbassato da 5.0
-  ZIP_SCALE: 1.0              # Alzato da 0.5 per proteggere la pulizia
+  ALPHA: 1.0                 
+  ZIP_SCALE: 0.5
+  COUNT_L1_W: 1.0
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:
@@ -157,6 +156,9 @@ BINS_CONFIG:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
     bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
   qnrf:
+    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
+    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
+  nwpu:
     bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
     bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
 

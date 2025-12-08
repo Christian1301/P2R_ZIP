@@ -96,6 +96,24 @@ def collate_joint(batch):
 
     return torch.stack(imgs_out), torch.stack(dens_out), pts_out
 
+def apply_progressive_unfreeze(model, epoch, optim_cfg):
+    """Sblocca il backbone progressivamente."""
+    if epoch == 50:
+        print("🔓 Epoch 50: Sblocco backbone superiore (75%)")
+        for name, param in model.named_parameters():
+            if "backbone.body" in name:
+                layer_idx = int(name.split(".")[2]) if "." in name else 0
+                if layer_idx >= 30:  # VGG16-BN ha ~43 layer
+                    param.requires_grad = True
+        return True  # Segnala di ricreare optimizer
+    
+    elif epoch == 100:
+        print("🔓 Epoch 100: Sblocco completo backbone")
+        for param in model.backbone.parameters():
+            param.requires_grad = True
+        return True
+    
+    return False
 # ============================================================
 # TRAINING LOOP
 # ============================================================
@@ -103,7 +121,7 @@ def collate_joint(batch):
 def train_one_epoch(
     model, criterion_zip, criterion_p2r, dataloader, optimizer, scheduler,
     schedule_step_mode, device, default_down, clamp_cfg, epoch,
-    zip_scale, alpha
+    zip_scale, alpha, count_l1_weight
 ):
     model.train()
     total_loss = 0.0
@@ -132,9 +150,19 @@ def train_one_epoch(
             pred_density, (h_in, w_in), default_down
         )
         loss_p2r = criterion_p2r(pred_density, points, down=down_tuple)
+
+        down_h, down_w = down_tuple
+        cell_area = down_h * down_w
+        pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
+        gt_count = torch.tensor(
+            [len(p) for p in points if p is not None],
+            dtype=torch.float32,
+            device=device,
+        )
+        loss_count_l1 = F.l1_loss(pred_count, gt_count)
         
         # Loss Totale
-        combined_loss = scaled_loss_zip + alpha * loss_p2r
+        combined_loss = scaled_loss_zip + alpha * loss_p2r + count_l1_weight * loss_count_l1
         combined_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -152,7 +180,8 @@ def train_one_epoch(
         progress_bar.set_postfix({
             "Loss": f"{combined_loss.item():.2f}",
             "BCE": f"{scaled_loss_zip.item():.2f}",
-            "P2R": f"{loss_p2r.item():.2f}"
+            "P2R": f"{loss_p2r.item():.2f}",
+            "L1": f"{loss_count_l1.item():.2f}"
         })
 
     return total_loss / len(dataloader)
@@ -162,11 +191,17 @@ def validate(model, dataloader, device, default_down):
     model.eval()
     mae, mse = 0.0, 0.0
     total_pred, total_gt = 0.0, 0.0
+    density_stats = {"mean": [], "max": [], "min": [], "std": []}
 
     for images, gt_density, points in tqdm(dataloader, desc="Validate Stage 3"):
         images = images.to(device)
         outputs = model(images)
         pred_density = outputs["p2r_density"]
+
+        density_stats["mean"].append(pred_density.mean().item())
+        density_stats["max"].append(pred_density.max().item())
+        density_stats["min"].append(pred_density.min().item())
+        density_stats["std"].append(pred_density.std().item())
 
         _, _, h_in, w_in = images.shape
         pred_density, down_tuple, _ = canonicalize_p2r_grid(
@@ -187,6 +222,18 @@ def validate(model, dataloader, device, default_down):
     n = len(dataloader.dataset)
     mae /= n
     rmse = np.sqrt(mse / n)
+
+    if density_stats["mean"]:
+        mean_mean = np.mean(density_stats["mean"])
+        mean_max = np.mean(density_stats["max"])
+        mean_std = np.mean(density_stats["std"])
+        print("\n📊 Statistiche Densità:")
+        print(f"  Mean: {mean_mean:.4f}")
+        print(f"  Max:  {mean_max:.4f}")
+        print(f"  Std:  {mean_std:.4f}")
+        if mean_mean < 0.01:
+            print("⚠️ ALERT: Densità troppo bassa - rischio collasso!")
+
     return mae, rmse, total_pred, total_gt
 
 # ============================================================
@@ -358,17 +405,21 @@ def main():
     
     zip_scale = float(config["JOINT_LOSS"].get("ZIP_SCALE", 1.0))
     alpha = float(config["JOINT_LOSS"].get("ALPHA", 1.0))
+    count_l1_weight = float(config["JOINT_LOSS"].get("COUNT_L1_W", 0.0))
 
     print(f"\n🚀 START Stage 3 (Ep {start_epoch+1} -> {epochs_stage3})")
     
     for epoch in range(start_epoch, epochs_stage3):
         print(f"\n--- Epoch {epoch + 1}/{epochs_stage3} ---")
-        
+        if apply_progressive_unfreeze(model, epoch, optim_cfg):
+            optimizer = rebuild_optimizer(model, optim_cfg)
+            scheduler = get_scheduler(optimizer, optim_cfg, epochs_stage3 - epoch)
+            
         train_loss = train_one_epoch(
             model, criterion_zip, criterion_p2r, train_loader, optimizer,
             scheduler, str(optim_cfg.get("SCHEDULER_STEP", "iteration")).lower(),
             device, data_cfg["P2R_DOWNSAMPLE"], loss_cfg.get("LOG_SCALE_CLAMP"),
-            epoch + 1, zip_scale, alpha
+            epoch + 1, zip_scale, alpha, count_l1_weight
         )
 
         if scheduler and str(optim_cfg.get("SCHEDULER_STEP", "iteration")).lower() == "epoch":

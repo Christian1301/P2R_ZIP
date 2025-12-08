@@ -19,8 +19,8 @@ class P2R_ZIP_Model(nn.Module):
         gate="multiply",
         upsample_to_input=True,
         debug=False,
-    zip_head_kwargs: Optional[dict] = None,
-    p2r_head_kwargs: Optional[dict] = None,
+        zip_head_kwargs: Optional[dict] = None,
+        p2r_head_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.bins = bins
@@ -32,6 +32,7 @@ class P2R_ZIP_Model(nn.Module):
         self.backbone = BackboneWrapper(backbone_name)
         zip_head_kwargs = zip_head_kwargs or {}
         self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins, **zip_head_kwargs)
+        
         p2r_head_kwargs = p2r_head_kwargs or {}
         if "in_channel" not in p2r_head_kwargs:
             p2r_head_kwargs["in_channel"] = 512
@@ -53,14 +54,25 @@ class P2R_ZIP_Model(nn.Module):
         zip_outputs = self.zip_head(feat, self.bin_centers)
         logit_pi_maps = zip_outputs["logit_pi_maps"]
         lambda_maps = zip_outputs["lambda_maps"]
+        
+        # --- GATING LOGIC (SOFT vs HARD) ---
         pi_softmax = logit_pi_maps.softmax(dim=1)
         pi_not_zero = pi_softmax[:, 1:] 
-        mask = (pi_not_zero > self.pi_thresh).float()
+        
+        if self.training:
+            # SOFT GATING: Durante il training permettiamo ai gradienti di fluire.
+            # Usiamo la probabilità stessa come gate (+ offset per evitare zero assoluto)
+            # Questo permette alla P2R loss di correggere la ZIP head.
+            mask = pi_not_zero + 0.1 
+            mask = torch.clamp(mask, 0.0, 1.0)
+        else:
+            # HARD GATING: In validazione usiamo la soglia netta per pulire il background.
+            mask = (pi_not_zero > self.pi_thresh).float()
 
         if mask.shape[-2:] != feat.shape[-2:]:
             mask = F.interpolate(mask, size=feat.shape[-2:], mode="bilinear", align_corners=False)
 
-        if self.debug:
+        if self.debug and not self.training:
             active_ratio = mask.mean().item() * 100
             print(f"[DEBUG] Active blocks ratio: {active_ratio:.2f}% (th={self.pi_thresh})")
 

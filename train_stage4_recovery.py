@@ -258,9 +258,17 @@ def main():
     
     if os.path.isfile(stage3_path):
         print(f"🔄 Caricamento pesi Stage 3: {stage3_path}")
-        state_dict = torch.load(stage3_path, map_location=device)
-        if "model" in state_dict: state_dict = state_dict["model"]
-        model.load_state_dict(state_dict, strict=False)
+        ckpt = torch.load(stage3_path, map_location=device)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif isinstance(ckpt, dict) and "model" in ckpt:
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+
+        mismatch = model.load_state_dict(state_dict, strict=False)
+        if mismatch.missing_keys or mismatch.unexpected_keys:
+            print(f"⚠️  Avviso load_state_dict Stage 4: missing={mismatch.missing_keys}, unexpected={mismatch.unexpected_keys}")
     else:
         print(f"❌ MANCA: {stage3_path}")
         return

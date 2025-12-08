@@ -12,13 +12,74 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from losses.p2r_region_loss import P2RLoss
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import init_seeds, canonicalize_p2r_grid, collate_fn
+from train_utils import init_seeds, canonicalize_p2r_grid
 
 # ============================================================
-# LOSS DEFINITIONS (Mirroring Training)
+# COLLATE FUNCTION (Cruciale: Identica al Training per la Scala)
+# ============================================================
+def _round_up_8(x: int) -> int:
+    return (x + 7) // 8 * 8
+
+def collate_joint(batch):
+    """
+    Replica la logica di preprocessing dello Stage 3 (Resize invece di Padding).
+    Fondamentale per mantenere la stessa scala delle feature vista in training.
+    """
+    if isinstance(batch[0], dict):
+        imgs = [b["image"] for b in batch]
+        dens = [b["density"] for b in batch]
+        pts  = [b.get("points", None) for b in batch]
+    else:
+        imgs, dens, pts = zip(*[(s[0], s[1], s[2]) for s in batch])
+
+    H_max = max(im.shape[-2] for im in imgs)
+    W_max = max(im.shape[-1] for im in imgs)
+    # Arrotonda a multipli di 8 (come nel training)
+    H_tgt, W_tgt = _round_up_8(H_max), _round_up_8(W_max)
+
+    imgs_out, dens_out, pts_out = [], [], []
+    for im, den, p in zip(imgs, dens, pts):
+        _, H, W = im.shape
+        sy, sx = H_tgt / H, W_tgt / W
+
+        # Resize immagine (Interpolazione Bilineare)
+        im_res = F.interpolate(im.unsqueeze(0), size=(H_tgt, W_tgt),
+                               mode='bilinear', align_corners=False).squeeze(0)
+        
+        # Resize densità (se presente)
+        if den is not None:
+            den_res = F.interpolate(den.unsqueeze(0), size=(H_tgt, W_tgt),
+                                    mode='bilinear', align_corners=False).squeeze(0)
+            # Scala la densità per conservare il conteggio totale (Massa)
+            den_res *= (H * W) / (H_tgt * W_tgt)
+        else:
+            den_res = None
+
+        # Scala le coordinate dei punti
+        if p is None or (hasattr(p, "numel") and p.numel() == 0):
+            p_scaled = p
+        else:
+            p_scaled = p.clone()
+            p_scaled[:, 0] *= sx # Scala X
+            p_scaled[:, 1] *= sy # Scala Y
+
+        imgs_out.append(im_res)
+        if den_res is not None:
+            dens_out.append(den_res)
+        pts_out.append(p_scaled)
+
+    # Stack dei tensori densità se presenti
+    if len(dens_out) > 0:
+        dens_out_stack = torch.stack(dens_out)
+    else:
+        dens_out_stack = None
+
+    return torch.stack(imgs_out), dens_out_stack, pts_out
+
+# ============================================================
+# LOSS DI VALIDAZIONE
 # ============================================================
 class PiHeadLoss(nn.Module):
-    """Loss BCE per la validazione della maschera (Stage 1/3 logic)."""
     def __init__(self, pos_weight=5.0, block_size=16):
         super().__init__()
         self.pos_weight = pos_weight
@@ -53,7 +114,7 @@ class PiHeadLoss(nn.Module):
         return loss
 
 # ============================================================
-# VALUTAZIONE
+# LOOP DI VALUTAZIONE
 # ============================================================
 @torch.no_grad()
 def evaluate_joint(model, dataloader, device, default_down, criterion_zip, criterion_p2r):
@@ -63,36 +124,39 @@ def evaluate_joint(model, dataloader, device, default_down, criterion_zip, crite
     total_pred, total_gt = 0.0, 0.0
     pi_active_stats = []
 
-    print("\n===== VALUTAZIONE STAGE 3 (Joint) =====")
-    print("Monitoraggio: MAE, RMSE, BCE Loss (Mask), P2R Loss (Density)")
+    print("\n===== VALUTAZIONE STAGE 3 (Joint - Resized) =====")
     
     for idx, (images, gt_density, points) in enumerate(tqdm(dataloader, desc="[Validate Stage 3]")):
-        images, gt_density = images.to(device), gt_density.to(device)
+        images = images.to(device)
+        # gt_density serve per la loss ZIP
+        if gt_density is not None:
+            gt_density = gt_density.to(device)
         
-        # Gestione punti (lista di tensori)
         points_list = [p.to(device) for p in points]
 
         # Forward
         outputs = model(images)
         pred_density = outputs["p2r_density"]
 
-        # 1. Calcolo Loss ZIP (BCE)
-        loss_zip = criterion_zip(outputs, gt_density)
-        total_loss_zip += loss_zip.item()
+        # 1. Loss ZIP (se GT disponibile)
+        if gt_density is not None:
+            loss_zip = criterion_zip(outputs, gt_density)
+            total_loss_zip += loss_zip.item()
 
-        # 2. Calcolo Loss P2R
-        # Canonicalize per allineare grid size
+        # 2. Loss P2R e Canonicalize
         _, _, h_in, w_in = images.shape
         pred_density_aligned, down_tuple, _ = canonicalize_p2r_grid(
             pred_density, (h_in, w_in), default_down, warn_tag="stage3_eval"
         )
+        
         loss_p2r = criterion_p2r(pred_density_aligned, points_list, down=down_tuple)
         total_loss_p2r += loss_p2r.item()
 
-        # 3. Metriche di Conteggio
+        # 3. Metriche Conteggio
         down_h, down_w = down_tuple
         cell_area = down_h * down_w
-        # Somma densità / area pixel
+        
+        # P2R Density è normalizzata per pixel, quindi sommiamo e dividiamo per l'area del pixel effettivo
         pred_count = torch.sum(pred_density_aligned, dim=(1, 2, 3)) / cell_area
         
         gt_count_tensor = torch.tensor([len(p) for p in points_list], device=device)
@@ -102,72 +166,44 @@ def evaluate_joint(model, dataloader, device, default_down, criterion_zip, crite
         total_pred += pred_count.sum().item()
         total_gt += gt_count_tensor.sum().item()
 
-        # Statistiche Maschera (Active Ratio)
+        # Statistiche Maschera
         pi_logits = outputs["logit_pi_maps"]
         pi_probs = torch.sigmoid(pi_logits[:, 1:2])
         active_ratio = (pi_probs > 0.5).float().mean().item() * 100
         pi_active_stats.append(active_ratio)
 
         if idx == 0:
-            print("\n[DEBUG PRIMO BATCH]")
-            print(f"  Img Size: {h_in}x{w_in}")
-            print(f"  BCE Loss: {loss_zip.item():.4f}")
-            print(f"  P2R Loss: {loss_p2r.item():.4f}")
-            print(f"  Pred: {pred_count[0].item():.2f} | GT: {gt_count_tensor[0].item():.2f}")
-            print(f"  Mask Active: {active_ratio:.1f}%")
+            print(f"\n[DEBUG BATCH 0] Pred: {pred_count[0].item():.2f} | GT: {gt_count_tensor[0].item():.2f}")
 
-    # Medie
     n_samples = len(dataloader.dataset)
-    n_batches = len(dataloader)
-    
     avg_mae = mae / n_samples
     avg_rmse = np.sqrt(mse / n_samples)
-    avg_loss_zip = total_loss_zip / n_batches
-    avg_loss_p2r = total_loss_p2r / n_batches
-    avg_active = np.mean(pi_active_stats)
     bias = total_pred / total_gt if total_gt > 0 else 0
 
     print("\n" + "="*40)
-    print(f"RISULTATI FINALI STAGE 3")
+    print(f"RISULTATI STAGE 3 (Post-Check)")
     print("="*40)
     print(f"MAE:            {avg_mae:.2f}")
     print(f"RMSE:           {avg_rmse:.2f}")
-    print(f"Bias (Pred/GT): {bias:.3f}")
-    print("-" * 40)
-    print(f"Loss ZIP (BCE): {avg_loss_zip:.4f}")
-    print(f"Loss P2R:       {avg_loss_p2r:.4f}")
-    print(f"Avg Active Mask:{avg_active:.2f}%")
+    print(f"Bias:           {bias:.3f}")
     print("="*40 + "\n")
 
 
 def main():
-    if not os.path.exists("config.yaml"):
-        print("❌ config.yaml non trovato.")
-        return
-        
-    with open("config.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-
+    if not os.path.exists("config.yaml"): return
+    with open("config.yaml", "r") as f: cfg = yaml.safe_load(f)
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
-    print(f"✅ Avvio valutazione Stage 3 su {device}")
 
-    # Configurazione Modello
     dataset_name = cfg["DATASET"]
     bin_cfg = cfg["BINS_CONFIG"][dataset_name]
     
-    # In Stage 3 (Eval), upsample potrebbe essere False se così era nel training
-    upsample_to_input = cfg["MODEL"].get("UPSAMPLE_TO_INPUT", False)
-    if upsample_to_input:
-        print("ℹ️ Forzo UPSAMPLE_TO_INPUT=False per consistenza con P2R logic.")
-        upsample_to_input = False
-
-    zip_head_cfg = cfg.get("ZIP_HEAD", {})
+    # Model Setup
     zip_head_kwargs = {
-        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
-        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
-        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
-        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
+        "lambda_scale": cfg["ZIP_HEAD"].get("LAMBDA_SCALE", 0.5),
+        "lambda_max": cfg["ZIP_HEAD"].get("LAMBDA_MAX", 8.0),
+        "use_softplus": cfg["ZIP_HEAD"].get("USE_SOFTPLUS", True),
+        "lambda_noise_std": 0.0
     }
 
     model = P2R_ZIP_Model(
@@ -176,28 +212,31 @@ def main():
         backbone_name=cfg["MODEL"]["BACKBONE"],
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
-        upsample_to_input=upsample_to_input,
+        upsample_to_input=cfg["MODEL"].get("UPSAMPLE_TO_INPUT", False),
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     # Caricamento Checkpoint
-    ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    ckpt_path = os.path.join(ckpt_dir, "stage3_best.pth")
+    ckpt_path = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"], "stage3_best.pth")
     if not os.path.exists(ckpt_path):
-        # Fallback a last.pth o stage2_best se stage3 non esiste
-        ckpt_path = os.path.join(ckpt_dir, "stage3", "last.pth")
-    
-    if not os.path.exists(ckpt_path):
-        print("❌ Nessun checkpoint Stage 3 trovato (nè best, nè last).")
+        print("❌ Nessun checkpoint Stage 3 trovato.")
         return
 
-    print(f"✅ Caricamento checkpoint da {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location=device)
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
-    model.load_state_dict(state_dict, strict=False)
+    print(f"✅ Caricamento {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
 
-    # Dataset & Dataloader
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
+
+    missing = model.load_state_dict(state_dict, strict=False)
+    if missing.missing_keys or missing.unexpected_keys:
+        print(f"⚠️  Avviso load_state_dict: missing={missing.missing_keys}, unexpected={missing.unexpected_keys}")
+
+    # Dataset & Loader
     data_cfg = cfg["DATA"]
     val_transforms = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(cfg["DATASET"])
@@ -208,37 +247,29 @@ def main():
         transforms=val_transforms,
     )
 
+    # USARE collate_joint INVECE DI collate_fn!
+    # Questo è il fix critico per allineare la validazione al training
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,
         shuffle=False,
         num_workers=cfg["OPTIM_JOINT"]["NUM_WORKERS"],
-        pin_memory=True,
-        collate_fn=collate_fn, # Uso collate_fn standard che gestisce i punti
+        collate_fn=collate_joint, 
+        pin_memory=True
     )
 
-    # Setup Losses per Monitoraggio
-    pos_weight = cfg.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
-    criterion_zip = PiHeadLoss(
-        pos_weight=pos_weight,
-        block_size=data_cfg["ZIP_BLOCK_SIZE"]
+    # Losses
+    criterion_zip = PiHeadLoss(5.0, data_cfg["ZIP_BLOCK_SIZE"]).to(device)
+    p2r_cfg = cfg.get("P2R_LOSS", {})
+    criterion_p2r = P2RLoss(
+        scale_weight=float(p2r_cfg.get("SCALE_WEIGHT", 1.0)),
+        pos_weight=float(p2r_cfg.get("POS_WEIGHT", 1.0)),
+        chunk_size=int(p2r_cfg.get("CHUNK_SIZE", 128)),
+        min_radius=float(p2r_cfg.get("MIN_RADIUS", 0.0)),
+        max_radius=float(p2r_cfg.get("MAX_RADIUS", 10.0))
     ).to(device)
 
-    p2r_loss_cfg = cfg.get("P2R_LOSS", {})
-    loss_kwargs = {
-        "scale_weight": float(p2r_loss_cfg.get("SCALE_WEIGHT", 1.0)),
-        "pos_weight": float(p2r_loss_cfg.get("POS_WEIGHT", 1.0)),
-        "chunk_size": int(p2r_loss_cfg.get("CHUNK_SIZE", 128)),
-        "min_radius": float(p2r_loss_cfg.get("MIN_RADIUS", 0.0)),
-        "max_radius": float(p2r_loss_cfg.get("MAX_RADIUS", 10.0))
-    }
-    criterion_p2r = P2RLoss(**loss_kwargs).to(device)
-
-    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
-    
-    # Esegui Valutazione
-    evaluate_joint(model, val_loader, device, default_down, criterion_zip, criterion_p2r)
-
+    evaluate_joint(model, val_loader, device, data_cfg.get("P2R_DOWNSAMPLE", 8), criterion_zip, criterion_p2r)
 
 if __name__ == "__main__":
     main()

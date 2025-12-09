@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from losses.p2r_region_loss import P2RLoss
+from losses.p2r_region_loss import P2RLossFixed
 from train_utils import collate_fn, init_seeds
 from train_stage2_p2r import calibrate_density_scale
 
@@ -162,7 +162,7 @@ def main():
         loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
     if "MAX_RADIUS" in loss_cfg:
         loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
-    loss_fn = P2RLoss(**loss_kwargs).to(device)
+    loss_fn = P2RLossFixed(**loss_kwargs).to(device)
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")

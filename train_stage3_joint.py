@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 3 - Joint Training V3 - HIGH RECALL
+Stage 3 - Joint Training V5 - P2R FROZEN
 
-Modifiche rispetto a V2:
-1. Recall Penalty: penalizza se recall < 97%
-2. Adaptive temperature: inizia soft, diventa sharp
-3. Early stopping migliorato basato su recall + MAE
-4. Logging più dettagliato per debug
+LEZIONE APPRESA DA V4:
+Il training congiunto di P2R + π-head causa divergenza.
+La P2R head di Stage 2 era già buona (MAE ~103), ma il joint training
+l'ha rovinata (MAE → 170+) aumentando il bias da 1.1 a 1.26.
 
-Obiettivo: π-head con recall > 98% E MAE < 70
+NUOVA STRATEGIA:
+1. CONGELA COMPLETAMENTE la P2R head (incluso log_scale)
+2. Allena SOLO il π-head per migliorare localizzazione
+3. Usa MAE MASKED come metrica (il π-head può aiutare a filtrare rumore)
+
+Obiettivo: π-head che migliora (non peggiora) il conteggio
 """
 
 import os
@@ -31,10 +35,110 @@ from train_utils import (
 
 
 # =============================================================================
+# CALIBRAZIONE LOG_SCALE (da Stage 2)
+# =============================================================================
+
+@torch.no_grad()
+def calibrate_density_scale(
+    model,
+    loader,
+    device,
+    default_down,
+    max_batches=10,
+    clamp_range=(-2.0, 10.0),
+    max_adjust=3.0,
+    bias_eps=0.05,
+    verbose=True,
+):
+    """
+    Calibrazione della scala basata sul bias mediano.
+    
+    Questa funzione è CRITICA per allineare le metriche tra stage.
+    Senza calibrazione, il log_scale salvato nel checkpoint potrebbe
+    non essere ottimale, causando discrepanze di MAE.
+    """
+    if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
+        if verbose:
+            print("⚠️ Calibrazione saltata: log_scale non trovato")
+        return None
+
+    model.eval()
+    ratios = []
+
+    for batch_idx, (images, _, points) in enumerate(loader, start=1):
+        if max_batches is not None and batch_idx > max_batches:
+            break
+
+        images = images.to(device)
+
+        outputs = model(images)
+        pred_density = outputs.get("p2r_density", outputs.get("density"))
+        if pred_density is None:
+            continue
+
+        _, _, H_in, W_in = images.shape
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(
+            pred_density, (H_in, W_in), default_down
+        )
+        down_h, down_w = down_tuple
+        cell_area = down_h * down_w
+
+        for i, pts in enumerate(points):
+            gt = len(pts) if pts is not None else 0
+            if gt == 0:
+                continue
+            
+            pred = (pred_density[i].sum() / cell_area).item()
+            if gt > 0:
+                ratios.append(pred / gt)
+
+    if len(ratios) == 0:
+        if verbose:
+            print("⚠️ Calibrazione saltata: nessun dato valido")
+        return None
+
+    ratios_np = np.array(ratios)
+    bias_median = np.median(ratios_np)
+    
+    if verbose:
+        print(f"\n📊 Statistiche Calibrazione:")
+        print(f"   Bias mediano: {bias_median:.3f}")
+        print(f"   Ratio range: [{ratios_np.min():.3f}, {ratios_np.max():.3f}]")
+
+    if abs(bias_median - 1.0) < bias_eps:
+        if verbose:
+            print(f"✅ Calibrazione: bias già accettabile ({bias_median:.3f})")
+        return bias_median
+
+    prev_log_scale = float(model.p2r_head.log_scale.detach().item())
+    raw_adjust = float(np.log(max(bias_median, 0.01)))
+    
+    if max_adjust is not None:
+        adjust = float(np.clip(raw_adjust, -max_adjust, max_adjust))
+    else:
+        adjust = raw_adjust
+    
+    model.p2r_head.log_scale.data -= torch.tensor(adjust, device=device)
+    
+    if clamp_range is not None:
+        min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
+        model.p2r_head.log_scale.data.clamp_(min_val, max_val)
+    
+    new_log_scale = float(model.p2r_head.log_scale.detach().item())
+    new_scale = float(torch.exp(model.p2r_head.log_scale.detach()).item())
+    
+    if verbose:
+        print(f"🔧 Calibrazione: bias={bias_median:.3f} → "
+              f"log_scale {prev_log_scale:.2f}→{new_log_scale:.2f} (scala={new_scale:.2f})")
+    
+    return bias_median
+
+
+# =============================================================================
 # CHECKPOINT MANAGEMENT
 # =============================================================================
 
-def save_stage3_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False):
     """Salva checkpoint Stage 3."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -47,25 +151,25 @@ def save_stage3_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_re
         "best_results": best_results,
     }
     
-    latest_path = os.path.join(output_dir, "stage3_latest.pth")
+    latest_path = os.path.join(output_dir, "stage3_v5_latest.pth")
     torch.save(checkpoint, latest_path)
     
     if is_best:
-        best_path = os.path.join(output_dir, "stage3_best.pth")
+        best_path = os.path.join(output_dir, "stage3_v5_best.pth")
         torch.save(checkpoint, best_path)
-        print(f"💾 Saved: stage3_latest.pth + stage3_best.pth (MAE={best_mae:.2f})")
+        print(f"💾 Saved: stage3_v5_latest.pth + stage3_v5_best.pth (MAE={best_mae:.2f})")
     else:
-        print(f"💾 Saved: stage3_latest.pth (epoch {epoch})")
+        print(f"💾 Saved: stage3_v5_latest.pth (epoch {epoch})")
 
 
-def resume_stage3(model, optimizer, scheduler, output_dir, device):
-    """Riprende Stage 3 da checkpoint."""
-    latest_path = os.path.join(output_dir, "stage3_latest.pth")
+def resume_checkpoint(model, optimizer, scheduler, output_dir, device):
+    """Riprende da checkpoint."""
+    latest_path = os.path.join(output_dir, "stage3_v5_latest.pth")
     
     if not os.path.isfile(latest_path):
         return 1, float('inf'), {}
     
-    print(f"🔄 Resume Stage 3 da: {latest_path}")
+    print(f"🔄 Resume da: {latest_path}")
     checkpoint = torch.load(latest_path, map_location=device)
     
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
@@ -74,42 +178,30 @@ def resume_stage3(model, optimizer, scheduler, output_dir, device):
     if scheduler and checkpoint.get("scheduler_state_dict"):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     
-    start_epoch = checkpoint.get("epoch", 0) + 1
-    best_mae = checkpoint.get("best_mae", float('inf'))
-    best_results = checkpoint.get("best_results", {})
-    
-    print(f"✅ Ripreso da epoch {start_epoch - 1}, best_mae={best_mae:.2f}")
-    
-    return start_epoch, best_mae, best_results
+    return checkpoint.get("epoch", 0) + 1, checkpoint.get("best_mae", float('inf')), checkpoint.get("best_results", {})
 
 
 # =============================================================================
-# LOSS FUNCTIONS - HIGH RECALL VERSION
+# LOSS: Solo per π-head
 # =============================================================================
 
-class PiHeadLossHighRecall(nn.Module):
+class PiHeadLoss(nn.Module):
     """
-    Loss per π-head ottimizzata per HIGH RECALL.
+    Loss per π-head ottimizzata.
     
-    Modifiche:
-    1. pos_weight molto alto (25+) per penalizzare falsi negativi
-    2. occupancy_threshold basso (0.3) per catturare regioni sparse
-    3. Recall penalty esplicita se recall < target
+    Obiettivo: il π-head deve identificare blocchi con persone
+    in modo che il masking MIGLIORI (non peggiori) il conteggio.
     """
     def __init__(
         self, 
-        pos_weight: float = 25.0,           # Alto!
+        pos_weight: float = 8.0,
         block_size: int = 16, 
-        occupancy_threshold: float = 0.3,   # Basso!
-        recall_min_target: float = 0.97,    # Target recall 97%
-        recall_penalty_weight: float = 1.0,
+        occupancy_threshold: float = 0.5,
     ):
         super().__init__()
         self.pos_weight = pos_weight
         self.block_size = block_size
         self.occupancy_threshold = occupancy_threshold
-        self.recall_min_target = recall_min_target
-        self.recall_penalty_weight = recall_penalty_weight
         
         self.bce = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor([pos_weight]),
@@ -117,13 +209,12 @@ class PiHeadLossHighRecall(nn.Module):
         )
     
     def compute_gt_occupancy(self, gt_density):
-        """GT occupancy con soglia BASSA per catturare tutto."""
+        """GT occupancy: blocco pieno se contiene >= threshold persone."""
         gt_counts_per_block = F.avg_pool2d(
             gt_density,
             kernel_size=self.block_size,
             stride=self.block_size
         ) * (self.block_size ** 2)
-        # Soglia molto bassa: anche 0.3 persone per blocco = occupato
         return (gt_counts_per_block > self.occupancy_threshold).float()
     
     def forward(self, logit_pi_maps, gt_density):
@@ -138,249 +229,128 @@ class PiHeadLossHighRecall(nn.Module):
         if self.bce.pos_weight.device != logit_pieno.device:
             self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
         
-        # BCE Loss principale
-        loss_bce = self.bce(logit_pieno, gt_occupancy)
+        loss = self.bce(logit_pieno, gt_occupancy)
         
         # Metriche
         with torch.no_grad():
-            pred_occupancy = (torch.sigmoid(logit_pieno) > 0.5).float()
+            pred_prob = torch.sigmoid(logit_pieno)
+            pred_occupancy = (pred_prob > 0.5).float()
             coverage = pred_occupancy.mean().item() * 100
             
             if gt_occupancy.sum() > 0:
-                recall = (pred_occupancy * gt_occupancy).sum() / gt_occupancy.sum()
-                recall_val = recall.item()
+                tp = (pred_occupancy * gt_occupancy).sum()
+                fn = ((1 - pred_occupancy) * gt_occupancy).sum()
+                fp = (pred_occupancy * (1 - gt_occupancy)).sum()
+                
+                recall = (tp / (tp + fn + 1e-6)).item() * 100
+                precision = (tp / (tp + fp + 1e-6)).item() * 100
             else:
-                recall_val = 1.0
+                recall = 100.0
+                precision = 100.0
         
-        # RECALL PENALTY: penalizza se recall < target
-        recall_penalty = torch.tensor(0.0, device=logit_pieno.device)
-        if gt_occupancy.sum() > 0:
-            pred_soft = torch.sigmoid(logit_pieno)
-            soft_recall = (pred_soft * gt_occupancy).sum() / (gt_occupancy.sum() + 1e-6)
-            
-            if soft_recall < self.recall_min_target:
-                # Penalità quadratica per recall basso
-                recall_gap = self.recall_min_target - soft_recall
-                recall_penalty = self.recall_penalty_weight * (recall_gap ** 2) * 100
-        
-        total_loss = loss_bce + recall_penalty
-        
-        return total_loss, {
-            "pi_coverage": coverage, 
-            "pi_recall": recall_val * 100,
-            "recall_penalty": recall_penalty.item() if torch.is_tensor(recall_penalty) else recall_penalty,
+        return loss, {
+            "coverage": coverage, 
+            "recall": recall,
+            "precision": precision,
         }
 
 
-class P2RSpatialLoss(nn.Module):
-    """Loss spaziale per P2R."""
-    def __init__(self, sigma: float = 8.0):
-        super().__init__()
-        self.sigma = sigma
-    
-    def forward(self, pred_density, points, down_h, down_w):
-        B, _, H, W = pred_density.shape
-        device = pred_density.device
-        total_loss = 0.0
-        
-        for i in range(B):
-            pts = points[i]
-            if pts is None or len(pts) == 0:
-                continue
-            
-            target = torch.zeros(H, W, device=device)
-            
-            for pt in pts:
-                x, y = pt[0].item() / down_w, pt[1].item() / down_h
-                yy, xx = torch.meshgrid(
-                    torch.arange(H, device=device, dtype=torch.float32),
-                    torch.arange(W, device=device, dtype=torch.float32),
-                    indexing='ij'
-                )
-                gaussian = torch.exp(-((xx - x)**2 + (yy - y)**2) / (2 * (self.sigma/down_h)**2))
-                target += gaussian
-            
-            if target.max() > 0:
-                target = target / target.max()
-            
-            pred_norm = pred_density[i, 0]
-            if pred_norm.max() > 0:
-                pred_norm = pred_norm / pred_norm.max()
-            
-            total_loss += F.mse_loss(pred_norm, target)
-        
-        return total_loss / max(B, 1)
-
-
 # =============================================================================
-# HELPER FUNCTIONS
+# COUNT FUNCTIONS
 # =============================================================================
 
-def get_soft_mask(logit_pi_maps, temperature: float = 1.0):
-    """Soft mask dal π-head."""
-    logit_pieno = logit_pi_maps[:, 1:2, :, :]
-    soft_mask = torch.sigmoid(logit_pieno / temperature)
-    return soft_mask
+def compute_count_raw(pred_density, down_h, down_w):
+    """Conteggio RAW (senza maschera)."""
+    cell_area = down_h * down_w
+    return torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
 
 
-def compute_masked_count(pred_density, soft_mask, down_h, down_w):
-    """Conteggio con maschera."""
+def compute_count_masked(pred_density, pi_probs, down_h, down_w, threshold=0.5):
+    """Conteggio MASKED (con maschera π)."""
     cell_area = down_h * down_w
     
-    if soft_mask.shape[-2:] != pred_density.shape[-2:]:
-        soft_mask = F.interpolate(
-            soft_mask, 
-            size=pred_density.shape[-2:], 
-            mode='bilinear',
-            align_corners=False
+    if pi_probs.shape[-2:] != pred_density.shape[-2:]:
+        pi_probs = F.interpolate(
+            pi_probs, size=pred_density.shape[-2:], 
+            mode='bilinear', align_corners=False
         )
     
-    masked_density = pred_density * soft_mask
-    count = torch.sum(masked_density, dim=(1, 2, 3)) / cell_area
-    
-    return count, masked_density
-
-
-def get_adaptive_temperature(epoch, total_epochs, temp_start=1.5, temp_end=0.5):
-    """
-    Temperature adattiva: inizia soft (più gradienti), finisce sharp (più preciso).
-    """
-    progress = min(epoch / max(total_epochs * 0.7, 1), 1.0)
-    return temp_start - (temp_start - temp_end) * progress
+    mask = (pi_probs > threshold).float()
+    masked_density = pred_density * mask
+    return torch.sum(masked_density, dim=(1, 2, 3)) / cell_area
 
 
 # =============================================================================
-# TRAINING LOOP
+# TRAINING - Solo π-head
 # =============================================================================
 
-def train_one_epoch(
-    model, pi_loss_fn, spatial_loss_fn,
-    dataloader, optimizer, device, default_down, epoch, config, total_epochs
-):
+def train_one_epoch(model, pi_loss_fn, dataloader, optimizer, device, default_down, epoch):
+    """
+    Training: SOLO π-head, P2R completamente congelata.
+    """
     model.train()
     
-    pi_weight = config["PI_WEIGHT"]
-    count_weight = config["COUNT_WEIGHT"]
-    spatial_weight = config["SPATIAL_WEIGHT"]
-    scale_weight = config["SCALE_WEIGHT"]
-    
-    # Temperature adattiva
-    temperature = get_adaptive_temperature(epoch, total_epochs)
+    # Assicura che P2R sia in eval mode (BatchNorm frozen)
+    model.p2r_head.eval()
     
     total_loss = 0.0
-    total_mae = 0.0
     total_coverage = 0.0
     total_recall = 0.0
-    total_recall_penalty = 0.0
     num_batches = 0
     
-    progress_bar = tqdm(dataloader, desc=f"Joint [Ep {epoch}]")
+    progress_bar = tqdm(dataloader, desc=f"Stage3 V5 [Ep {epoch}]")
     
     for images, gt_density, points in progress_bar:
         images = images.to(device)
         gt_density = gt_density.to(device)
-        points = [p.to(device) if p is not None else None for p in points]
         
         optimizer.zero_grad()
-        outputs = model(images)
         
-        # P2R Density
-        pred_density = outputs["p2r_density"]
-        _, _, h_in, w_in = images.shape
-        pred_density, down_tuple, _ = canonicalize_p2r_grid(
-            pred_density, (h_in, w_in), default_down
-        )
-        down_h, down_w = down_tuple
-        
-        # Soft Mask
-        logit_pi = outputs["logit_pi_maps"]
-        soft_mask = get_soft_mask(logit_pi, temperature=temperature)
-        
-        # Conteggio MASKED
-        pred_count, masked_density = compute_masked_count(
-            pred_density, soft_mask, down_h, down_w
-        )
-        
-        gt_count = torch.tensor(
-            [len(p) if p is not None else 0 for p in points],
-            device=device, dtype=torch.float32
-        )
-        
-        # === LOSSES ===
-        
-        # Count Loss (L1)
-        loss_count = F.l1_loss(pred_count, gt_count)
-        
-        # Scale Loss
+        # Forward (P2R non ha gradienti)
         with torch.no_grad():
-            valid_mask = gt_count > 1
-        if valid_mask.any():
-            scale_errors = torch.abs(pred_count[valid_mask] - gt_count[valid_mask]) / gt_count[valid_mask]
-            loss_scale = scale_errors.mean()
-        else:
-            loss_scale = torch.tensor(0.0, device=device)
+            # Backbone e P2R senza gradienti
+            feat = model.backbone(images)
         
-        # π-head Loss (con recall penalty)
-        loss_pi, pi_metrics = pi_loss_fn(logit_pi, gt_density)
+        # Solo ZIP head con gradienti
+        zip_outputs = model.zip_head(feat, model.bin_centers)
+        logit_pi = zip_outputs["logit_pi_maps"]
         
-        # Spatial Loss
-        if spatial_weight > 0:
-            loss_spatial = spatial_loss_fn(pred_density, points, down_h, down_w)
-        else:
-            loss_spatial = torch.tensor(0.0, device=device)
+        # Loss solo su π-head
+        loss, metrics = pi_loss_fn(logit_pi, gt_density)
         
-        # Loss Totale
-        total = (
-            count_weight * loss_count +
-            scale_weight * loss_scale +
-            pi_weight * loss_pi +
-            spatial_weight * loss_spatial
-        )
-        
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.zip_head.parameters(), 1.0)
         optimizer.step()
         
-        # Metriche
-        with torch.no_grad():
-            mae = torch.abs(pred_count - gt_count).mean().item()
-            total_mae += mae
-            total_coverage += pi_metrics["pi_coverage"]
-            total_recall += pi_metrics["pi_recall"]
-            total_recall_penalty += pi_metrics.get("recall_penalty", 0)
-        
-        total_loss += total.item()
+        total_loss += loss.item()
+        total_coverage += metrics["coverage"]
+        total_recall += metrics["recall"]
         num_batches += 1
         
         progress_bar.set_postfix({
-            "L": f"{total.item():.1f}",
-            "MAE": f"{mae:.1f}",
-            "rec": f"{pi_metrics['pi_recall']:.0f}%",
-            "T": f"{temperature:.2f}"
+            "L": f"{loss.item():.3f}",
+            "cov": f"{metrics['coverage']:.1f}%",
+            "rec": f"{metrics['recall']:.0f}%",
         })
     
     n = max(num_batches, 1)
-    avg_recall = total_recall / n
-    avg_coverage = total_coverage / n
+    print(f"   Train: Loss={total_loss/n:.4f}, Coverage={total_coverage/n:.1f}%, Recall={total_recall/n:.1f}%")
     
-    print(f"   Train: MAE={total_mae/n:.2f}, π_recall={avg_recall:.1f}%, "
-          f"π_coverage={avg_coverage:.1f}%, temp={temperature:.2f}")
-    
-    # Warning se recall basso
-    if avg_recall < 95:
-        print(f"   ⚠️ ATTENZIONE: recall basso ({avg_recall:.1f}%)! Il π-head maschera persone.")
-    
-    return total_loss / len(dataloader), avg_recall
+    return total_loss / len(dataloader)
 
 
 @torch.no_grad()
-def validate(model, dataloader, device, default_down, temperature=1.0):
-    """Validazione con metriche dettagliate."""
+def validate(model, dataloader, device, default_down, pi_threshold=0.5):
+    """
+    Validazione: confronta RAW vs MASKED.
+    
+    L'obiettivo è che MASKED sia MEGLIO di RAW.
+    """
     model.eval()
     
-    mae_masked, mae_raw = 0.0, 0.0
+    mae_raw, mae_masked = 0.0, 0.0
     mse_masked = 0.0
-    total_pred, total_gt = 0.0, 0.0
+    total_pred_raw, total_pred_masked, total_gt = 0.0, 0.0, 0.0
     total_coverage, total_recall = 0.0, 0.0
     n_samples = 0
     
@@ -398,91 +368,104 @@ def validate(model, dataloader, device, default_down, temperature=1.0):
             pred_density, (h_in, w_in), default_down
         )
         down_h, down_w = down_tuple
-        cell_area = down_h * down_w
         
-        # Raw count
-        pred_count_raw = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
+        # Counts
+        pred_count_raw = compute_count_raw(pred_density, down_h, down_w)
         
-        # Masked count
-        logit_pi = outputs["logit_pi_maps"]
-        soft_mask = get_soft_mask(logit_pi, temperature=temperature)
-        pred_count_masked, _ = compute_masked_count(pred_density, soft_mask, down_h, down_w)
+        pi_probs = outputs.get("pi_probs")
+        if pi_probs is None:
+            logit_pi = outputs["logit_pi_maps"]
+            pi_probs = logit_pi.softmax(dim=1)[:, 1:2]
         
-        # Coverage & Recall
-        gt_occupancy = (F.avg_pool2d(gt_density, 16, 16) * 256 > 0.3).float()  # Soglia bassa!
-        pred_occupancy = (soft_mask > 0.5).float()
+        pred_count_masked = compute_count_masked(
+            pred_density, pi_probs, down_h, down_w, threshold=pi_threshold
+        )
+        
+        # π metrics
+        gt_occupancy = (F.avg_pool2d(gt_density, 16, 16) * 256 > 0.5).float()
+        pred_occupancy = (pi_probs > 0.5).float()
         
         if pred_occupancy.shape[-2:] != gt_occupancy.shape[-2:]:
-            pred_occupancy_resized = F.interpolate(pred_occupancy, gt_occupancy.shape[-2:], mode='nearest')
-        else:
-            pred_occupancy_resized = pred_occupancy
+            pred_occupancy = F.interpolate(pred_occupancy, gt_occupancy.shape[-2:], mode='nearest')
         
         coverage = pred_occupancy.mean().item() * 100
+        recall = 100.0
         if gt_occupancy.sum() > 0:
-            recall = (pred_occupancy_resized * gt_occupancy).sum() / gt_occupancy.sum() * 100
-        else:
-            recall = 100.0
+            recall = (pred_occupancy * gt_occupancy).sum() / gt_occupancy.sum() * 100
         
         for idx, pts in enumerate(points):
             gt = len(pts) if pts is not None else 0
-            pred_m = pred_count_masked[idx].item()
             pred_r = pred_count_raw[idx].item()
+            pred_m = pred_count_masked[idx].item()
             
-            err_m = abs(pred_m - gt)
             err_r = abs(pred_r - gt)
+            err_m = abs(pred_m - gt)
             
-            mae_masked += err_m
             mae_raw += err_r
+            mae_masked += err_m
             mse_masked += err_m ** 2
-            total_pred += pred_m
+            total_pred_raw += pred_r
+            total_pred_masked += pred_m
             total_gt += gt
             total_coverage += coverage
-            total_recall += recall if isinstance(recall, float) else recall.item()
+            total_recall += recall.item() if torch.is_tensor(recall) else recall
             n_samples += 1
             
             if gt <= 100:
-                errors_by_density["sparse"].append(err_m)
+                errors_by_density["sparse"].append((err_r, err_m))
             elif gt <= 500:
-                errors_by_density["medium"].append(err_m)
+                errors_by_density["medium"].append((err_r, err_m))
             else:
-                errors_by_density["dense"].append(err_m)
+                errors_by_density["dense"].append((err_r, err_m))
     
-    mae_masked /= n_samples
     mae_raw /= n_samples
+    mae_masked /= n_samples
     rmse = np.sqrt(mse_masked / n_samples)
-    bias = total_pred / total_gt if total_gt > 0 else 0
+    bias_raw = total_pred_raw / total_gt if total_gt > 0 else 0
+    bias_masked = total_pred_masked / total_gt if total_gt > 0 else 0
     coverage = total_coverage / n_samples
     recall = total_recall / n_samples
     
-    print(f"\n📊 Validation:")
-    print(f"   MAE MASKED: {mae_masked:.2f}")
+    # Report
+    print(f"\n{'='*60}")
+    print(f"📊 Validation Results")
+    print(f"{'='*60}")
     print(f"   MAE RAW:    {mae_raw:.2f}")
+    print(f"   MAE MASKED: {mae_masked:.2f}  ← METRICA PRINCIPALE")
     print(f"   RMSE:       {rmse:.2f}")
-    print(f"   Bias:       {bias:.3f}")
+    print(f"   Bias RAW:   {bias_raw:.3f}")
+    print(f"   Bias MASKED:{bias_masked:.3f}")
+    print(f"{'─'*60}")
     print(f"   π coverage: {coverage:.1f}%")
     print(f"   π recall:   {recall:.1f}%")
+    print(f"{'─'*60}")
     
-    print(f"\n   Per densità:")
+    print(f"   Per densità:")
     for name, errors in errors_by_density.items():
         if errors:
-            print(f"      {name}: MAE={np.mean(errors):.1f} ({len(errors)} imgs)")
+            raw_errs = [e[0] for e in errors]
+            masked_errs = [e[1] for e in errors]
+            print(f"      {name}: RAW={np.mean(raw_errs):.1f}, MASKED={np.mean(masked_errs):.1f} ({len(errors)} imgs)")
     
-    if mae_masked < mae_raw:
-        print(f"\n   ✅ π-head AIUTA! (masked < raw di {mae_raw - mae_masked:.1f})")
+    # Confronto
+    delta = mae_raw - mae_masked
+    if delta > 0:
+        print(f"\n   ✅ MASKED migliore di RAW di {delta:.1f} punti")
     else:
-        print(f"\n   ⚠️ π-head peggiora di {mae_masked - mae_raw:.1f}")
+        print(f"\n   ⚠️ RAW migliore di MASKED di {-delta:.1f} punti")
     
-    # Warning recall
-    if recall < 95:
-        print(f"\n   🚨 RECALL CRITICO: {recall:.1f}% - il π-head maschera troppe persone!")
+    print(f"{'='*60}\n")
     
     return {
-        "mae": mae_masked,
+        "mae": mae_masked,  # Metrica principale ora è MASKED
         "mae_raw": mae_raw,
+        "mae_masked": mae_masked,
         "rmse": rmse,
-        "bias": bias,
+        "bias": bias_masked,
+        "bias_raw": bias_raw,
         "coverage": coverage,
         "recall": recall,
+        "improvement": delta,  # Quanto MASKED migliora su RAW
     }
 
 
@@ -500,29 +483,27 @@ def main():
     
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
-    print(f"✅ Avvio Stage 3 Joint Training V3 (HIGH RECALL) su {device}")
     
-    # Joint Config
+    print("="*60)
+    print("🚀 Stage 3 V5 - P2R FROZEN, solo π-head training")
+    print("="*60)
+    print(f"Device: {device}")
+    print("Strategia: P2R congelata, allena solo π-head")
+    print("Metrica: MAE MASKED (π-head deve migliorare il conteggio)")
+    print("="*60)
+    
+    # Config
+    data_cfg = config["DATA"]
     joint_cfg = config.get("JOINT_LOSS", {})
-    loss_config = {
-        "PI_WEIGHT": float(joint_cfg.get("PI_WEIGHT", 0.8)),
-        "COUNT_WEIGHT": float(joint_cfg.get("COUNT_WEIGHT", 2.0)),
-        "SCALE_WEIGHT": float(joint_cfg.get("SCALE_WEIGHT", 0.3)),
-        "SPATIAL_WEIGHT": float(joint_cfg.get("SPATIAL_WEIGHT", 0.05)),
-        "PI_POS_WEIGHT": float(joint_cfg.get("PI_POS_WEIGHT", 25.0)),
-        "OCCUPANCY_THRESHOLD": float(joint_cfg.get("OCCUPANCY_THRESHOLD", 0.3)),
-        "RECALL_MIN_TARGET": float(joint_cfg.get("RECALL_MIN_TARGET", 0.97)),
-        "RECALL_PENALTY_WEIGHT": float(joint_cfg.get("RECALL_PENALTY_WEIGHT", 1.0)),
-    }
     
-    print(f"\n⚙️ Loss Config (HIGH RECALL):")
-    for k, v in loss_config.items():
-        print(f"   {k}: {v}")
+    pi_pos_weight = float(joint_cfg.get("PI_POS_WEIGHT", 8.0))
+    occupancy_threshold = float(joint_cfg.get("OCCUPANCY_THRESHOLD", 0.5))
+    
+    print(f"\n⚙️ Config:")
+    print(f"   PI_POS_WEIGHT: {pi_pos_weight}")
+    print(f"   OCCUPANCY_THRESHOLD: {occupancy_threshold}")
     
     # Dataset
-    data_cfg = config["DATA"]
-    optim_cfg = config.get("OPTIM_JOINT", {})
-    
     train_transforms = build_transforms(data_cfg, is_train=True)
     val_transforms = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(config["DATASET"])
@@ -539,6 +520,8 @@ def main():
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
         transforms=val_transforms
     )
+    
+    optim_cfg = config.get("OPTIM_JOINT", {})
     
     train_loader = DataLoader(
         train_dataset,
@@ -573,6 +556,7 @@ def main():
         pi_thresh=config["MODEL"]["ZIP_PI_THRESH"],
         gate=config["MODEL"]["GATE"],
         upsample_to_input=False,
+        use_ste_mask=True,
         zip_head_kwargs=zip_head_kwargs
     ).to(device)
     
@@ -580,152 +564,165 @@ def main():
     output_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(output_dir, exist_ok=True)
     
-    # Freeze backbone
+    # =========================================
+    # CARICA STAGE 2 (checkpoint buono!)
+    # =========================================
+    stage2_path = os.path.join(output_dir, "stage2_best.pth")
+    if os.path.isfile(stage2_path):
+        print(f"\n✅ Caricamento Stage 2: {stage2_path}")
+        state = torch.load(stage2_path, map_location=device)
+        if "model" in state:
+            state = state["model"]
+        elif "model_state_dict" in state:
+            state = state["model_state_dict"]
+        model.load_state_dict(state, strict=False)
+    else:
+        print(f"❌ Stage 2 non trovato: {stage2_path}")
+        return
+    
+    # Definisci default_down prima della calibrazione
+    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    
+    # =========================================
+    # CALIBRAZIONE LOG_SCALE (CRITICO!)
+    # =========================================
+    # Senza calibrazione, il log_scale del checkpoint potrebbe
+    # non essere ottimale, causando discrepanze di MAE
+    print("\n🔧 Calibrazione log_scale...")
+    calibrate_density_scale(
+        model, val_loader, device, default_down,
+        max_batches=10, verbose=True
+    )
+    
+    # =========================================
+    # CONGELA TUTTO TRANNE π-head
+    # =========================================
+    print("\n🧊 Congelamento:")
+    
+    # Congela backbone
     for param in model.backbone.parameters():
         param.requires_grad = False
-    print("🧊 Backbone congelato")
-    print("🔥 ZIP head e P2R head trainabili")
+    print("   ✓ Backbone congelato")
     
-    # Optimizer
-    trainable_params = list(model.zip_head.parameters()) + list(model.p2r_head.parameters())
+    # Congela P2R head COMPLETAMENTE (incluso log_scale!)
+    for param in model.p2r_head.parameters():
+        param.requires_grad = False
+    print("   ✓ P2R head congelata (incluso log_scale)")
+    
+    # Congela anche lambda head nella ZIP (alleniamo solo pi)
+    # La ZIP head ha: shared, pi_head, bin_head
+    # Congeliamo bin_head, teniamo trainabile pi_head e shared
+    for name, param in model.zip_head.named_parameters():
+        if "bin_head" in name:
+            param.requires_grad = False
+        else:
+            param.requires_grad = True
+    print("   ✓ ZIP bin_head congelata")
+    print("   🔥 ZIP pi_head + shared trainabili")
+    
+    # Conta parametri
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"\n   Parametri trainabili: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+    
+    # Optimizer - solo parametri trainabili
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_params,
-        lr=float(optim_cfg.get("LR_HEADS", 3e-5)),
+        lr=float(optim_cfg.get("LR_HEADS", 1e-4)),  # LR più alto, solo π-head
         weight_decay=float(optim_cfg.get("WEIGHT_DECAY", 1e-4))
     )
     
-    epochs = optim_cfg.get("EPOCHS", 400)
+    epochs = optim_cfg.get("EPOCHS", 200)
     scheduler = get_scheduler(optimizer, optim_cfg, epochs)
     
-    # Resume o carica Stage 2
-    start_epoch, best_mae, best_results = resume_stage3(
-        model, optimizer, scheduler, output_dir, device
-    )
-    
-    if start_epoch == 1:
-        stage2_path = os.path.join(output_dir, "stage2_best.pth")
-        if os.path.isfile(stage2_path):
-            print(f"✅ Caricamento Stage 2: {stage2_path}")
-            state = torch.load(stage2_path, map_location=device)
-            if "model" in state:
-                state = state["model"]
-            elif "model_state_dict" in state:
-                state = state["model_state_dict"]
-            model.load_state_dict(state, strict=False)
-        else:
-            print(f"⚠️ Stage 2 non trovato: {stage2_path}")
-            return
-    
-    # Loss Functions (HIGH RECALL)
-    pi_loss_fn = PiHeadLossHighRecall(
-        pos_weight=loss_config["PI_POS_WEIGHT"],
+    # Loss
+    pi_loss_fn = PiHeadLoss(
+        pos_weight=pi_pos_weight,
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        occupancy_threshold=loss_config["OCCUPANCY_THRESHOLD"],
-        recall_min_target=loss_config["RECALL_MIN_TARGET"],
-        recall_penalty_weight=loss_config["RECALL_PENALTY_WEIGHT"],
+        occupancy_threshold=occupancy_threshold,
     ).to(device)
     
-    spatial_loss_fn = P2RSpatialLoss(sigma=8.0).to(device)
+    # Valutazione iniziale (Stage 2 puro, post-calibrazione)
+    print("\n📋 Valutazione iniziale (Stage 2 checkpoint):")
+    init_results = validate(model, val_loader, device, default_down)
     
-    # Valutazione iniziale
-    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    best_mae = init_results["mae"]  # MAE MASKED
+    best_results = init_results
+    baseline_raw = init_results["mae_raw"]
     
-    if start_epoch == 1:
-        print("\n📋 Valutazione iniziale (Stage 2):")
-        init_results = validate(model, val_loader, device, default_down, temperature=1.0)
-        if init_results["mae"] < best_mae:
-            best_mae = init_results["mae"]
-            best_results = init_results
+    print(f"\n🎯 Baseline:")
+    print(f"   MAE RAW (riferimento): {baseline_raw:.2f}")
+    print(f"   MAE MASKED (da migliorare): {best_mae:.2f}")
+    print(f"   Obiettivo: MASKED < RAW (improvement > 0)")
     
     # Training
-    print(f"\n🚀 START Joint Training V3 (HIGH RECALL)")
-    print(f"   Target: MAE < 70 CON recall > 97%")
-    print(f"   Epochs: {start_epoch} → {epochs}")
+    print(f"\n🚀 START Training")
+    print(f"   Epochs: 1 → {epochs}")
     
-    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 40)
+    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 30)
     no_improve = 0
     val_interval = optim_cfg.get("VAL_INTERVAL", 5)
     
-    # Track best recall + MAE combo
-    best_recall = 0.0
-    
-    for epoch in range(start_epoch, epochs + 1):
+    for epoch in range(1, epochs + 1):
         print(f"\n{'='*50}")
         print(f"Epoch {epoch}/{epochs}")
         print(f"{'='*50}")
         
-        train_loss, train_recall = train_one_epoch(
-            model, pi_loss_fn, spatial_loss_fn,
-            train_loader, optimizer, device, default_down, epoch, loss_config, epochs
+        train_loss = train_one_epoch(
+            model, pi_loss_fn, train_loader, optimizer, device, default_down, epoch
         )
         
         if scheduler:
             scheduler.step()
         
-        save_stage3_checkpoint(
-            model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False
-        )
-        
         # Validazione
         if epoch % val_interval == 0:
-            temperature = get_adaptive_temperature(epoch, epochs)
-            results = validate(model, val_loader, device, default_down, temperature)
+            results = validate(model, val_loader, device, default_down)
             
-            # Criterio migliorato: MAE basso E recall alto
-            current_recall = results["recall"]
+            # Metrica: MAE MASKED (vogliamo che sia basso E migliore di RAW)
             current_mae = results["mae"]
+            improvement = results["improvement"]
             
-            # È meglio se: MAE migliora O (MAE simile E recall migliora)
-            is_better_mae = current_mae < best_mae - 0.5
-            is_similar_mae = abs(current_mae - best_mae) < 2.0
-            is_better_recall = current_recall > best_recall + 0.5
+            # È best se: MAE migliora E improvement positivo (MASKED < RAW)
+            is_better = current_mae < best_mae - 0.5
             
-            is_best = is_better_mae or (is_similar_mae and is_better_recall)
-            
-            if is_best:
-                improvement = best_mae - current_mae
+            if is_better:
                 best_mae = current_mae
-                best_recall = max(best_recall, current_recall)
                 best_results = results
-                save_stage3_checkpoint(
+                save_checkpoint(
                     model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=True
                 )
-                print(f"🏆 NEW BEST: MAE={best_mae:.2f}, recall={current_recall:.1f}%")
+                print(f"🏆 NEW BEST: MAE_MASKED={best_mae:.2f}, improvement={improvement:.1f}")
                 no_improve = 0
             else:
                 no_improve += 1
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False
+                )
                 print(f"   No improvement ({no_improve}/{patience})")
             
             # Early stopping
-            if patience > 0 and no_improve >= patience:
+            if no_improve >= patience:
                 print(f"⛔ Early stopping a epoch {epoch}")
                 break
-            
-            # Warning se overfitting
-            if epoch > 50 and current_mae > best_mae + 20:
-                print(f"   ⚠️ Possibile overfitting: MAE attuale {current_mae:.1f} vs best {best_mae:.1f}")
     
-    # Risultati Finali
+    # Risultati finali
     print("\n" + "="*60)
-    print("🏁 STAGE 3 COMPLETATO (HIGH RECALL)")
+    print("🏁 STAGE 3 V5 COMPLETATO")
     print("="*60)
-    print(f"   Best MAE (masked): {best_results.get('mae', best_mae):.2f}")
-    print(f"   Best recall:       {best_results.get('recall', 'N/A'):.1f}%")
-    print(f"   MAE raw:           {best_results.get('mae_raw', 'N/A')}")
-    print(f"   Bias:              {best_results.get('bias', 'N/A')}")
+    print(f"   Baseline RAW:     {baseline_raw:.2f}")
+    print(f"   Best MAE MASKED:  {best_results.get('mae', best_mae):.2f}")
+    print(f"   Improvement:      {best_results.get('improvement', 0):.1f}")
+    print(f"   Bias:             {best_results.get('bias', 0):.3f}")
+    print(f"   π recall:         {best_results.get('recall', 0):.1f}%")
     
-    recall = best_results.get('recall', 0)
-    if recall >= 97:
-        print(f"\n   ✅ RECALL TARGET RAGGIUNTO! ({recall:.1f}% >= 97%)")
+    if best_results.get('improvement', 0) > 0:
+        print(f"\n   ✅ π-head MIGLIORA il conteggio di {best_results['improvement']:.1f} punti!")
     else:
-        print(f"\n   ⚠️ Recall sotto target: {recall:.1f}% < 97%")
+        print(f"\n   ⚠️ π-head non migliora. Usa MAE RAW come riferimento.")
     
-    if best_mae <= 60:
-        print("\n🎯 TARGET MAE RAGGIUNTO! MAE ≤ 60")
-    elif best_mae <= 70:
-        print("\n✅ Buon risultato! MAE ≤ 70")
-    
-    print(f"\n💾 Modello: {os.path.join(output_dir, 'stage3_best.pth')}")
+    print(f"\n💾 Best model: {os.path.join(output_dir, 'stage3_v5_best.pth')}")
 
 
 if __name__ == "__main__":

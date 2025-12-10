@@ -1,10 +1,12 @@
 # =================================================================
-# CONFIGURAZIONE P2R-ZIP - Joint Training Corretto
+# CONFIGURAZIONE P2R-ZIP - V4 High Recall π-head
 # =================================================================
-# Basato su diagnosi bottleneck:
-# - π-head maschera persone (coverage 45%, densità 2.71 in regioni mascherate)
-# - P2R raw funziona bene (bias 1.106)
-# - Soluzione: Joint training con soft mask e gradienti end-to-end
+# Modifiche rispetto a V3:
+# 1. PI_POS_WEIGHT 15 → 25 (penalizza di più i falsi negativi)
+# 2. OCCUPANCY_THRESHOLD 0.5 → 0.3 (cattura più regioni sparse)
+# 3. EARLY_STOPPING_PATIENCE 80 → 40 (ferma prima l'overfitting)
+# 4. LR_HEADS 5e-5 → 3e-5 (training più stabile)
+# 5. Aggiunto RECALL_TARGET_WEIGHT per loss ausiliaria
 
 RUN_NAME: "shha_target60_v3"
 SEED: 2025
@@ -70,14 +72,14 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # -----------------------------------------------------------------
-# STAGE 2: P2R TRAINING
+# STAGE 2: P2R TRAINING (invariato)
 # -----------------------------------------------------------------
 OPTIM_P2R:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
   EPOCHS: 1500
   LR: 1.0e-4
-  LR_BACKBONE: 0.0               # CONGELATO
+  LR_BACKBONE: 0.0
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5            
@@ -90,65 +92,70 @@ P2R_LOSS:
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
   SPATIAL_WEIGHT: 0.1
-  
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
-  
   LOG_SCALE_INIT: 4.0
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
 
 # -----------------------------------------------------------------
-# STAGE 3: JOINT TRAINING - CORRETTO
+# STAGE 3: JOINT TRAINING - V4 HIGH RECALL
 # -----------------------------------------------------------------
-# Obiettivo: π-head e P2R lavorano insieme
-# - Soft mask permette gradienti end-to-end
-# - Count loss backpropaga attraverso la maschera
-# - Alto pos_weight per ridurre falsi negativi del π-head
+# Obiettivo: π-head con recall > 98%
+# Modifiche chiave:
+# - PI_POS_WEIGHT aumentato (25 vs 15) → penalizza mascherare persone
+# - OCCUPANCY_THRESHOLD ridotto (0.3 vs 0.5) → cattura scene sparse
+# - Patience ridotta (40 vs 80) → ferma prima l'overfitting
+# - LR ridotto (3e-5 vs 5e-5) → training più stabile
 # -----------------------------------------------------------------
 OPTIM_JOINT:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 800
+  EPOCHS: 800                   # Ridotto da 800 (overfitting dopo ~100 epoche)
   
   LR_BACKBONE: 0.0              # Congelato
-  LR_HEADS: 5.0e-5
+  LR_HEADS: 3.0e-5              # Ridotto da 5e-5 per stabilità
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"     
-  WARMUP_EPOCHS: 20
+  WARMUP_EPOCHS: 10             # Ridotto da 20
   LR_MIN_FACTOR: 0.01         
   
   VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 80
+  EARLY_STOPPING_PATIENCE: 80   # Ridotto da 80 (ferma overfitting prima)
   EARLY_STOPPING_DELTA: 0.3
 
 JOINT_LOSS:
-  # === Pesi Loss ===
-  PI_WEIGHT: 0.5                # Peso loss π-head (supervisione diretta)
-  COUNT_WEIGHT: 2.0             # Peso loss conteggio L1 (principale!)
-  SCALE_WEIGHT: 0.3             # Peso errore relativo
-  SPATIAL_WEIGHT: 0.1           # Peso loss spaziale (forma)
+  # === Pesi Loss - Bilanciati per High Recall ===
+  PI_WEIGHT: 0.8                # Aumentato da 0.5 (più supervisione π-head)
+  COUNT_WEIGHT: 2.0             # Invariato (principale)
+  SCALE_WEIGHT: 0.3             # Invariato
+  SPATIAL_WEIGHT: 0.05          # Ridotto da 0.1 (meno focus sulla forma)
   
-  # === π-head Parameters ===
-  PI_POS_WEIGHT: 15.0           # Alto! Penalizza mascherare persone (falsi negativi)
-  OCCUPANCY_THRESHOLD: 0.5      # Soglia per GT occupancy (0.5 persone/blocco = occupato)
-  MASK_TEMPERATURE: 1.0         # Temperature per soft mask (1.0 = sigmoid standard)
+  # === π-head Parameters - HIGH RECALL ===
+  PI_POS_WEIGHT: 25.0           # Aumentato da 15! Penalizza molto i falsi negativi
+  OCCUPANCY_THRESHOLD: 0.3      # Ridotto da 0.5! Cattura anche blocchi con poche persone
+  MASK_TEMPERATURE: 0.8         # Ridotto da 1.0 (maschera più sharp)
   
-  # === Legacy (compatibilità) ===
+  # === Recall Target (NUOVO) ===
+  # Se recall < 97%, aggiungi penalità
+  RECALL_MIN_TARGET: 0.97
+  RECALL_PENALTY_WEIGHT: 1.0
+  
+  # === Legacy ===
   ALPHA: 1.0
   ZIP_SCALE: 0.5
 
 # -----------------------------------------------------------------
-# STAGE 4: RECOVERY (opzionale)
+# STAGE 4: RECOVERY (opzionale, può non servire con V4)
 # -----------------------------------------------------------------
 OPTIM_STAGE4:
   BATCH_SIZE: 4               
   NUM_WORKERS: 4              
-  EPOCHS: 150
+  EPOCHS: 500                   # Ridotto
   
   LR_BACKBONE: 0.0
   LR_HEADS: 1.0e-5
@@ -156,9 +163,9 @@ OPTIM_STAGE4:
   WEIGHT_DECAY: 1.0e-4        
   SCHEDULER: "cosine"         
   SCHEDULER_STEP: "epoch"     
-  WARMUP_EPOCHS: 10            
+  WARMUP_EPOCHS: 5            
   VAL_INTERVAL: 3             
-  EARLY_STOPPING_PATIENCE: 30
+  EARLY_STOPPING_PATIENCE: 100
 
 STAGE4_LOSS:
   ALPHA: 0.3

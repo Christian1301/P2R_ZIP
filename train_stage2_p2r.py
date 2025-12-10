@@ -1,16 +1,12 @@
 # train_stage2_p2r.py
 # -*- coding: utf-8 -*-
 """
-Stage 2 P2R Training - VERSIONE CORRETTA V2
+Stage 2 P2R Training - VERSIONE CORRETTA V3
 
-PROBLEMA RISOLTO:
-La versione originale usava BCE loss con normalizzazione, che eliminava
-l'informazione sulla magnitudine. Il modello prediceva sempre ~3-4 persone.
-
-SOLUZIONE:
-- Loss con supervisione DIRETTA sul conteggio (L1)
-- log_scale inizializzato alto e senza clamp restrittivo
-- Calibrazione opzionale ma non critica (la loss fa il lavoro)
+Modifiche V3:
+- Aggiunto salvataggio di stage2_last.pth per resume
+- Aggiunta funzione resume_stage2() per riprendere training
+- Mantiene tutte le correzioni V2 (loss diretta, log_scale alto)
 """
 
 import os
@@ -31,8 +27,67 @@ from train_utils import (
     get_scheduler,
     collate_fn,
     canonicalize_p2r_grid,
-    save_checkpoint,
 )
+
+
+def save_stage2_checkpoint(model, optimizer, scheduler, epoch, best_mae, output_dir, is_best=False):
+    """Salva checkpoint Stage 2 (last + opzionalmente best)."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    checkpoint = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler else None,
+        "best_mae": best_mae,
+    }
+    
+    # Salva SEMPRE last
+    last_path = os.path.join(output_dir, "stage2_last.pth")
+    torch.save(checkpoint, last_path)
+    
+    # Salva best se richiesto
+    if is_best:
+        best_path = os.path.join(output_dir, "stage2_best.pth")
+        torch.save(model.state_dict(), best_path)
+        print(f"💾 Saved: stage2_last.pth + stage2_best.pth (MAE={best_mae:.2f})")
+    else:
+        print(f"💾 Saved: stage2_last.pth (epoch {epoch})")
+
+
+def resume_stage2(model, optimizer, scheduler, output_dir, device):
+    """
+    Riprende Stage 2 da stage2_last.pth se esiste.
+    
+    Returns:
+        start_epoch: epoca da cui riprendere (1 se partenza da zero)
+        best_mae: miglior MAE finora (inf se partenza da zero)
+    """
+    last_path = os.path.join(output_dir, "stage2_last.pth")
+    
+    if not os.path.isfile(last_path):
+        print("ℹ️ Nessun checkpoint Stage 2 trovato, partenza da zero")
+        return 1, float('inf')
+    
+    print(f"🔄 Resume Stage 2 da: {last_path}")
+    checkpoint = torch.load(last_path, map_location=device)
+    
+    # Carica stato modello
+    model.load_state_dict(checkpoint["model"], strict=False)
+    
+    # Carica stato optimizer
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    
+    # Carica stato scheduler
+    if scheduler and checkpoint.get("scheduler"):
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    
+    start_epoch = checkpoint.get("epoch", 0) + 1
+    best_mae = checkpoint.get("best_mae", float('inf'))
+    
+    print(f"✅ Ripreso da epoch {start_epoch - 1}, best_mae={best_mae:.2f}")
+    
+    return start_epoch, best_mae
 
 
 @torch.no_grad()
@@ -47,10 +102,7 @@ def calibrate_density_scale(
     bias_eps=0.1,
     verbose=True,
 ):
-    """
-    Calibrazione della scala basata sul bias mediano.
-    Con la nuova loss, questa funzione è meno critica.
-    """
+    """Calibrazione della scala basata sul bias mediano."""
     if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
         return None
 
@@ -102,13 +154,11 @@ def calibrate_density_scale(
         print(f"   Bias mediano: {bias_median:.3f}")
         print(f"   Ratio range: [{ratios_np.min():.3f}, {ratios_np.max():.3f}]")
 
-    # Se il bias è già vicino a 1, non fare nulla
     if abs(bias_median - 1.0) < bias_eps:
         if verbose:
             print(f"ℹ️ Calibrazione: bias già accettabile ({bias_median:.3f})")
         return bias_median
 
-    # Applica correzione
     prev_log_scale = float(model.p2r_head.log_scale.detach().item())
     raw_adjust = float(np.log(max(bias_median, 0.01)))
     
@@ -119,7 +169,6 @@ def calibrate_density_scale(
     
     model.p2r_head.log_scale.data -= torch.tensor(adjust, device=device)
     
-    # Clamp opzionale (range MOLTO più ampio)
     if clamp_range is not None:
         min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
         model.p2r_head.log_scale.data.clamp_(min_val, max_val)
@@ -327,9 +376,12 @@ def main():
         },
     ).to(device)
     
-    # Carica Stage 1
-    stage1_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    zip_ckpt = os.path.join(stage1_dir, "best_model.pth")
+    # Output directory
+    output_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Carica Stage 1 (backbone + ZIP head)
+    zip_ckpt = os.path.join(output_dir, "best_model.pth")
     if os.path.isfile(zip_ckpt):
         state = torch.load(zip_ckpt, map_location=device)
         if "model" in state:
@@ -348,11 +400,10 @@ def main():
     for param in model.p2r_head.parameters():
         param.requires_grad = True
     
-    # Il nuovo p2r_head.py ha già log_scale=4.0
-    # Ma se usiamo un checkpoint vecchio, forziamo il reset
+    # Reset log_scale se necessario
     if hasattr(model.p2r_head, "log_scale"):
         current_scale = model.p2r_head.log_scale.item()
-        if current_scale < 2.0:  # Se è ancora il vecchio valore
+        if current_scale < 2.0:
             model.p2r_head.log_scale.data.fill_(4.0)
             print(f"🔧 Reset log_scale: {current_scale:.2f} → 4.0")
         print(f"   log_scale: {model.p2r_head.log_scale.item():.2f} "
@@ -367,7 +418,10 @@ def main():
     )
     scheduler = get_scheduler(optimizer, optim_cfg, optim_cfg["EPOCHS"])
     
-    # Loss con supervisione diretta sul conteggio
+    # === RESUME ===
+    start_epoch, best_mae = resume_stage2(model, optimizer, scheduler, output_dir, device)
+    
+    # Loss
     loss_fn = P2RLoss(
         count_weight=float(p2r_cfg.get("COUNT_WEIGHT", 2.0)),
         scale_weight=float(p2r_cfg.get("SCALE_WEIGHT", 0.5)),
@@ -378,18 +432,21 @@ def main():
     print(f"\n📋 Loss weights: count={loss_fn.count_weight}, "
           f"scale={loss_fn.scale_weight}, spatial={loss_fn.spatial_weight}")
     
-    # Valutazione iniziale
-    print("\n📋 Valutazione iniziale:")
-    _, init_mae, _, _, _ = evaluate_p2r(model, val_loader, loss_fn, device, default_down)
+    # Valutazione iniziale (solo se partenza da zero)
+    if start_epoch == 1:
+        print("\n📋 Valutazione iniziale:")
+        _, init_mae, _, _, _ = evaluate_p2r(model, val_loader, loss_fn, device, default_down)
+        if init_mae < best_mae:
+            best_mae = init_mae
     
     # Training loop
-    best_mae = init_mae
     patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 100)
     no_improve = 0
+    val_interval = optim_cfg.get("VAL_INTERVAL", 5)
     
-    print(f"\n🚀 Inizio training per {optim_cfg['EPOCHS']} epoche")
+    print(f"\n🚀 Inizio training da epoch {start_epoch} per {optim_cfg['EPOCHS']} epoche")
     
-    for epoch in range(1, optim_cfg["EPOCHS"] + 1):
+    for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         train_loss = train_one_epoch(
             model, train_loader, loss_fn, optimizer, device,
             default_down, epoch
@@ -399,7 +456,7 @@ def main():
             scheduler.step()
         
         # Validazione
-        if epoch % optim_cfg.get("VAL_INTERVAL", 5) == 0:
+        if epoch % val_interval == 0:
             val_loss, mae, rmse, tot_pred, tot_gt = evaluate_p2r(
                 model, val_loader, loss_fn, device, default_down
             )
@@ -409,19 +466,27 @@ def main():
                   f"Val MAE {mae:.2f} | Best {best_mae:.2f} | "
                   f"log_scale {scale:.2f}")
             
-            if mae < best_mae:
+            is_best = mae < best_mae
+            if is_best:
                 best_mae = mae
                 no_improve = 0
-                
-                best_path = os.path.join(stage1_dir, "stage2_best.pth")
-                torch.save(model.state_dict(), best_path)
-                print(f"💾 Nuovo best: MAE={best_mae:.2f}")
             else:
                 no_improve += 1
             
+            # Salva checkpoint (sempre last, opzionalmente best)
+            save_stage2_checkpoint(
+                model, optimizer, scheduler, epoch, best_mae, output_dir, is_best=is_best
+            )
+            
             if no_improve >= patience:
-                print(f"⛔ Early stopping dopo {patience} validazioni")
+                print(f"⛔ Early stopping dopo {patience} validazioni senza miglioramento")
                 break
+        else:
+            # Salva last anche senza validazione (ogni N epoche)
+            if epoch % 20 == 0:
+                save_stage2_checkpoint(
+                    model, optimizer, scheduler, epoch, best_mae, output_dir, is_best=False
+                )
     
     print(f"\n✅ Stage 2 completato. Best MAE: {best_mae:.2f}")
 

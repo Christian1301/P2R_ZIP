@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 3 - Joint Training CORRETTO
+Stage 3 - Joint Training CORRETTO V2
+
+Modifiche V2:
+- Aggiunto salvataggio di stage3_latest.pth per resume
+- Aggiunta funzione resume_stage3() per riprendere training
+- Mantiene tutte le correzioni V1 (soft mask, end-to-end gradients)
 
 Obiettivo: Allenare π-head e P2R INSIEME in modo che:
 1. Il conteggio finale usa P2R × π_mask (come da design)
 2. Il count loss backpropaga attraverso la maschera
 3. Il π-head impara a NON mascherare regioni con persone
-
-Problema diagnosticato:
-- π-head maschera il 55% dei pixel
-- Nelle regioni mascherate c'è densità 2.71 (persone!)
-- MAE masked (122) > MAE raw (103) → π-head peggiora il risultato
-
-Soluzione:
-- Usare soft mask (sigmoid) invece di hard threshold per permettere gradienti
-- Count loss su masked output → gradiente fluisce al π-head
-- π-head loss con alto pos_weight per ridurre falsi negativi
 """
 
 import os
@@ -36,6 +31,76 @@ from train_utils import (
     canonicalize_p2r_grid, collate_fn
 )
 
+
+# =============================================================================
+# CHECKPOINT MANAGEMENT
+# =============================================================================
+
+def save_stage3_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False):
+    """Salva checkpoint Stage 3 (latest + opzionalmente best)."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "best_mae": best_mae,
+        "best_results": best_results,
+    }
+    
+    # Salva SEMPRE latest
+    latest_path = os.path.join(output_dir, "stage3_latest.pth")
+    torch.save(checkpoint, latest_path)
+    
+    # Salva best se richiesto
+    if is_best:
+        best_path = os.path.join(output_dir, "stage3_best.pth")
+        torch.save(checkpoint, best_path)
+        print(f"💾 Saved: stage3_latest.pth + stage3_best.pth (MAE={best_mae:.2f})")
+    else:
+        print(f"💾 Saved: stage3_latest.pth (epoch {epoch})")
+
+
+def resume_stage3(model, optimizer, scheduler, output_dir, device):
+    """
+    Riprende Stage 3 da stage3_latest.pth se esiste.
+    
+    Returns:
+        start_epoch: epoca da cui riprendere (1 se partenza da zero)
+        best_mae: miglior MAE finora (inf se partenza da zero)
+        best_results: dizionario risultati migliori
+    """
+    latest_path = os.path.join(output_dir, "stage3_latest.pth")
+    
+    if not os.path.isfile(latest_path):
+        return 1, float('inf'), {}
+    
+    print(f"🔄 Resume Stage 3 da: {latest_path}")
+    checkpoint = torch.load(latest_path, map_location=device)
+    
+    # Carica stato modello
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    
+    # Carica stato optimizer
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    
+    # Carica stato scheduler
+    if scheduler and checkpoint.get("scheduler_state_dict"):
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    
+    start_epoch = checkpoint.get("epoch", 0) + 1
+    best_mae = checkpoint.get("best_mae", float('inf'))
+    best_results = checkpoint.get("best_results", {})
+    
+    print(f"✅ Ripreso da epoch {start_epoch - 1}, best_mae={best_mae:.2f}")
+    
+    return start_epoch, best_mae, best_results
+
+
+# =============================================================================
+# LOSS FUNCTIONS
+# =============================================================================
 
 class PiHeadLoss(nn.Module):
     """
@@ -152,6 +217,10 @@ class P2RSpatialLoss(nn.Module):
         return total_loss / max(B, 1)
 
 
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
 def get_soft_mask(logit_pi_maps, temperature: float = 1.0):
     """
     Crea soft mask dal π-head usando sigmoid.
@@ -193,6 +262,10 @@ def compute_masked_count(pred_density, soft_mask, down_h, down_w):
     
     return count, masked_density
 
+
+# =============================================================================
+# TRAINING LOOP
+# =============================================================================
 
 def train_one_epoch(
     model, pi_loss_fn, spatial_loss_fn,
@@ -418,16 +491,9 @@ def validate(model, dataloader, device, default_down, temperature=1.0):
     }
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_mae, results):
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'best_mae': best_mae,
-        'results': results,
-    }, path)
-
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     if not os.path.exists("config.yaml"):
@@ -439,7 +505,7 @@ def main():
     
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
-    print(f"✅ Avvio Stage 3 Joint Training CORRETTO su {device}")
+    print(f"✅ Avvio Stage 3 Joint Training CORRETTO V2 su {device}")
     
     # === Joint Config ===
     joint_cfg = config.get("JOINT_LOSS", {})
@@ -514,22 +580,9 @@ def main():
         zip_head_kwargs=zip_head_kwargs
     ).to(device)
     
-    # === Carica Stage 2 ===
+    # === Output Directory ===
     output_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(output_dir, exist_ok=True)
-    
-    stage2_path = os.path.join(output_dir, "stage2_best.pth")
-    if os.path.isfile(stage2_path):
-        print(f"✅ Caricamento Stage 2: {stage2_path}")
-        state = torch.load(stage2_path, map_location=device)
-        if "model" in state:
-            state = state["model"]
-        elif "model_state_dict" in state:
-            state = state["model_state_dict"]
-        model.load_state_dict(state, strict=False)
-    else:
-        print(f"⚠️ Stage 2 non trovato!")
-        return
     
     # === Freeze/Unfreeze ===
     # Congela backbone, allena entrambi gli head
@@ -549,6 +602,26 @@ def main():
     epochs = optim_cfg.get("EPOCHS", 200)
     scheduler = get_scheduler(optimizer, optim_cfg, epochs)
     
+    # === RESUME O CARICA STAGE 2 ===
+    start_epoch, best_mae, best_results = resume_stage3(
+        model, optimizer, scheduler, output_dir, device
+    )
+    
+    # Se non c'è checkpoint Stage 3, carica Stage 2
+    if start_epoch == 1:
+        stage2_path = os.path.join(output_dir, "stage2_best.pth")
+        if os.path.isfile(stage2_path):
+            print(f"✅ Caricamento Stage 2: {stage2_path}")
+            state = torch.load(stage2_path, map_location=device)
+            if "model" in state:
+                state = state["model"]
+            elif "model_state_dict" in state:
+                state = state["model_state_dict"]
+            model.load_state_dict(state, strict=False)
+        else:
+            print(f"⚠️ Stage 2 non trovato: {stage2_path}")
+            return
+    
     # === Loss Functions ===
     pi_loss_fn = PiHeadLoss(
         pos_weight=loss_config["PI_POS_WEIGHT"],
@@ -558,49 +631,54 @@ def main():
     
     spatial_loss_fn = P2RSpatialLoss(sigma=8.0).to(device)
     
-    # === Valutazione iniziale ===
-    print("\n📋 Valutazione iniziale (Stage 2):")
+    # === Valutazione iniziale (solo se partenza da zero) ===
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
-    init_results = validate(model, val_loader, device, default_down, loss_config["MASK_TEMPERATURE"])
     
-    best_mae = init_results["mae"]
-    best_results = init_results
+    if start_epoch == 1:
+        print("\n📋 Valutazione iniziale (Stage 2):")
+        init_results = validate(model, val_loader, device, default_down, loss_config["MASK_TEMPERATURE"])
+        if init_results["mae"] < best_mae:
+            best_mae = init_results["mae"]
+            best_results = init_results
     
     # === Training ===
     print(f"\n🚀 START Joint Training")
     print(f"   Obiettivo: MAE MASKED < MAE RAW (π-head deve aiutare)")
-    print(f"   Epochs: {epochs}")
+    print(f"   Epochs: {start_epoch} → {epochs}")
     
     patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 30)
     no_improve = 0
     val_interval = optim_cfg.get("VAL_INTERVAL", 5)
     
-    best_path = os.path.join(output_dir, "stage3_best.pth")
-    latest_path = os.path.join(output_dir, "stage3_latest.pth")
-    
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs + 1):
         print(f"\n{'='*50}")
-        print(f"Epoch {epoch + 1}/{epochs}")
+        print(f"Epoch {epoch}/{epochs}")
         print(f"{'='*50}")
         
         train_loss = train_one_epoch(
             model, pi_loss_fn, spatial_loss_fn,
-            train_loader, optimizer, device, default_down, epoch + 1, loss_config
+            train_loader, optimizer, device, default_down, epoch, loss_config
         )
         
         if scheduler:
             scheduler.step()
         
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch + 1, best_mae, best_results)
+        # Salva latest ad ogni epoca
+        save_stage3_checkpoint(
+            model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False
+        )
         
-        if (epoch + 1) % val_interval == 0:
+        # Validazione
+        if epoch % val_interval == 0:
             results = validate(model, val_loader, device, default_down, loss_config["MASK_TEMPERATURE"])
             
             if results["mae"] < best_mae:
                 improvement = best_mae - results["mae"]
                 best_mae = results["mae"]
                 best_results = results
-                save_checkpoint(best_path, model, optimizer, scheduler, epoch + 1, best_mae, best_results)
+                save_stage3_checkpoint(
+                    model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=True
+                )
                 print(f"🏆 NEW BEST: MAE={best_mae:.2f} (↓{improvement:.2f})")
                 no_improve = 0
             else:
@@ -608,20 +686,20 @@ def main():
                 print(f"   No improvement ({no_improve}/{patience})")
             
             if patience > 0 and no_improve >= patience:
-                print(f"⛔ Early stopping a epoch {epoch + 1}")
+                print(f"⛔ Early stopping a epoch {epoch}")
                 break
     
     # === Risultati Finali ===
     print("\n" + "="*60)
     print("🏁 STAGE 3 COMPLETATO")
     print("="*60)
-    print(f"   Best MAE (masked): {best_results['mae']:.2f}")
-    print(f"   MAE raw:           {best_results['mae_raw']:.2f}")
-    print(f"   Bias:              {best_results['bias']:.3f}")
-    print(f"   π coverage:        {best_results['coverage']:.1f}%")
-    print(f"   π recall:          {best_results['recall']:.1f}%")
+    print(f"   Best MAE (masked): {best_results.get('mae', best_mae):.2f}")
+    print(f"   MAE raw:           {best_results.get('mae_raw', 'N/A')}")
+    print(f"   Bias:              {best_results.get('bias', 'N/A')}")
+    print(f"   π coverage:        {best_results.get('coverage', 'N/A')}")
+    print(f"   π recall:          {best_results.get('recall', 'N/A')}")
     
-    if best_results['mae'] < best_results['mae_raw']:
+    if best_results.get('mae', float('inf')) < best_results.get('mae_raw', float('inf')):
         delta = best_results['mae_raw'] - best_results['mae']
         print(f"\n   ✅ SUCCESSO: π-head migliora il conteggio di {delta:.1f}!")
     else:
@@ -632,7 +710,7 @@ def main():
     elif best_mae <= 70:
         print("\n✅ Buon risultato! MAE ≤ 70")
     
-    print(f"\n💾 Modello: {best_path}")
+    print(f"\n💾 Modello: {os.path.join(output_dir, 'stage3_best.pth')}")
 
 
 if __name__ == "__main__":

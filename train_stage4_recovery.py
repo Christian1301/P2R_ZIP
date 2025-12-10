@@ -1,14 +1,13 @@
 # P2R_ZIP/train_stage4_recovery.py
 # -*- coding: utf-8 -*-
 """
-Stage 4 - Recovery & Polishing (OPTIMIZED VERSION)
+Stage 4 - Recovery & Polishing (VERSIONE AGGIORNATA)
 
 Obiettivo: Recuperare e migliorare il MAE dopo Stage 3.
 Strategie chiave:
 1. Backbone completamente congelato
 2. Focus sulla loss L1 del conteggio
-3. Ensemble di calibrazioni
-4. Validazione stratificata
+3. Validazione stratificata
 """
 import os
 import yaml
@@ -228,9 +227,10 @@ def main():
     init_seeds(config["SEED"])
     print(f"✅ Avvio Stage 4 (Recovery - OPTIMIZED) su {device}")
 
-    optim_cfg = config["OPTIM_STAGE4"]
-    loss_cfg = config["STAGE4_LOSS"]
+    optim_cfg = config.get("OPTIM_STAGE4", {})
+    loss_cfg = config.get("STAGE4_LOSS", {})
     data_cfg = config["DATA"]
+    p2r_cfg = config.get("P2R_LOSS", {})
     
     # Dataset
     train_transforms = build_transforms(data_cfg, is_train=True)
@@ -250,24 +250,23 @@ def main():
         transforms=val_transforms
     )
 
-    # USA collate_fn standard (come Stage 2)
     train_loader = DataLoader(
-        train_dataset, batch_size=optim_cfg["BATCH_SIZE"], shuffle=True,
-        num_workers=optim_cfg["NUM_WORKERS"], pin_memory=True, drop_last=True,
+        train_dataset, batch_size=optim_cfg.get("BATCH_SIZE", 4), shuffle=True,
+        num_workers=optim_cfg.get("NUM_WORKERS", 4), pin_memory=True, drop_last=True,
         collate_fn=collate_fn
     )
     val_loader = DataLoader(
         val_dataset, batch_size=1, shuffle=False,
-        num_workers=optim_cfg["NUM_WORKERS"], pin_memory=True,
+        num_workers=optim_cfg.get("NUM_WORKERS", 4), pin_memory=True,
         collate_fn=collate_fn
     )
 
     # Modello
     bin_config = config["BINS_CONFIG"][config["DATASET"]]
     zip_head_kwargs = {
-        "lambda_scale": config["ZIP_HEAD"]["LAMBDA_SCALE"],
-        "lambda_max": config["ZIP_HEAD"]["LAMBDA_MAX"],
-        "use_softplus": config["ZIP_HEAD"]["USE_SOFTPLUS"],
+        "lambda_scale": config["ZIP_HEAD"].get("LAMBDA_SCALE", 0.5),
+        "lambda_max": config["ZIP_HEAD"].get("LAMBDA_MAX", 8.0),
+        "use_softplus": config["ZIP_HEAD"].get("USE_SOFTPLUS", True),
         "lambda_noise_std": 0.0,
     }
     
@@ -322,52 +321,59 @@ def main():
     trainable_params = list(model.zip_head.parameters()) + list(model.p2r_head.parameters())
     optimizer = torch.optim.AdamW(
         trainable_params,
-        lr=float(optim_cfg["LR_HEADS"]),
-        weight_decay=float(optim_cfg["WEIGHT_DECAY"])
+        lr=float(optim_cfg.get("LR_HEADS", 1e-5)),
+        weight_decay=float(optim_cfg.get("WEIGHT_DECAY", 1e-4))
     )
-    scheduler = get_scheduler(optimizer, optim_cfg, optim_cfg["EPOCHS"])
+    
+    epochs = optim_cfg.get("EPOCHS", 150)
+    scheduler = get_scheduler(optimizer, optim_cfg, epochs)
 
     # Loss functions
     crit_zip = PiHeadLoss(5.0, data_cfg["ZIP_BLOCK_SIZE"]).to(device)
     
-    p2r_cfg = config["P2R_LOSS"]
+    # P2R Loss con i nuovi parametri (compatibile con entrambi i formati config)
     crit_p2r = P2RLoss(
-        scale_weight=float(p2r_cfg["SCALE_WEIGHT"]),
-        pos_weight=float(p2r_cfg["POS_WEIGHT"]),
-        chunk_size=int(p2r_cfg["CHUNK_SIZE"]),
-        min_radius=float(p2r_cfg["MIN_RADIUS"]),
-        max_radius=float(p2r_cfg["MAX_RADIUS"])
+        count_weight=float(p2r_cfg.get("COUNT_WEIGHT", 2.0)),
+        scale_weight=float(p2r_cfg.get("SCALE_WEIGHT", 0.5)),
+        spatial_weight=float(p2r_cfg.get("SPATIAL_WEIGHT", 0.1)),
+        min_radius=float(p2r_cfg.get("MIN_RADIUS", 8.0)),
+        max_radius=float(p2r_cfg.get("MAX_RADIUS", 64.0)),
+        chunk_size=int(p2r_cfg.get("CHUNK_SIZE", 2048)),
     ).to(device)
     
     count_loss_fn = CountHuberLoss(delta=20.0)  # Robusto agli outlier
 
-    # Calibrazione iniziale
+    # Calibrazione iniziale (opzionale con la nuova loss)
     print("🔧 Calibrazione iniziale...")
     calibrate_density_scale(
-        model, val_loader, device, data_cfg["P2R_DOWNSAMPLE"],
-        max_batches=None,
+        model, val_loader, device, data_cfg.get("P2R_DOWNSAMPLE", 8),
+        max_batches=15,
         clamp_range=p2r_cfg.get("LOG_SCALE_CLAMP"),
-        max_adjust=1.5
+        max_adjust=1.5,
+        verbose=True
     )
     
     # Valutazione iniziale
     print("\n📋 Valutazione iniziale:")
-    init_mae, init_rmse, _, _ = validate_stratified(model, val_loader, device, data_cfg["P2R_DOWNSAMPLE"])
+    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    init_mae, init_rmse, _, _ = validate_stratified(model, val_loader, device, default_down)
     
     best_mae = init_mae
-    patience = optim_cfg["EARLY_STOPPING_PATIENCE"]
+    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 30)
     no_improve = 0
-    default_down = data_cfg["P2R_DOWNSAMPLE"]
     
-    zip_s = float(loss_cfg["ZIP_SCALE"])
+    zip_s = float(loss_cfg.get("ZIP_SCALE", 0.1))
     p2r_s = float(loss_cfg.get("ALPHA", 0.3))
-    count_w = float(loss_cfg["COUNT_L1_W"])
+    count_w = float(loss_cfg.get("COUNT_L1_W", 3.0))
 
     print(f"\n🚀 START STAGE 4 (Recovery)")
     print(f"   Loss weights: ZIP={zip_s}, P2R={p2r_s}, COUNT={count_w}")
+    print(f"   Epochs: {epochs}, Patience: {patience}")
     
-    for epoch in range(optim_cfg["EPOCHS"]):
-        print(f"\n--- Epoch {epoch+1}/{optim_cfg['EPOCHS']} ---")
+    val_interval = optim_cfg.get("VAL_INTERVAL", 3)
+    
+    for epoch in range(epochs):
+        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
         
         train_loss = train_one_epoch(
             model, crit_zip, crit_p2r, count_loss_fn, train_loader, optimizer,
@@ -377,15 +383,16 @@ def main():
         if scheduler: 
             scheduler.step()
 
-        if (epoch + 1) % optim_cfg["VAL_INTERVAL"] == 0:
-            # Calibra prima della validazione
+        if (epoch + 1) % val_interval == 0:
+            # Calibra prima della validazione (opzionale)
             if hasattr(model.p2r_head, "log_scale"):
                 backup_scale = model.p2r_head.log_scale.data.clone()
                 calibrate_density_scale(
                     model, val_loader, device, default_down,
                     max_batches=15,
                     clamp_range=p2r_cfg.get("LOG_SCALE_CLAMP"),
-                    max_adjust=0.3
+                    max_adjust=0.3,
+                    verbose=False
                 )
             
             val_mae, val_rmse, tot_pred, tot_gt = validate_stratified(

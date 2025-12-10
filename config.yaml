@@ -1,12 +1,10 @@
 # =================================================================
-# CONFIGURAZIONE P2R-ZIP - VERSIONE CORRETTA v3
+# CONFIGURAZIONE P2R-ZIP - Joint Training Corretto
 # =================================================================
-# Correzioni rispetto a v2:
-# 1. SCALE_WEIGHT drasticamente ridotto (0.10 → 0.02)
-# 2. LOG_SCALE_CLAMP più stretto ([-3,2] → [-1.5,1.0])
-# 3. MIN_RADIUS aumentato per stabilità BCE
-# 4. Calibrazione più aggressiva
-# 5. POS_WEIGHT P2R ridotto
+# Basato su diagnosi bottleneck:
+# - π-head maschera persone (coverage 45%, densità 2.71 in regioni mascherate)
+# - P2R raw funziona bene (bias 1.106)
+# - Soluzione: Joint training con soft mask e gradienti end-to-end
 
 RUN_NAME: "shha_target60_v3"
 SEED: 2025
@@ -72,100 +70,100 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # -----------------------------------------------------------------
-# STAGE 2: P2R TRAINING - CORREZIONI CRITICHE
+# STAGE 2: P2R TRAINING
 # -----------------------------------------------------------------
 OPTIM_P2R:
-  BATCH_SIZE: 8                  # Ridotto da 10 per stabilità
+  BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 2000               
-  LR: 8.0e-5                     # Ridotto da 1.2e-4
-  LR_BACKBONE: 0.0               # CONGELATO completamente in Stage 2
+  EPOCHS: 1500
+  LR: 1.0e-4
+  LR_BACKBONE: 0.0               # CONGELATO
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5            
   RESUME_LAST: true
   SAVE_BEST: true
-  EARLY_STOPPING_PATIENCE: 500   
+  EARLY_STOPPING_PATIENCE: 50
   EARLY_STOPPING_DELTA: 0.5      
 
 P2R_LOSS:
-  # CORREZIONE CRITICA 1: Scale weight molto ridotto
-  # Era 0.10, causava scale_penalty >> BCE loss
-  SCALE_WEIGHT: 0.02
+  COUNT_WEIGHT: 2.0
+  SCALE_WEIGHT: 0.5
+  SPATIAL_WEIGHT: 0.1
   
-  # CORREZIONE 2: POS_WEIGHT ridotto per bilanciare meglio
-  POS_WEIGHT: 3.0                # Era 6.0
-  
+  MIN_RADIUS: 8.0
+  MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
   
-  # CORREZIONE 3: MIN_RADIUS aumentato per stabilità
-  MIN_RADIUS: 8.0                # Era 4.0
-  MAX_RADIUS: 50.0
-  
-  # CORREZIONE 4: Log scale più conservativo
-  LOG_SCALE_INIT: -0.5           # Era -0.8
-  LOG_SCALE_LR_FACTOR: 0.05      # Era 0.10 - impara più lentamente
-  
-  # CORREZIONE 5: Clamp più stretto
-  LOG_SCALE_CLAMP: [-1.5, 1.0]   # Era [-3.0, 2.0]
-  
-  # CORREZIONE 6: Calibrazione più aggressiva
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 2.0  # Era 1.0
-  CALIBRATE_BATCHES: 15                  # Era 8
+  LOG_SCALE_INIT: 4.0
+  LOG_SCALE_CLAMP: [-2.0, 10.0]
+  LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
+  CALIBRATE_BATCHES: 10
 
 # -----------------------------------------------------------------
-# STAGE 3: JOINT TRAINING
+# STAGE 3: JOINT TRAINING - CORRETTO
+# -----------------------------------------------------------------
+# Obiettivo: π-head e P2R lavorano insieme
+# - Soft mask permette gradienti end-to-end
+# - Count loss backpropaga attraverso la maschera
+# - Alto pos_weight per ridurre falsi negativi del π-head
 # -----------------------------------------------------------------
 OPTIM_JOINT:
-  BATCH_SIZE: 4
+  BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 400
+  EPOCHS: 800
   
-  LR_BACKBONE: 0.0               # CONGELATO in Stage 3
-  LR_HEADS: 1.5e-5               # Ridotto da 2e-5
+  LR_BACKBONE: 0.0              # Congelato
+  LR_HEADS: 5.0e-5
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"     
-  WARMUP_EPOCHS: 50
+  WARMUP_EPOCHS: 20
   LR_MIN_FACTOR: 0.01         
   
-  VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 200
+  VAL_INTERVAL: 5
+  EARLY_STOPPING_PATIENCE: 30
   EARLY_STOPPING_DELTA: 0.3
-  
-  LOAD_STAGE3_BEST: false     
-  RESUME_LAST: true          
-  SAVE_BEST: true             
 
 JOINT_LOSS:
-  ALPHA: 0.3                     # Ridotto da 0.5
-  COUNT_L1_W: 2.0                # Aumentato da 1.5
-  ZIP_SCALE: 0.2                 # Ridotto da 0.3
-  ADAPTIVE_BALANCING: false   
+  # === Pesi Loss ===
+  PI_WEIGHT: 0.5                # Peso loss π-head (supervisione diretta)
+  COUNT_WEIGHT: 2.0             # Peso loss conteggio L1 (principale!)
+  SCALE_WEIGHT: 0.3             # Peso errore relativo
+  SPATIAL_WEIGHT: 0.1           # Peso loss spaziale (forma)
+  
+  # === π-head Parameters ===
+  PI_POS_WEIGHT: 15.0           # Alto! Penalizza mascherare persone (falsi negativi)
+  OCCUPANCY_THRESHOLD: 0.5      # Soglia per GT occupancy (0.5 persone/blocco = occupato)
+  MASK_TEMPERATURE: 1.0         # Temperature per soft mask (1.0 = sigmoid standard)
+  
+  # === Legacy (compatibilità) ===
+  ALPHA: 1.0
+  ZIP_SCALE: 0.5
 
 # -----------------------------------------------------------------
-# STAGE 4: RECOVERY
+# STAGE 4: RECOVERY (opzionale)
 # -----------------------------------------------------------------
 OPTIM_STAGE4:
   BATCH_SIZE: 4               
   NUM_WORKERS: 4              
-  EPOCHS: 200
+  EPOCHS: 150
   
   LR_BACKBONE: 0.0
-  LR_HEADS: 8.0e-6               # Molto basso
+  LR_HEADS: 1.0e-5
   
   WEIGHT_DECAY: 1.0e-4        
   SCHEDULER: "cosine"         
   SCHEDULER_STEP: "epoch"     
   WARMUP_EPOCHS: 10            
-  VAL_INTERVAL: 2             
-  EARLY_STOPPING_PATIENCE: 200
+  VAL_INTERVAL: 3             
+  EARLY_STOPPING_PATIENCE: 30
 
 STAGE4_LOSS:
-  ALPHA: 0.2
+  ALPHA: 0.3
   ZIP_SCALE: 0.1
-  COUNT_L1_W: 3.0                # Molto alto - focus su conteggio
+  COUNT_L1_W: 3.0
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

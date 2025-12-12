@@ -311,11 +311,11 @@ def main():
     ).to(device)
 
     # Carica checkpoint
-    ckpt_path = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"], "stage3_best.pth")
+    ckpt_path = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"], "stage3_v5_best.pth")
     
     if not os.path.exists(ckpt_path):
         # Prova latest
-        ckpt_path = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"], "stage3_latest.pth")
+        ckpt_path = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"], "stage3_v5_latest.pth")
     
     if not os.path.exists(ckpt_path):
         print(f"❌ Checkpoint non trovato: {ckpt_path}")

@@ -1,27 +1,27 @@
 # =================================================================
-# CONFIGURAZIONE V6 - RIPRISTINO COUNT_WEIGHT + STAGE 2 POTENZIATO
+# CONFIGURAZIONE V7 - "ALL-IN" OPTIMIZATION
 # =================================================================
 # 
-# LEZIONI DA V5:
-# - COUNT_WEIGHT 1.0 ha PEGGIORATO i risultati (V4→V5: +20 MAE)
-# - α=0.5 era già ottimale per bilanciare BCE e Count
+# OBIETTIVO: Scendere da MAE 79.15 → target 65-70
 #
-# MODIFICHE V6 (rispetto a V4):
-# 1. COUNT_WEIGHT: ripristinato a 0.5 (come V4)
-# 2. Stage 2 EPOCHS: 1500 → 2000 (più tempo per P2R)
-# 3. Stage 2 EARLY_STOPPING_PATIENCE: 50 → 80
-# 4. Data Augmentation più aggressiva (CROP_SCALE più ampio)
-# 5. Stage 3 EPOCHS: 200 → 300 (come V5, era promettente)
-# 6. Stage 3 EARLY_STOPPING_PATIENCE: 30 → 50
+# STRATEGIA COMBINATA:
+# 1. Stage 1: COUNT_WEIGHT aumentato (0.5→0.65) + più epoche
+#    → Backbone impara features più informative per il counting
 #
-# RISULTATI MIGLIORI (V4):
-# - Stage 2: MAE 82.74, Bias 1.069
-# - Stage 3: MAE 79.05, Bias 1.026  ← BEST
-# - Stage 4: MAE 81.10, Bias 1.046
-# - Target: MAE 65-70
+# 2. Stage 2: Più epoche + LR ridotto + backbone sbloccato (delicato)
+#    → Convergenza più profonda, fine-tuning end-to-end
+#
+# 3. Stage 3: Soft weighting invece di hard masking
+#    → π-head pesa le predizioni invece di mascherarle
+#
+# 4. Stage 4: Invariato (bias correction)
+#
+# RISULTATI V6:
+# - Stage 2: MAE 79.15 (best)
+# - Stage 3: MAE 82.87 (degradazione - hard masking dannoso)
 # =================================================================
 
-RUN_NAME: "shha_target60_v6"
+RUN_NAME: "shha_target60_v7"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -37,9 +37,9 @@ DATA:
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
   
-  # *** MODIFICA V6: Data Augmentation più aggressiva ***
+  # Data Augmentation aggressiva (come V6)
   CROP_SIZE: 384
-  CROP_SCALE: [0.5, 1.0]    # Era [0.7, 1.0] - ora più variazione
+  CROP_SCALE: [0.5, 1.0]
 
 # === MODELLO ===
 MODEL:
@@ -57,14 +57,18 @@ ZIP_HEAD:
   LAMBDA_NOISE_STD: 0.0
 
 # =================================================================
-# STAGE 1 - ZIP PRE-TRAINING (V2 con Loss Ibrida)
+# STAGE 1 - ZIP PRE-TRAINING (POTENZIATO)
 # =================================================================
-# COUNT_WEIGHT ripristinato a 0.5 (valore ottimale da V4)
+# COUNT_WEIGHT aumentato per features più count-aware
+# Più epoche per convergenza migliore
 # =================================================================
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 2000
+  
+  # *** V7: Più epoche ***
+  EPOCHS: 2500                # Era 2000
+  
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
@@ -73,14 +77,17 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 500
+  
+  # *** V7: Patience aumentata ***
+  EARLY_STOPPING_PATIENCE: 600  # Era 500
 
 ZIP_LOSS:
   # Loss BCE per π-head
   POS_WEIGHT_BCE: 5.0
   
-  # *** V6: Ripristinato a 0.5 (ottimale) ***
-  COUNT_WEIGHT: 0.5           # Era 1.0 in V5 (peggiorava), torna a 0.5
+  # *** V7: COUNT_WEIGHT aumentato ***
+  # Incremento moderato per non destabilizzare
+  COUNT_WEIGHT: 0.65            # Era 0.5 in V6
   
   # Regolarizzazione λ
   LAMBDA_REG_WEIGHT: 0.01
@@ -101,32 +108,39 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (POTENZIATO)
+# STAGE 2 - P2R TRAINING (MASSIMIZZATO)
 # =================================================================
-# Più epoche e patience per permettere convergenza migliore
+# Più epoche, LR ridotto per stabilità, backbone sbloccato delicato
 # =================================================================
 OPTIM_P2R:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
   
-  # *** MODIFICA V6: Più epoche ***
-  EPOCHS: 2000                # Era 1500, ora 2000
+  # *** V7: Ancora più epoche ***
+  EPOCHS: 3000                  # Era 2000 in V6
   
-  LR: 1.0e-4
-  LR_BACKBONE: 0.0
+  # *** V7: LR ridotto per fine-tuning più stabile ***
+  LR: 5.0e-5                    # Era 1.0e-4
+  
+  # *** V7: Backbone sbloccato (molto delicato) ***
+  LR_BACKBONE: 1.0e-6           # Era 0.0 - ora fine-tuning leggero
+  
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
   
-  # *** MODIFICA V6: Patience aumentata ***
-  EARLY_STOPPING_PATIENCE: 80  # Era 50, ora 80
+  # *** V7: Patience molto aumentata ***
+  EARLY_STOPPING_PATIENCE: 120  # Era 80 in V6
 
 P2R_LOSS:
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
-  SPATIAL_WEIGHT: 0.1
+  
+  # *** V7: Spatial weight aumentato per localizzazione ***
+  SPATIAL_WEIGHT: 0.15          # Era 0.1
+  
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -136,51 +150,54 @@ P2R_LOSS:
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - JOINT TRAINING (P2R Frozen, π-head only)
+# STAGE 3 - SOFT WEIGHTING (NUOVO APPROCCIO)
 # =================================================================
-# Manteniamo le modifiche V5 (più epoche) che erano promettenti
+# Invece di hard masking (che degradava), usiamo soft weighting:
+# pred_final = pred_raw * (1 - α) + pred_raw * π * α
+# dove α controlla quanto la π-head influenza il risultato
 # =================================================================
 OPTIM_JOINT:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
   
-  # *** Come V5: Più epoche ***
-  EPOCHS: 800
+  # *** V7: Epoche moderate (soft weighting converge più veloce) ***
+  EPOCHS: 600
   
-  LR_BACKBONE: 0.0
-  LR_HEADS: 1.0e-4
+  LR_BACKBONE: 0.0              # Backbone congelato
+  LR_HEADS: 5.0e-5              # LR ridotto per stabilità
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   SCHEDULER_STEP: "epoch"
   WARMUP_EPOCHS: 5
   LR_MIN_FACTOR: 0.01
   VAL_INTERVAL: 5
-  
-  # *** Come V5: Patience aumentata ***
-  EARLY_STOPPING_PATIENCE: 80
+  EARLY_STOPPING_PATIENCE: 200
 
-# === JOINT LOSS (usato da π-head) ===
+# === JOINT LOSS (SOFT WEIGHTING) ===
 JOINT_LOSS:
   PI_POS_WEIGHT: 8.0
   OCCUPANCY_THRESHOLD: 0.5
   PI_THRESHOLD: 0.5
+  
+  # *** V7: Nuovi parametri per soft weighting ***
+  SOFT_WEIGHT_ALPHA: 0.3        # Quanto la π-head influenza (0=niente, 1=tutto)
+  USE_SOFT_WEIGHTING: true      # Flag per nuovo approccio
 
 # =================================================================
-# STAGE 4 - BIAS CORRECTION
+# STAGE 4 - BIAS CORRECTION (invariato)
 # =================================================================
 OPTIM_STAGE4:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
-  EPOCHS: 800
+  EPOCHS: 150
   
-  # Learning rates differenziati
   LR_P2R: 1.0e-6
   LR_LOG_SCALE: 1.0e-5
   LR_PI: 1.0e-4
   
   WEIGHT_DECAY: 1.0e-4
   VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 80
+  EARLY_STOPPING_PATIENCE: 40
 
 STAGE4_LOSS:
   OVERESTIMATE_WEIGHT: 2.0

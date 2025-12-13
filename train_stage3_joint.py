@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 3 - Joint Training V5 - P2R FROZEN
+Stage 3 - BIAS CORRECTION END-TO-END FINE-TUNING
 
-LEZIONE APPRESA DA V4:
-Il training congiunto di P2R + π-head causa divergenza.
-La P2R head di Stage 2 era già buona (MAE ~103), ma il joint training
-l'ha rovinata (MAE → 170+) aumentando il bias da 1.1 a 1.26.
+PROBLEMA:
+- Stage 2 P2R ha MAE ~103 con bias 1.10 (sovrastima 10%)
+- Stage 3 V5 (π-only) arriva a MAE ~99 ma con alta varianza
+- Target: MAE 65-70
 
-NUOVA STRATEGIA:
-1. CONGELA COMPLETAMENTE la P2R head (incluso log_scale)
-2. Allena SOLO il π-head per migliorare localizzazione
-3. Usa MAE MASKED come metrica (il π-head può aiutare a filtrare rumore)
+SOLUZIONE:
+1. Sbloccare P2R head con LR MOLTO basso (1e-6)
+2. Learning rate separato per log_scale (parametro chiave del bias)
+3. Loss ASIMMETRICA: penalizza sovrastima più di sottostima
+4. Gradient clipping aggressivo per stabilità
+5. π-head continua a essere trainato
 
-Obiettivo: π-head che migliora (non peggiora) il conteggio
+STRATEGIA:
+- Backbone: FROZEN
+- P2R head: LR 1e-6 (micro-adjustment)
+- log_scale: LR 1e-5 (target principale della correzione)
+- π-head: LR 1e-4 (come V5)
+- Nuova loss: BiasAwareCountLoss che penalizza ratio > 1.0
 """
 
 import os
@@ -135,86 +142,80 @@ def calibrate_density_scale(
 
 
 # =============================================================================
-# CHECKPOINT MANAGEMENT
+# BIAS-AWARE LOSS FUNCTIONS
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False):
-    """Salva checkpoint Stage 3."""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-        "best_mae": best_mae,
-        "best_results": best_results,
-    }
-    
-    latest_path = os.path.join(output_dir, "stage3_v5_latest.pth")
-    torch.save(checkpoint, latest_path)
-    
-    if is_best:
-        best_path = os.path.join(output_dir, "stage3_v5_best.pth")
-        torch.save(checkpoint, best_path)
-        print(f"💾 Saved: stage3_v5_latest.pth + stage3_v5_best.pth (MAE={best_mae:.2f})")
-    else:
-        print(f"💾 Saved: stage3_v5_latest.pth (epoch {epoch})")
-
-
-def resume_checkpoint(model, optimizer, scheduler, output_dir, device):
-    """Riprende da checkpoint."""
-    latest_path = os.path.join(output_dir, "stage3_v5_latest.pth")
-    
-    if not os.path.isfile(latest_path):
-        return 1, float('inf'), {}
-    
-    print(f"🔄 Resume da: {latest_path}")
-    checkpoint = torch.load(latest_path, map_location=device)
-    
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    
-    if scheduler and checkpoint.get("scheduler_state_dict"):
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    
-    return checkpoint.get("epoch", 0) + 1, checkpoint.get("best_mae", float('inf')), checkpoint.get("best_results", {})
-
-
-# =============================================================================
-# LOSS: Solo per π-head
-# =============================================================================
-
-class PiHeadLoss(nn.Module):
+class BiasAwareCountLoss(nn.Module):
     """
-    Loss per π-head ottimizzata.
+    Loss che penalizza ASIMMETRICAMENTE sovrastima vs sottostima.
     
-    Obiettivo: il π-head deve identificare blocchi con persone
-    in modo che il masking MIGLIORI (non peggiori) il conteggio.
+    Il bias sistematico del 10% indica che log_scale è troppo alto.
+    Questa loss penalizza di più quando pred > gt.
+    
+    L_total = L_mae + α * L_overestimate_penalty
+    
+    dove:
+    - L_mae = |pred - gt|
+    - L_overestimate_penalty = max(0, (pred/gt) - 1)² quando pred > gt
     """
     def __init__(
-        self, 
-        pos_weight: float = 8.0,
-        block_size: int = 16, 
-        occupancy_threshold: float = 0.5,
+        self,
+        overestimate_weight: float = 2.0,  # Quanto penalizzare sovrastima
+        target_bias: float = 1.0,          # Bias target (1.0 = perfetto)
+        bias_tolerance: float = 0.02,      # Tolleranza (0.98-1.02 ok)
     ):
+        super().__init__()
+        self.overestimate_weight = overestimate_weight
+        self.target_bias = target_bias
+        self.bias_tolerance = bias_tolerance
+    
+    def forward(self, pred_count, gt_count):
+        """
+        Args:
+            pred_count: [B] predicted counts
+            gt_count: [B] ground truth counts
+        """
+        # MAE base
+        mae_loss = torch.abs(pred_count - gt_count).mean()
+        
+        # Ratio pred/gt
+        ratio = pred_count / (gt_count + 1e-6)
+        
+        # Penalizza sovrastima (ratio > 1)
+        overestimate = F.relu(ratio - (self.target_bias + self.bias_tolerance))
+        overestimate_penalty = (overestimate ** 2).mean()
+        
+        # Penalizza sottostima (ratio < 1) - ma meno
+        underestimate = F.relu((self.target_bias - self.bias_tolerance) - ratio)
+        underestimate_penalty = (underestimate ** 2).mean() * 0.5  # Metà peso
+        
+        total_loss = mae_loss + self.overestimate_weight * (overestimate_penalty + underestimate_penalty)
+        
+        # Metriche
+        with torch.no_grad():
+            mean_ratio = ratio.mean().item()
+            overest_ratio = (ratio > 1.05).float().mean().item() * 100
+            underest_ratio = (ratio < 0.95).float().mean().item() * 100
+        
+        return total_loss, {
+            "mae": mae_loss.item(),
+            "bias": mean_ratio,
+            "overest_pct": overest_ratio,
+            "underest_pct": underest_ratio,
+        }
+
+
+class PiHeadLoss(nn.Module):
+    """Loss per π-head (come V5)."""
+    def __init__(self, pos_weight: float = 8.0, block_size: int = 16, occupancy_threshold: float = 0.5):
         super().__init__()
         self.pos_weight = pos_weight
         self.block_size = block_size
         self.occupancy_threshold = occupancy_threshold
-        
-        self.bce = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight]),
-            reduction='mean'
-        )
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]), reduction='mean')
     
     def compute_gt_occupancy(self, gt_density):
-        """GT occupancy: blocco pieno se contiene >= threshold persone."""
-        gt_counts_per_block = F.avg_pool2d(
-            gt_density,
-            kernel_size=self.block_size,
-            stride=self.block_size
-        ) * (self.block_size ** 2)
+        gt_counts_per_block = F.avg_pool2d(gt_density, kernel_size=self.block_size, stride=self.block_size) * (self.block_size ** 2)
         return (gt_counts_per_block > self.occupancy_threshold).float()
     
     def forward(self, logit_pi_maps, gt_density):
@@ -222,37 +223,24 @@ class PiHeadLoss(nn.Module):
         gt_occupancy = self.compute_gt_occupancy(gt_density)
         
         if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
-            gt_occupancy = F.interpolate(
-                gt_occupancy, size=logit_pieno.shape[-2:], mode='nearest'
-            )
+            gt_occupancy = F.interpolate(gt_occupancy, size=logit_pieno.shape[-2:], mode='nearest')
         
         if self.bce.pos_weight.device != logit_pieno.device:
             self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
         
         loss = self.bce(logit_pieno, gt_occupancy)
         
-        # Metriche
         with torch.no_grad():
             pred_prob = torch.sigmoid(logit_pieno)
             pred_occupancy = (pred_prob > 0.5).float()
             coverage = pred_occupancy.mean().item() * 100
-            
+            recall = 100.0
             if gt_occupancy.sum() > 0:
                 tp = (pred_occupancy * gt_occupancy).sum()
                 fn = ((1 - pred_occupancy) * gt_occupancy).sum()
-                fp = (pred_occupancy * (1 - gt_occupancy)).sum()
-                
                 recall = (tp / (tp + fn + 1e-6)).item() * 100
-                precision = (tp / (tp + fp + 1e-6)).item() * 100
-            else:
-                recall = 100.0
-                precision = 100.0
         
-        return loss, {
-            "coverage": coverage, 
-            "recall": recall,
-            "precision": precision,
-        }
+        return loss, {"coverage": coverage, "recall": recall}
 
 
 # =============================================================================
@@ -268,37 +256,75 @@ def compute_count_raw(pred_density, down_h, down_w):
 def compute_count_masked(pred_density, pi_probs, down_h, down_w, threshold=0.5):
     """Conteggio MASKED (con maschera π)."""
     cell_area = down_h * down_w
-    
     if pi_probs.shape[-2:] != pred_density.shape[-2:]:
-        pi_probs = F.interpolate(
-            pi_probs, size=pred_density.shape[-2:], 
-            mode='bilinear', align_corners=False
-        )
-    
+        pi_probs = F.interpolate(pi_probs, size=pred_density.shape[-2:], mode='bilinear', align_corners=False)
     mask = (pi_probs > threshold).float()
     masked_density = pred_density * mask
     return torch.sum(masked_density, dim=(1, 2, 3)) / cell_area
 
 
 # =============================================================================
-# TRAINING - Solo π-head
+# CHECKPOINT MANAGEMENT
 # =============================================================================
 
-def train_one_epoch(model, pi_loss_fn, dataloader, optimizer, device, default_down, epoch):
-    """
-    Training: SOLO π-head, P2R completamente congelata.
-    """
+def save_checkpoint(model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=False):
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "best_mae": best_mae,
+        "best_results": best_results,
+    }
+    
+    latest_path = os.path.join(output_dir, "stage4_latest.pth")
+    torch.save(checkpoint, latest_path)
+    
+    if is_best:
+        best_path = os.path.join(output_dir, "stage4_best.pth")
+        torch.save(checkpoint, best_path)
+        print(f"💾 Saved: stage4_latest.pth + stage4_best.pth (MAE={best_mae:.2f})")
+    else:
+        print(f"💾 Saved: stage4_latest.pth (epoch {epoch})")
+
+
+def resume_checkpoint(model, optimizer, scheduler, output_dir, device):
+    latest_path = os.path.join(output_dir, "stage4_latest.pth")
+    if not os.path.isfile(latest_path):
+        return 1, float('inf'), {}
+    
+    print(f"🔄 Resume da: {latest_path}")
+    checkpoint = torch.load(latest_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if scheduler and checkpoint.get("scheduler_state_dict"):
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    
+    return checkpoint.get("epoch", 0) + 1, checkpoint.get("best_mae", float('inf')), checkpoint.get("best_results", {})
+
+
+# =============================================================================
+# TRAINING
+# =============================================================================
+
+def train_one_epoch(model, count_loss_fn, pi_loss_fn, dataloader, optimizer, device, default_down, epoch, config):
+    """Training con bias correction."""
     model.train()
     
-    # Assicura che P2R sia in eval mode (BatchNorm frozen)
-    model.p2r_head.eval()
+    # Backbone in eval (BatchNorm frozen)
+    model.backbone.eval()
     
-    total_loss = 0.0
+    total_count_loss = 0.0
+    total_pi_loss = 0.0
+    total_bias = 0.0
     total_coverage = 0.0
-    total_recall = 0.0
     num_batches = 0
     
-    progress_bar = tqdm(dataloader, desc=f"Stage3 V5 [Ep {epoch}]")
+    pi_weight = config.get("PI_LOSS_WEIGHT", 0.3)
+    count_weight = config.get("COUNT_LOSS_WEIGHT", 1.0)
+    
+    progress_bar = tqdm(dataloader, desc=f"Stage4 [Ep {epoch}]")
     
     for images, gt_density, points in progress_bar:
         images = images.to(device)
@@ -306,52 +332,67 @@ def train_one_epoch(model, pi_loss_fn, dataloader, optimizer, device, default_do
         
         optimizer.zero_grad()
         
-        # Forward (P2R non ha gradienti)
-        with torch.no_grad():
-            # Backbone e P2R senza gradienti
-            feat = model.backbone(images)
+        # Forward
+        outputs = model(images)
         
-        # Solo ZIP head con gradienti
-        zip_outputs = model.zip_head(feat, model.bin_centers)
-        logit_pi = zip_outputs["logit_pi_maps"]
+        # P2R density
+        pred_density = outputs["p2r_density"]
+        _, _, h_in, w_in = images.shape
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(pred_density, (h_in, w_in), default_down)
+        down_h, down_w = down_tuple
         
-        # Loss solo su π-head
-        loss, metrics = pi_loss_fn(logit_pi, gt_density)
+        # Count RAW (senza masking per count loss)
+        pred_count = compute_count_raw(pred_density, down_h, down_w)
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.zip_head.parameters(), 1.0)
+        # GT count
+        gt_count = torch.tensor([len(pts) if pts is not None else 0 for pts in points], 
+                                device=device, dtype=torch.float32)
+        
+        # Count loss con bias penalty
+        count_loss, count_metrics = count_loss_fn(pred_count, gt_count)
+        
+        # Pi loss
+        logit_pi = outputs["logit_pi_maps"]
+        pi_loss, pi_metrics = pi_loss_fn(logit_pi, gt_density)
+        
+        # Total loss
+        total_loss = count_weight * count_loss + pi_weight * pi_loss
+        
+        total_loss.backward()
+        
+        # Gradient clipping AGGRESSIVO per stabilità
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        
         optimizer.step()
         
-        total_loss += loss.item()
-        total_coverage += metrics["coverage"]
-        total_recall += metrics["recall"]
+        total_count_loss += count_loss.item()
+        total_pi_loss += pi_loss.item()
+        total_bias += count_metrics["bias"]
+        total_coverage += pi_metrics["coverage"]
         num_batches += 1
         
         progress_bar.set_postfix({
-            "L": f"{loss.item():.3f}",
-            "cov": f"{metrics['coverage']:.1f}%",
-            "rec": f"{metrics['recall']:.0f}%",
+            "CL": f"{count_loss.item():.3f}",
+            "bias": f"{count_metrics['bias']:.3f}",
+            "cov": f"{pi_metrics['coverage']:.1f}%",
         })
     
     n = max(num_batches, 1)
-    print(f"   Train: Loss={total_loss/n:.4f}, Coverage={total_coverage/n:.1f}%, Recall={total_recall/n:.1f}%")
+    print(f"   Train: CountLoss={total_count_loss/n:.4f}, PiLoss={total_pi_loss/n:.4f}, "
+          f"Bias={total_bias/n:.3f}, Coverage={total_coverage/n:.1f}%")
     
-    return total_loss / len(dataloader)
+    return total_count_loss / n
 
 
 @torch.no_grad()
 def validate(model, dataloader, device, default_down, pi_threshold=0.5):
-    """
-    Validazione: confronta RAW vs MASKED.
-    
-    L'obiettivo è che MASKED sia MEGLIO di RAW.
-    """
+    """Validazione completa."""
     model.eval()
     
     mae_raw, mae_masked = 0.0, 0.0
-    mse_masked = 0.0
-    total_pred_raw, total_pred_masked, total_gt = 0.0, 0.0, 0.0
-    total_coverage, total_recall = 0.0, 0.0
+    mse_raw = 0.0
+    total_pred_raw, total_gt = 0.0, 0.0
+    total_coverage = 0.0
     n_samples = 0
     
     errors_by_density = {"sparse": [], "medium": [], "dense": []}
@@ -364,12 +405,9 @@ def validate(model, dataloader, device, default_down, pi_threshold=0.5):
         
         pred_density = outputs["p2r_density"]
         _, _, h_in, w_in = images.shape
-        pred_density, down_tuple, _ = canonicalize_p2r_grid(
-            pred_density, (h_in, w_in), default_down
-        )
+        pred_density, down_tuple, _ = canonicalize_p2r_grid(pred_density, (h_in, w_in), default_down)
         down_h, down_w = down_tuple
         
-        # Counts
         pred_count_raw = compute_count_raw(pred_density, down_h, down_w)
         
         pi_probs = outputs.get("pi_probs")
@@ -377,21 +415,11 @@ def validate(model, dataloader, device, default_down, pi_threshold=0.5):
             logit_pi = outputs["logit_pi_maps"]
             pi_probs = logit_pi.softmax(dim=1)[:, 1:2]
         
-        pred_count_masked = compute_count_masked(
-            pred_density, pi_probs, down_h, down_w, threshold=pi_threshold
-        )
+        pred_count_masked = compute_count_masked(pred_density, pi_probs, down_h, down_w, threshold=pi_threshold)
         
-        # π metrics
-        gt_occupancy = (F.avg_pool2d(gt_density, 16, 16) * 256 > 0.5).float()
+        # Coverage
         pred_occupancy = (pi_probs > 0.5).float()
-        
-        if pred_occupancy.shape[-2:] != gt_occupancy.shape[-2:]:
-            pred_occupancy = F.interpolate(pred_occupancy, gt_occupancy.shape[-2:], mode='nearest')
-        
         coverage = pred_occupancy.mean().item() * 100
-        recall = 100.0
-        if gt_occupancy.sum() > 0:
-            recall = (pred_occupancy * gt_occupancy).sum() / gt_occupancy.sum() * 100
         
         for idx, pts in enumerate(points):
             gt = len(pts) if pts is not None else 0
@@ -403,70 +431,124 @@ def validate(model, dataloader, device, default_down, pi_threshold=0.5):
             
             mae_raw += err_r
             mae_masked += err_m
-            mse_masked += err_m ** 2
+            mse_raw += err_r ** 2
             total_pred_raw += pred_r
-            total_pred_masked += pred_m
             total_gt += gt
             total_coverage += coverage
-            total_recall += recall.item() if torch.is_tensor(recall) else recall
             n_samples += 1
             
             if gt <= 100:
-                errors_by_density["sparse"].append((err_r, err_m))
+                errors_by_density["sparse"].append((err_r, err_m, pred_r, gt))
             elif gt <= 500:
-                errors_by_density["medium"].append((err_r, err_m))
+                errors_by_density["medium"].append((err_r, err_m, pred_r, gt))
             else:
-                errors_by_density["dense"].append((err_r, err_m))
+                errors_by_density["dense"].append((err_r, err_m, pred_r, gt))
     
     mae_raw /= n_samples
     mae_masked /= n_samples
-    rmse = np.sqrt(mse_masked / n_samples)
+    rmse_raw = np.sqrt(mse_raw / n_samples)
     bias_raw = total_pred_raw / total_gt if total_gt > 0 else 0
-    bias_masked = total_pred_masked / total_gt if total_gt > 0 else 0
     coverage = total_coverage / n_samples
-    recall = total_recall / n_samples
     
     # Report
     print(f"\n{'='*60}")
-    print(f"📊 Validation Results")
+    print(f"📊 Stage 4 Validation Results")
     print(f"{'='*60}")
-    print(f"   MAE RAW:    {mae_raw:.2f}")
-    print(f"   MAE MASKED: {mae_masked:.2f}  ← METRICA PRINCIPALE")
-    print(f"   RMSE:       {rmse:.2f}")
-    print(f"   Bias RAW:   {bias_raw:.3f}")
-    print(f"   Bias MASKED:{bias_masked:.3f}")
+    print(f"   MAE RAW:    {mae_raw:.2f}  ← METRICA PRINCIPALE")
+    print(f"   MAE MASKED: {mae_masked:.2f}")
+    print(f"   RMSE:       {rmse_raw:.2f}")
+    print(f"   Bias:       {bias_raw:.3f} {'✅' if 0.98 <= bias_raw <= 1.02 else '⚠️'}")
     print(f"{'─'*60}")
     print(f"   π coverage: {coverage:.1f}%")
-    print(f"   π recall:   {recall:.1f}%")
     print(f"{'─'*60}")
     
     print(f"   Per densità:")
     for name, errors in errors_by_density.items():
         if errors:
             raw_errs = [e[0] for e in errors]
-            masked_errs = [e[1] for e in errors]
-            print(f"      {name}: RAW={np.mean(raw_errs):.1f}, MASKED={np.mean(masked_errs):.1f} ({len(errors)} imgs)")
+            biases = [e[2]/(e[3]+1e-6) for e in errors]
+            print(f"      {name}: MAE={np.mean(raw_errs):.1f}, bias={np.mean(biases):.3f} ({len(errors)} imgs)")
     
-    # Confronto
-    delta = mae_raw - mae_masked
-    if delta > 0:
-        print(f"\n   ✅ MASKED migliore di RAW di {delta:.1f} punti")
+    # Target check
+    target_low, target_high = 65, 70
+    if mae_raw <= target_high:
+        print(f"\n   🎯 TARGET RAGGIUNTO! MAE {mae_raw:.2f} ≤ {target_high}")
     else:
-        print(f"\n   ⚠️ RAW migliore di MASKED di {-delta:.1f} punti")
+        gap = mae_raw - target_high
+        print(f"\n   📉 Gap da target: {gap:.1f} punti (MAE {mae_raw:.2f} vs target {target_high})")
     
     print(f"{'='*60}\n")
     
     return {
-        "mae": mae_masked,  # Metrica principale ora è MASKED
+        "mae": mae_raw,
         "mae_raw": mae_raw,
         "mae_masked": mae_masked,
-        "rmse": rmse,
-        "bias": bias_masked,
-        "bias_raw": bias_raw,
+        "rmse": rmse_raw,
+        "bias": bias_raw,
         "coverage": coverage,
-        "recall": recall,
-        "improvement": delta,  # Quanto MASKED migliora su RAW
     }
+
+
+# =============================================================================
+# PARAMETER GROUPS WITH DIFFERENT LR
+# =============================================================================
+
+def get_parameter_groups(model, config):
+    """
+    Crea gruppi di parametri con learning rate diversi.
+    
+    Strategia:
+    - Backbone: FROZEN (lr=0)
+    - P2R head (escluso log_scale): lr MOLTO basso (1e-6)
+    - P2R log_scale: lr medio (1e-5) - TARGET PRINCIPALE
+    - ZIP π-head: lr normale (1e-4)
+    """
+    lr_p2r = config.get("LR_P2R", 1e-6)
+    lr_log_scale = config.get("LR_LOG_SCALE", 1e-5)
+    lr_pi = config.get("LR_PI", 1e-4)
+    
+    # Congela backbone
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    
+    # Identifica parametri
+    p2r_params = []
+    log_scale_params = []
+    pi_params = []
+    
+    for name, param in model.p2r_head.named_parameters():
+        if "log_scale" in name:
+            log_scale_params.append(param)
+            param.requires_grad = True
+            print(f"   🎯 log_scale: {name} (LR={lr_log_scale})")
+        else:
+            p2r_params.append(param)
+            param.requires_grad = True
+    
+    for name, param in model.zip_head.named_parameters():
+        if "bin_head" in name:
+            param.requires_grad = False  # bin_head congelata
+        else:
+            pi_params.append(param)
+            param.requires_grad = True
+    
+    param_groups = [
+        {"params": p2r_params, "lr": lr_p2r, "name": "p2r_head"},
+        {"params": log_scale_params, "lr": lr_log_scale, "name": "log_scale"},
+        {"params": pi_params, "lr": lr_pi, "name": "pi_head"},
+    ]
+    
+    # Report
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    print(f"\n📊 Parameter Groups:")
+    print(f"   P2R head:   {sum(p.numel() for p in p2r_params):,} params @ LR={lr_p2r}")
+    print(f"   log_scale:  {sum(p.numel() for p in log_scale_params):,} params @ LR={lr_log_scale}")
+    print(f"   π-head:     {sum(p.numel() for p in pi_params):,} params @ LR={lr_pi}")
+    print(f"   Trainable:  {total_trainable:,} / {total_params:,} ({100*total_trainable/total_params:.1f}%)")
+    
+    return param_groups
 
 
 # =============================================================================
@@ -485,23 +567,29 @@ def main():
     init_seeds(config["SEED"])
     
     print("="*60)
-    print("🚀 Stage 3 V5 - P2R FROZEN, solo π-head training")
+    print("🚀 Stage 4 - BIAS CORRECTION END-TO-END")
     print("="*60)
     print(f"Device: {device}")
-    print("Strategia: P2R congelata, allena solo π-head")
-    print("Metrica: MAE MASKED (π-head deve migliorare il conteggio)")
+    print("Strategia: P2R unfrozen con LR basso + Bias Penalty Loss")
+    print("Target: MAE 65-70, Bias ~1.0")
     print("="*60)
     
     # Config
     data_cfg = config["DATA"]
-    joint_cfg = config.get("JOINT_LOSS", {})
+    stage4_cfg = config.get("STAGE4_LOSS", {})
+    optim_cfg = config.get("OPTIM_STAGE4", {})
     
-    pi_pos_weight = float(joint_cfg.get("PI_POS_WEIGHT", 8.0))
-    occupancy_threshold = float(joint_cfg.get("OCCUPANCY_THRESHOLD", 0.5))
+    # Override con valori ottimizzati per bias correction
+    lr_p2r = float(optim_cfg.get("LR_P2R", 1e-6))
+    lr_log_scale = float(optim_cfg.get("LR_LOG_SCALE", 1e-5))
+    lr_pi = float(optim_cfg.get("LR_PI", 1e-4))
+    overestimate_weight = float(stage4_cfg.get("OVERESTIMATE_WEIGHT", 2.0))
     
     print(f"\n⚙️ Config:")
-    print(f"   PI_POS_WEIGHT: {pi_pos_weight}")
-    print(f"   OCCUPANCY_THRESHOLD: {occupancy_threshold}")
+    print(f"   LR_P2R: {lr_p2r}")
+    print(f"   LR_LOG_SCALE: {lr_log_scale}")
+    print(f"   LR_PI: {lr_pi}")
+    print(f"   OVERESTIMATE_WEIGHT: {overestimate_weight}")
     
     # Dataset
     train_transforms = build_transforms(data_cfg, is_train=True)
@@ -521,11 +609,9 @@ def main():
         transforms=val_transforms
     )
     
-    optim_cfg = config.get("OPTIM_JOINT", {})
-    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=optim_cfg.get("BATCH_SIZE", 8),
+        batch_size=optim_cfg.get("BATCH_SIZE", 4),  # Batch più piccolo per stabilità
         shuffle=True,
         num_workers=optim_cfg.get("NUM_WORKERS", 4),
         pin_memory=True,
@@ -565,19 +651,31 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     # =========================================
-    # CARICA STAGE 2 (checkpoint buono!)
+    # CARICA BEST CHECKPOINT DISPONIBILE
     # =========================================
-    stage2_path = os.path.join(output_dir, "stage2_best.pth")
-    if os.path.isfile(stage2_path):
-        print(f"\n✅ Caricamento Stage 2: {stage2_path}")
-        state = torch.load(stage2_path, map_location=device)
-        if "model" in state:
-            state = state["model"]
-        elif "model_state_dict" in state:
-            state = state["model_state_dict"]
-        model.load_state_dict(state, strict=False)
-    else:
-        print(f"❌ Stage 2 non trovato: {stage2_path}")
+    # Priorità: stage3_v5_best > stage3_best > stage2_best
+    checkpoint_priority = [
+        "stage3_v5_best.pth",
+        "stage3_best.pth", 
+        "stage2_best.pth"
+    ]
+    
+    loaded = False
+    for ckpt_name in checkpoint_priority:
+        ckpt_path = os.path.join(output_dir, ckpt_name)
+        if os.path.isfile(ckpt_path):
+            print(f"\n✅ Caricamento: {ckpt_path}")
+            state = torch.load(ckpt_path, map_location=device)
+            if "model" in state:
+                state = state["model"]
+            elif "model_state_dict" in state:
+                state = state["model_state_dict"]
+            model.load_state_dict(state, strict=False)
+            loaded = True
+            break
+    
+    if not loaded:
+        print(f"❌ Nessun checkpoint trovato in {output_dir}")
         return
     
     # Definisci default_down prima della calibrazione
@@ -589,103 +687,112 @@ def main():
     # Senza calibrazione, il log_scale del checkpoint potrebbe
     # non essere ottimale, causando discrepanze di MAE
     print("\n🔧 Calibrazione log_scale...")
+    
+    # Crea un loader temporaneo per calibrazione
+    calib_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=optim_cfg.get("NUM_WORKERS", 4),
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
     calibrate_density_scale(
-        model, val_loader, device, default_down,
+        model, calib_loader, device, default_down,
         max_batches=10, verbose=True
     )
     
     # =========================================
-    # CONGELA TUTTO TRANNE π-head
+    # SETUP PARAMETRI CON LR DIFFERENZIATI
     # =========================================
-    print("\n🧊 Congelamento:")
+    print("\n🔧 Setup parametri:")
     
-    # Congela backbone
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-    print("   ✓ Backbone congelato")
+    param_config = {
+        "LR_P2R": lr_p2r,
+        "LR_LOG_SCALE": lr_log_scale,
+        "LR_PI": lr_pi,
+    }
+    param_groups = get_parameter_groups(model, param_config)
     
-    # Congela P2R head COMPLETAMENTE (incluso log_scale!)
-    for param in model.p2r_head.parameters():
-        param.requires_grad = False
-    print("   ✓ P2R head congelata (incluso log_scale)")
-    
-    # Congela anche lambda head nella ZIP (alleniamo solo pi)
-    # La ZIP head ha: shared, pi_head, bin_head
-    # Congeliamo bin_head, teniamo trainabile pi_head e shared
-    for name, param in model.zip_head.named_parameters():
-        if "bin_head" in name:
-            param.requires_grad = False
-        else:
-            param.requires_grad = True
-    print("   ✓ ZIP bin_head congelata")
-    print("   🔥 ZIP pi_head + shared trainabili")
-    
-    # Conta parametri
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"\n   Parametri trainabili: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
-    
-    # Optimizer - solo parametri trainabili
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Optimizer
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=float(optim_cfg.get("LR_HEADS", 1e-4)),  # LR più alto, solo π-head
+        param_groups,
         weight_decay=float(optim_cfg.get("WEIGHT_DECAY", 1e-4))
     )
     
-    epochs = optim_cfg.get("EPOCHS", 200)
-    scheduler = get_scheduler(optimizer, optim_cfg, epochs)
+    epochs = optim_cfg.get("EPOCHS", 150)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-7
+    )
     
-    # Loss
+    # Loss functions
+    count_loss_fn = BiasAwareCountLoss(
+        overestimate_weight=overestimate_weight,
+        target_bias=1.0,
+        bias_tolerance=0.02,
+    )
+    
     pi_loss_fn = PiHeadLoss(
-        pos_weight=pi_pos_weight,
+        pos_weight=float(config.get("JOINT_LOSS", {}).get("PI_POS_WEIGHT", 8.0)),
         block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        occupancy_threshold=occupancy_threshold,
+        occupancy_threshold=0.5,
     ).to(device)
     
-    # Valutazione iniziale (Stage 2 puro, post-calibrazione)
-    print("\n📋 Valutazione iniziale (Stage 2 checkpoint):")
+    loss_config = {
+        "PI_LOSS_WEIGHT": float(stage4_cfg.get("PI_WEIGHT", 0.3)),
+        "COUNT_LOSS_WEIGHT": float(stage4_cfg.get("COUNT_WEIGHT", 1.0)),
+    }
+    
+    # Valutazione iniziale (post-calibrazione)
+    print("\n📋 Valutazione iniziale:")
     init_results = validate(model, val_loader, device, default_down)
     
-    best_mae = init_results["mae"]  # MAE MASKED
+    best_mae = init_results["mae"]
     best_results = init_results
-    baseline_raw = init_results["mae_raw"]
+    initial_bias = init_results["bias"]
     
     print(f"\n🎯 Baseline:")
-    print(f"   MAE RAW (riferimento): {baseline_raw:.2f}")
-    print(f"   MAE MASKED (da migliorare): {best_mae:.2f}")
-    print(f"   Obiettivo: MASKED < RAW (improvement > 0)")
+    print(f"   MAE iniziale: {best_mae:.2f}")
+    print(f"   Bias iniziale: {initial_bias:.3f}")
+    print(f"   Target: MAE 65-70, Bias ~1.0")
     
     # Training
-    print(f"\n🚀 START Training")
+    print(f"\n🚀 START Training Stage 4")
     print(f"   Epochs: 1 → {epochs}")
     
-    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 30)
+    patience = optim_cfg.get("EARLY_STOPPING_PATIENCE", 50)
     no_improve = 0
-    val_interval = optim_cfg.get("VAL_INTERVAL", 5)
+    val_interval = optim_cfg.get("VAL_INTERVAL", 3)
     
     for epoch in range(1, epochs + 1):
         print(f"\n{'='*50}")
         print(f"Epoch {epoch}/{epochs}")
         print(f"{'='*50}")
         
+        # Log current LRs
+        lrs = [f"{pg['name']}:{pg['lr']:.2e}" for pg in optimizer.param_groups]
+        print(f"   LRs: {', '.join(lrs)}")
+        
         train_loss = train_one_epoch(
-            model, pi_loss_fn, train_loader, optimizer, device, default_down, epoch
+            model, count_loss_fn, pi_loss_fn, train_loader, 
+            optimizer, device, default_down, epoch, loss_config
         )
         
-        if scheduler:
-            scheduler.step()
+        scheduler.step()
         
         # Validazione
         if epoch % val_interval == 0:
             results = validate(model, val_loader, device, default_down)
             
-            # Metrica: MAE MASKED (vogliamo che sia basso E migliore di RAW)
             current_mae = results["mae"]
-            improvement = results["improvement"]
+            current_bias = results["bias"]
             
-            # È best se: MAE migliora E improvement positivo (MASKED < RAW)
-            is_better = current_mae < best_mae - 0.5
+            # È best se MAE migliora E bias si avvicina a 1.0
+            bias_improved = abs(current_bias - 1.0) < abs(best_results.get("bias", 2.0) - 1.0)
+            mae_improved = current_mae < best_mae - 0.3
+            
+            is_better = mae_improved or (current_mae < best_mae and bias_improved)
             
             if is_better:
                 best_mae = current_mae
@@ -693,7 +800,7 @@ def main():
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, best_mae, best_results, output_dir, is_best=True
                 )
-                print(f"🏆 NEW BEST: MAE_MASKED={best_mae:.2f}, improvement={improvement:.1f}")
+                print(f"🏆 NEW BEST: MAE={best_mae:.2f}, Bias={current_bias:.3f}")
                 no_improve = 0
             else:
                 no_improve += 1
@@ -702,6 +809,14 @@ def main():
                 )
                 print(f"   No improvement ({no_improve}/{patience})")
             
+            # Check target
+            if current_mae <= 70 and 0.95 <= current_bias <= 1.05:
+                print(f"\n🎯🎯🎯 TARGET RAGGIUNTO! MAE={current_mae:.2f}, Bias={current_bias:.3f}")
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, current_mae, results, output_dir, is_best=True
+                )
+                break
+            
             # Early stopping
             if no_improve >= patience:
                 print(f"⛔ Early stopping a epoch {epoch}")
@@ -709,20 +824,22 @@ def main():
     
     # Risultati finali
     print("\n" + "="*60)
-    print("🏁 STAGE 3 V5 COMPLETATO")
+    print("🏁 STAGE 4 COMPLETATO")
     print("="*60)
-    print(f"   Baseline RAW:     {baseline_raw:.2f}")
-    print(f"   Best MAE MASKED:  {best_results.get('mae', best_mae):.2f}")
-    print(f"   Improvement:      {best_results.get('improvement', 0):.1f}")
-    print(f"   Bias:             {best_results.get('bias', 0):.3f}")
-    print(f"   π recall:         {best_results.get('recall', 0):.1f}%")
+    print(f"   MAE iniziale:  {init_results['mae']:.2f}")
+    print(f"   Bias iniziale: {initial_bias:.3f}")
+    print(f"   ──────────────────────")
+    print(f"   Best MAE:      {best_results.get('mae', best_mae):.2f}")
+    print(f"   Best Bias:     {best_results.get('bias', 0):.3f}")
+    print(f"   Best RMSE:     {best_results.get('rmse', 0):.2f}")
     
-    if best_results.get('improvement', 0) > 0:
-        print(f"\n   ✅ π-head MIGLIORA il conteggio di {best_results['improvement']:.1f} punti!")
+    gap = best_results.get('mae', best_mae) - 70
+    if gap <= 0:
+        print(f"\n   🎯 TARGET RAGGIUNTO!")
     else:
-        print(f"\n   ⚠️ π-head non migliora. Usa MAE RAW come riferimento.")
+        print(f"\n   📉 Gap residuo: {gap:.1f} punti")
     
-    print(f"\n💾 Best model: {os.path.join(output_dir, 'stage3_v5_best.pth')}")
+    print(f"\n💾 Best model: {os.path.join(output_dir, 'stage4_best.pth')}")
 
 
 if __name__ == "__main__":

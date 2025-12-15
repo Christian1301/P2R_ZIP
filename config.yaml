@@ -1,27 +1,23 @@
 # =================================================================
-# CONFIGURAZIONE V7 - "ALL-IN" OPTIMIZATION
+# CONFIGURAZIONE V8 - STAGE 2 POTENZIATO
 # =================================================================
 # 
-# OBIETTIVO: Scendere da MAE 79.15 → target 65-70
+# OBIETTIVO: Migliorare MAE 68.97 → target 63-66
 #
-# STRATEGIA COMBINATA:
-# 1. Stage 1: COUNT_WEIGHT aumentato (0.5→0.65) + più epoche
-#    → Backbone impara features più informative per il counting
+# MODIFICHE DA V7:
+# 1. Stage 2: 3000 → 5000 epoche
+# 2. Early stopping patience: 120 → 200
+# 3. Data augmentation più aggressiva:
+#    - CROP_SCALE: [0.5, 1.0] → [0.4, 1.0]
+#    - Color jitter aggiunto
+#    - Random grayscale 10%
+# 4. Warmup epochs per Stage 2
 #
-# 2. Stage 2: Più epoche + LR ridotto + backbone sbloccato (delicato)
-#    → Convergenza più profonda, fine-tuning end-to-end
-#
-# 3. Stage 3: Soft weighting invece di hard masking
-#    → π-head pesa le predizioni invece di mascherarle
-#
-# 4. Stage 4: Invariato (bias correction)
-#
-# RISULTATI V6:
-# - Stage 2: MAE 79.15 (best)
-# - Stage 3: MAE 82.87 (degradazione - hard masking dannoso)
+# RISULTATI V7:
+# - Stage 2: MAE 68.97 (baseline da battere)
 # =================================================================
 
-RUN_NAME: "shha_target60_v7"
+RUN_NAME: "shha_target60_v8"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -37,14 +33,28 @@ DATA:
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
   
-  # Data Augmentation aggressiva (come V6)
+  # *** V8: Data Augmentation POTENZIATA ***
   CROP_SIZE: 384
-  CROP_SCALE: [0.5, 1.0]
+  CROP_SCALE: [0.4, 1.0]        # Era [0.5, 1.0] - più variazione di scala
+  
+  # *** V8: Nuove augmentation ***
+  COLOR_JITTER:
+    ENABLED: true
+    BRIGHTNESS: 0.2
+    CONTRAST: 0.2
+    SATURATION: 0.2
+    HUE: 0.1
+  HORIZONTAL_FLIP: true
+  RANDOM_GRAY_PROB: 0.1         # 10% probabilità grayscale
+  GAUSSIAN_BLUR:
+    ENABLED: true
+    PROB: 0.1
+    KERNEL_SIZE: [3, 5]
 
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.5
+  ZIP_PI_THRESH: 0.2
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
   USE_STE_MASK: true
@@ -57,18 +67,12 @@ ZIP_HEAD:
   LAMBDA_NOISE_STD: 0.0
 
 # =================================================================
-# STAGE 1 - ZIP PRE-TRAINING (POTENZIATO)
-# =================================================================
-# COUNT_WEIGHT aumentato per features più count-aware
-# Più epoche per convergenza migliore
+# STAGE 1 - ZIP PRE-TRAINING (come V7)
 # =================================================================
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  
-  # *** V7: Più epoche ***
-  EPOCHS: 2500                # Era 2000
-  
+  EPOCHS: 2500
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
@@ -77,25 +81,13 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  
-  # *** V7: Patience aumentata ***
-  EARLY_STOPPING_PATIENCE: 600  # Era 500
+  EARLY_STOPPING_PATIENCE: 600
 
 ZIP_LOSS:
-  # Loss BCE per π-head
   POS_WEIGHT_BCE: 5.0
-  
-  # *** V7: COUNT_WEIGHT aumentato ***
-  # Incremento moderato per non destabilizzare
-  COUNT_WEIGHT: 0.65            # Era 0.5 in V6
-  
-  # Regolarizzazione λ
+  COUNT_WEIGHT: 0.65
   LAMBDA_REG_WEIGHT: 0.01
-  
-  # Soglia per definire "blocco pieno"
   OCCUPANCY_THRESHOLD: 0.5
-  
-  # Legacy (non usati in V2)
   WEIGHT_CE: 1.5
   WEIGHT_NLL: 1.0
   WEIGHT_COUNT: 0.8
@@ -108,22 +100,20 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (MASSIMIZZATO)
+# STAGE 2 - P2R TRAINING (MASSIMIZZATO V8)
 # =================================================================
-# Più epoche, LR ridotto per stabilità, backbone sbloccato delicato
+# Strategia: più epoche + augmentation aggressiva + patience alta
 # =================================================================
 OPTIM_P2R:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
   
-  # *** V7: Ancora più epoche ***
-  EPOCHS: 3000                  # Era 2000 in V6
+  # *** V8: MOLTO più epoche ***
+  EPOCHS: 5000                  # Era 3000 in V7
   
-  # *** V7: LR ridotto per fine-tuning più stabile ***
-  LR: 5.0e-5                    # Era 1.0e-4
-  
-  # *** V7: Backbone sbloccato (molto delicato) ***
-  LR_BACKBONE: 1.0e-6           # Era 0.0 - ora fine-tuning leggero
+  # LR stabile (come V7)
+  LR: 5.0e-5
+  LR_BACKBONE: 1.0e-6           # Fine-tuning leggero backbone
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
@@ -131,16 +121,19 @@ OPTIM_P2R:
   RESUME_LAST: true
   SAVE_BEST: true
   
-  # *** V7: Patience molto aumentata ***
-  EARLY_STOPPING_PATIENCE: 120  # Era 80 in V6
+  # *** V8: Warmup per stabilità iniziale ***
+  WARMUP_EPOCHS: 50
+  
+  # *** V8: Patience MOLTO aumentata ***
+  EARLY_STOPPING_PATIENCE: 200  # Era 120 in V7
+  
+  # *** V8: Gradient clipping per stabilità ***
+  GRAD_CLIP: 1.0
 
 P2R_LOSS:
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
-  
-  # *** V7: Spatial weight aumentato per localizzazione ***
-  SPATIAL_WEIGHT: 0.15          # Era 0.1
-  
+  SPATIAL_WEIGHT: 0.15
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -150,51 +143,36 @@ P2R_LOSS:
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - SOFT WEIGHTING (NUOVO APPROCCIO)
+# STAGE 3 - SOFT WEIGHTING (disabilitato - non funziona)
 # =================================================================
-# Invece di hard masking (che degradava), usiamo soft weighting:
-# pred_final = pred_raw * (1 - α) + pred_raw * π * α
-# dove α controlla quanto la π-head influenza il risultato
-# =================================================================
-OPTIM_JOINT:
+OPTIM_STAGE3:
+  ENABLED: false                # Disabilitato - Stage 2 è il finale
   BATCH_SIZE: 8
   NUM_WORKERS: 4
-  
-  # *** V7: Epoche moderate (soft weighting converge più veloce) ***
-  EPOCHS: 600
-  
-  LR_BACKBONE: 0.0              # Backbone congelato
-  LR_HEADS: 5.0e-5              # LR ridotto per stabilità
+  EPOCHS: 300
+  LR_BACKBONE: 0.0
+  LR_HEADS: 5.0e-5
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 5
-  LR_MIN_FACTOR: 0.01
-  VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 200
+  EARLY_STOPPING_PATIENCE: 60
 
-# === JOINT LOSS (SOFT WEIGHTING) ===
-JOINT_LOSS:
-  PI_POS_WEIGHT: 8.0
-  OCCUPANCY_THRESHOLD: 0.5
-  PI_THRESHOLD: 0.5
-  
-  # *** V7: Nuovi parametri per soft weighting ***
-  SOFT_WEIGHT_ALPHA: 0.3        # Quanto la π-head influenza (0=niente, 1=tutto)
-  USE_SOFT_WEIGHTING: true      # Flag per nuovo approccio
+STAGE3_LOSS:
+  SOFT_WEIGHT_ALPHA: 0.3
+  COUNT_WEIGHT: 1.0
+  SPATIAL_WEIGHT: 0.1
+  CONSISTENCY_WEIGHT: 0.2
+  PI_SUPERVISION_WEIGHT: 0.15
+  PI_POS_WEIGHT: 5.0
 
 # =================================================================
-# STAGE 4 - BIAS CORRECTION (invariato)
+# STAGE 4 - BIAS CORRECTION (opzionale)
 # =================================================================
 OPTIM_STAGE4:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
   EPOCHS: 150
-  
   LR_P2R: 1.0e-6
   LR_LOG_SCALE: 1.0e-5
   LR_PI: 1.0e-4
-  
   WEIGHT_DECAY: 1.0e-4
   VAL_INTERVAL: 3
   EARLY_STOPPING_PATIENCE: 40
@@ -209,16 +187,7 @@ BINS_CONFIG:
   shha:
     bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
     bin_centers: [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0]
-  shhb:
-    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
-    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  qnrf:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-  nwpu:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-
+ 
 EXP:
   OUT_DIR: "exp"
   SAVE_BEST: true

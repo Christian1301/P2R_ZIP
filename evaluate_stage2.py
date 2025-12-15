@@ -10,8 +10,11 @@ from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from losses.p2r_region_loss import P2RLossFixed
-from train_utils import collate_fn, init_seeds
-from train_stage2_p2r import calibrate_density_scale
+from train_utils import (
+    collate_fn,
+    init_seeds,
+    calibrate_density_scale_v2 as calibrate_density_scale,
+)
 
 
 @torch.no_grad()

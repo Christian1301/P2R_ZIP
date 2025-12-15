@@ -385,7 +385,7 @@ def train_one_epoch(model, count_loss_fn, pi_loss_fn, dataloader, optimizer, dev
 
 
 @torch.no_grad()
-def validate(model, dataloader, device, default_down, pi_threshold=0.5):
+def validate(model, dataloader, device, default_down, pi_threshold=0.2):
     """Validazione completa."""
     model.eval()
     

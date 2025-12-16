@@ -1,63 +1,41 @@
 # =================================================================
-# CONFIGURAZIONE V8 - MULTI-SCALE + AUGMENTATION + MORE EPOCHS
+# CONFIGURAZIONE JHU-CROWD++
 # =================================================================
 # 
-# OBIETTIVO: Migliorare MAE 68.97 → target 63-66
+# Dataset: JHU-CROWD++ (Johns Hopkins University)
+# - 2272 train, 500 val, 1600 test
+# - Densità media: ~346 persone/immagine
+# - Caratteristiche: diverse condizioni meteo, illuminazione
 #
-# MODIFICHE DA V7:
-# 1. Multi-scale loss con scales [1, 2, 4]
-# 2. Stage 2: 3000 → 5000 epoche
-# 3. Data augmentation potenziata:
-#    - CROP_SCALE: [0.5, 1.0] → [0.4, 1.0]
-#    - Color jitter (brightness, contrast, saturation, hue)
-#    - Random grayscale 10%
-#    - Gaussian blur 10%
-# 4. Warmup epochs + gradient clipping
-#
-# RISULTATI V7:
-# - Stage 2: MAE 68.97 (baseline da battere)
+# NOTA: Usa dataset loader "jhu" (jhu.py)
+# Struttura attesa: ROOT/train/images/*.jpg, ROOT/val/images/*.jpg
+#                   ROOT/train/gt/*.txt, ROOT/val/gt/*.txt
 # =================================================================
 
-RUN_NAME: "shha_target60_v9"
+RUN_NAME: "jhu_p2rzip_v1"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "shha"
+DATASET: "jhu"
 DATA:
-  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
+  ROOT: "/mnt/localstorage/cromano/Datasets/jhu_crowd_v2"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train_data"
-  VAL_SPLIT: "val_data"
+  TRAIN_SPLIT: "train"
+  VAL_SPLIT: "val"
   
-  # *** V8: Data Augmentation POTENZIATA ***
+  # Data Augmentation
   CROP_SIZE: 384
-  CROP_SCALE: [0.4, 1.0]        # Era [0.5, 1.0] - più variazione di scala
-  
-  # *** V8: Color Jitter ***
-  COLOR_JITTER:
-    ENABLED: true
-    BRIGHTNESS: 0.2
-    CONTRAST: 0.2
-    SATURATION: 0.2
-    HUE: 0.1
-  
-  # *** V8: Altri augment ***
-  HORIZONTAL_FLIP: true
-  RANDOM_GRAY_PROB: 0.1         # 10% probabilità grayscale
-  GAUSSIAN_BLUR:
-    ENABLED: true
-    PROB: 0.1
-    KERNEL_SIZE: [3, 5]
+  CROP_SCALE: [0.4, 1.0]
 
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.2
+  ZIP_PI_THRESH: 0.5
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
   USE_STE_MASK: true
@@ -70,12 +48,12 @@ ZIP_HEAD:
   LAMBDA_NOISE_STD: 0.0
 
 # =================================================================
-# STAGE 1 - ZIP PRE-TRAINING (come V7)
+# STAGE 1 - ZIP PRE-TRAINING
 # =================================================================
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 2500
+  EPOCHS: 2000
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
@@ -84,7 +62,7 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 600
+  EARLY_STOPPING_PATIENCE: 500
 
 ZIP_LOSS:
   POS_WEIGHT_BCE: 5.0
@@ -103,51 +81,27 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (MASSIMIZZATO V8)
-# =================================================================
-# Strategia: Multi-scale loss + più epoche + augmentation aggressiva
+# STAGE 2 - P2R TRAINING
 # =================================================================
 OPTIM_P2R:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 6
   NUM_WORKERS: 4
-  
-  # *** V8: MOLTO più epoche ***
-  EPOCHS: 5000                  # Era 3000 in V7
-  
-  # LR stabile (come V7)
+  EPOCHS: 3500
   LR: 5.0e-5
-  LR_BACKBONE: 1.0e-6           # Fine-tuning leggero backbone
-  
+  LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
-  
-  # *** V8: Warmup per stabilità iniziale ***
-  WARMUP_EPOCHS: 50
-  
-  # *** V8: Patience MOLTO aumentata ***
-  EARLY_STOPPING_PATIENCE: 200  # Era 120 in V7
-  
-  # *** V8: Gradient clipping per stabilità ***
+  WARMUP_EPOCHS: 60
+  EARLY_STOPPING_PATIENCE: 180
   GRAD_CLIP: 1.0
 
-# =================================================================
-# P2R LOSS V8 - MULTI-SCALE
-# =================================================================
 P2R_LOSS:
-  # *** V8: MULTI-SCALE LOSS ***
-  USE_MULTI_SCALE: true
-  SCALES: [1, 2, 4]             # Scale factors per pooling
-  SCALE_WEIGHTS: [1.0, 0.5, 0.25]  # Pesi decrescenti per scale maggiori
-  
-  # Loss weights
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
   SPATIAL_WEIGHT: 0.15
-  
-  # P2R parameters
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -157,10 +111,33 @@ P2R_LOSS:
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - BIAS CORRECTION (opzionale, dopo Stage 2)
+# STAGE 3 - JOINT TRAINING (SOFT WEIGHTING)
 # =================================================================
-OPTIM_STAGE3:
-  ENABLED: true                 # Puoi disabilitare se Stage 2 è sufficiente
+OPTIM_JOINT:
+  BATCH_SIZE: 6
+  NUM_WORKERS: 4
+  EPOCHS: 600
+  LR_BACKBONE: 0.0
+  LR_HEADS: 5.0e-5
+  WEIGHT_DECAY: 1.0e-4
+  SCHEDULER: "cosine"
+  SCHEDULER_STEP: "epoch"
+  WARMUP_EPOCHS: 5
+  LR_MIN_FACTOR: 0.01
+  VAL_INTERVAL: 5
+  EARLY_STOPPING_PATIENCE: 200
+
+JOINT_LOSS:
+  PI_POS_WEIGHT: 8.0
+  OCCUPANCY_THRESHOLD: 0.5
+  PI_THRESHOLD: 0.5
+  SOFT_WEIGHT_ALPHA: 0.3
+  USE_SOFT_WEIGHTING: true
+
+# =================================================================
+# STAGE 4 - BIAS CORRECTION
+# =================================================================
+OPTIM_STAGE4:
   BATCH_SIZE: 4
   NUM_WORKERS: 4
   EPOCHS: 150
@@ -171,7 +148,7 @@ OPTIM_STAGE3:
   VAL_INTERVAL: 3
   EARLY_STOPPING_PATIENCE: 40
 
-STAGE3_LOSS:
+STAGE4_LOSS:
   OVERESTIMATE_WEIGHT: 2.0
   COUNT_WEIGHT: 1.0
   PI_WEIGHT: 0.3
@@ -185,6 +162,9 @@ BINS_CONFIG:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
     bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
   qnrf:
+    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
+    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
+  jhu:
     bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
     bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
   nwpu:

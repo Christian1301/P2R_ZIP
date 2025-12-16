@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Stage 2 V8 - P2R Training con Augmentation Potenziata
+Stage 2 V8 - P2R Training con Multi-Scale Loss + Augmentation Potenziata
 
-MIGLIORAMENTI DA V7:
-1. 5000 epoche (era 3000)
-2. Data augmentation aggressiva:
-   - Scale range più ampio [0.4, 1.0]
+MODIFICHE DA V7:
+1. Multi-scale loss con scales [1, 2, 4]
+   - Calcola count a diverse risoluzioni
+   - Forza consistenza multi-scala
+2. 5000 epoche (era 3000)
+3. Data augmentation potenziata:
    - Color jitter
    - Random grayscale
    - Gaussian blur
-3. Warmup epochs
-4. Gradient clipping
-5. Patience aumentata (200)
+4. Warmup + gradient clipping
+
+FIX V8.1:
+- Device mismatch in EnhancedTransformsV8 (mean/std su CPU vs image su CUDA)
+- Checkpoint path: cerca best_model.pth invece di stage1_best.pth
 
 OBIETTIVO: MAE 68.97 → 63-66
 """
@@ -26,8 +30,8 @@ from tqdm import tqdm
 import yaml
 import numpy as np
 import random
+from PIL import Image
 
-# Torchvision per augmentation
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
@@ -58,250 +62,104 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-class EnhancedTransforms:
-    """
-    Augmentation potenziate per Stage 2 V8.
-    
-    Include:
-    - Random crop con scala variabile
-    - Color jitter
-    - Horizontal flip
-    - Random grayscale
-    - Gaussian blur (opzionale)
-    """
-    
-    def __init__(self, cfg, is_train=True):
-        self.is_train = is_train
-        self.cfg = cfg
-        
-        data_cfg = cfg.get('DATA', {})
-        
-        # Parametri crop
-        self.crop_size = data_cfg.get('CROP_SIZE', 384)
-        self.crop_scale = data_cfg.get('CROP_SCALE', [0.4, 1.0])
-        
-        # Color jitter
-        cj_cfg = data_cfg.get('COLOR_JITTER', {})
-        self.use_color_jitter = cj_cfg.get('ENABLED', True) if isinstance(cj_cfg, dict) else bool(cj_cfg)
-        if self.use_color_jitter:
-            self.color_jitter = T.ColorJitter(
-                brightness=cj_cfg.get('BRIGHTNESS', 0.2) if isinstance(cj_cfg, dict) else 0.2,
-                contrast=cj_cfg.get('CONTRAST', 0.2) if isinstance(cj_cfg, dict) else 0.2,
-                saturation=cj_cfg.get('SATURATION', 0.2) if isinstance(cj_cfg, dict) else 0.2,
-                hue=cj_cfg.get('HUE', 0.1) if isinstance(cj_cfg, dict) else 0.1,
-            )
-        
-        # Horizontal flip
-        self.use_hflip = data_cfg.get('HORIZONTAL_FLIP', True)
-        
-        # Random grayscale
-        self.gray_prob = data_cfg.get('RANDOM_GRAY_PROB', 0.1)
-        
-        # Gaussian blur
-        blur_cfg = data_cfg.get('GAUSSIAN_BLUR', {})
-        self.use_blur = blur_cfg.get('ENABLED', False) if isinstance(blur_cfg, dict) else False
-        self.blur_prob = blur_cfg.get('PROB', 0.1) if isinstance(blur_cfg, dict) else 0.1
-        self.blur_kernel = blur_cfg.get('KERNEL_SIZE', [3, 5]) if isinstance(blur_cfg, dict) else [3, 5]
-        
-        # Normalizzazione
-        self.norm_mean = data_cfg.get('NORM_MEAN', [0.485, 0.456, 0.406])
-        self.norm_std = data_cfg.get('NORM_STD', [0.229, 0.224, 0.225])
-        self.normalize = T.Normalize(mean=self.norm_mean, std=self.norm_std)
-    
-    def __call__(self, image, density, points):
-        """
-        Applica trasformazioni a immagine, density map e punti.
-        
-        Args:
-            image: PIL Image o Tensor
-            density: Tensor density map
-            points: Tensor [N, 2] coordinate punti (x, y)
-        
-        Returns:
-            image, density, points trasformati
-        """
-        # Converti a tensor se necessario
-        if not isinstance(image, torch.Tensor):
-            image = TF.to_tensor(image)
-        
-        if self.is_train:
-            # 1. Random crop
-            image, density, points = self._random_crop(image, density, points)
-            
-            # 2. Color jitter (solo su immagine)
-            if self.use_color_jitter and random.random() < 0.8:
-                # Converti a PIL per color jitter
-                image_pil = TF.to_pil_image(image)
-                image_pil = self.color_jitter(image_pil)
-                image = TF.to_tensor(image_pil)
-            
-            # 3. Horizontal flip
-            if self.use_hflip and random.random() < 0.5:
-                image, density, points = self._hflip(image, density, points)
-            
-            # 4. Random grayscale
-            if random.random() < self.gray_prob:
-                image = TF.rgb_to_grayscale(image, num_output_channels=3)
-            
-            # 5. Gaussian blur
-            if self.use_blur and random.random() < self.blur_prob:
-                kernel_size = random.choice(self.blur_kernel)
-                image = TF.gaussian_blur(image, kernel_size=[kernel_size, kernel_size])
-        
-        # Normalizza
-        image = self.normalize(image)
-        
-        return image, density, points
-    
-    def _random_crop(self, image, density, points):
-        """Random crop con scala variabile."""
-        _, H, W = image.shape
-        
-        # Scala random
-        scale = random.uniform(self.crop_scale[0], self.crop_scale[1])
-        crop_h = int(self.crop_size * scale)
-        crop_w = int(self.crop_size * scale)
-        
-        # Limita alle dimensioni immagine
-        crop_h = min(crop_h, H)
-        crop_w = min(crop_w, W)
-        
-        # Posizione random
-        top = random.randint(0, H - crop_h) if H > crop_h else 0
-        left = random.randint(0, W - crop_w) if W > crop_w else 0
-        
-        # Crop immagine
-        image = image[:, top:top+crop_h, left:left+crop_w]
-        
-        # Crop density (potrebbe avere dimensioni diverse)
-        dH, dW = density.shape[-2:]
-        scale_h = dH / H
-        scale_w = dW / W
-        d_top = int(top * scale_h)
-        d_left = int(left * scale_w)
-        d_crop_h = int(crop_h * scale_h)
-        d_crop_w = int(crop_w * scale_w)
-        density = density[..., d_top:d_top+d_crop_h, d_left:d_left+d_crop_w]
-        
-        # Filtra e trasla punti
-        if len(points) > 0:
-            # Filtra punti nel crop
-            mask = (
-                (points[:, 0] >= left) & (points[:, 0] < left + crop_w) &
-                (points[:, 1] >= top) & (points[:, 1] < top + crop_h)
-            )
-            points = points[mask]
-            
-            # Trasla
-            if len(points) > 0:
-                points = points.clone()
-                points[:, 0] -= left
-                points[:, 1] -= top
-        
-        # Resize a crop_size
-        image = F.interpolate(
-            image.unsqueeze(0), 
-            size=(self.crop_size, self.crop_size),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0)
-        
-        if density.dim() == 2:
-            density = density.unsqueeze(0).unsqueeze(0)
-        elif density.dim() == 3:
-            density = density.unsqueeze(0)
-        
-        # Scala density per preservare count
-        old_sum = density.sum()
-        density = F.interpolate(
-            density,
-            size=(self.crop_size // 8, self.crop_size // 8),  # P2R downsample
-            mode='bilinear',
-            align_corners=False
-        )
-        if old_sum > 0:
-            density = density * (old_sum / (density.sum() + 1e-8))
-        density = density.squeeze()
-        
-        # Scala punti
-        if len(points) > 0:
-            points = points.clone().float()
-            points[:, 0] = points[:, 0] * (self.crop_size / crop_w)
-            points[:, 1] = points[:, 1] * (self.crop_size / crop_h)
-        
-        return image, density, points
-    
-    def _hflip(self, image, density, points):
-        """Horizontal flip."""
-        image = TF.hflip(image)
-        
-        if density.dim() == 2:
-            density = density.flip(-1)
-        else:
-            density = density.flip(-1)
-        
-        if len(points) > 0:
-            _, _, W = image.shape
-            points = points.clone()
-            points[:, 0] = W - 1 - points[:, 0]
-        
-        return image, density, points
+# =============================================================================
+# MULTI-SCALE P2R LOSS
+# =============================================================================
 
-
-class P2RLossV8(nn.Module):
+class MultiScaleP2RLoss(nn.Module):
     """
-    Loss P2R per Stage 2 V8.
+    Loss P2R Multi-Scala per V8.
+    
+    Idea: calcola count loss a multiple risoluzioni (1x, 2x, 4x pooling).
+    Questo forza il modello a essere consistente a diverse scale,
+    migliorando la localizzazione e riducendo errori sistematici.
     
     Componenti:
-    1. Count Loss: MAE sul conteggio totale
-    2. Spatial Loss: localizzazione predizioni
+    1. Count Loss Multi-Scale: MAE a scale [1, 2, 4]
+    2. Spatial Loss: localizzazione predizioni  
     3. Scale Loss: regolarizzazione log_scale
     """
     
     def __init__(
         self,
+        scales=[1, 2, 4],
+        scale_weights=[1.0, 0.5, 0.25],
         count_weight=2.0,
         spatial_weight=0.15,
-        scale_weight=0.5,
+        scale_loss_weight=0.5,
         min_radius=8.0,
         max_radius=64.0,
     ):
         super().__init__()
+        self.scales = scales
+        self.scale_weights = scale_weights
         self.count_weight = count_weight
         self.spatial_weight = spatial_weight
-        self.scale_weight = scale_weight
+        self.scale_loss_weight = scale_loss_weight
         self.min_radius = min_radius
         self.max_radius = max_radius
+        
+        # Normalizza pesi
+        total_weight = sum(scale_weights)
+        self.scale_weights = [w / total_weight for w in scale_weights]
     
-    def forward(self, pred, points_list, cell_area, log_scale=None):
+    def forward(self, pred, points_list, cell_area, H_in, W_in, log_scale=None):
         """
         Args:
             pred: [B, 1, H, W] density predictions
             points_list: lista di tensori [N_i, 2] con coordinate GT
             cell_area: area della cella per scaling count
+            H_in, W_in: dimensioni input originale
             log_scale: parametro scala (opzionale)
         """
-        B = pred.shape[0]
+        B, _, H, W = pred.shape
         device = pred.device
         
         losses = {}
         
-        # Count loss
-        count_losses = []
+        # =====================================================================
+        # MULTI-SCALE COUNT LOSS
+        # =====================================================================
+        total_count_loss = torch.tensor(0.0, device=device)
+        
         gt_counts = []
-        pred_counts = []
+        pred_counts_scale1 = []
         
-        for i, pts in enumerate(points_list):
-            gt = len(pts)
-            pred_count = pred[i].sum() / cell_area
-            count_losses.append(torch.abs(pred_count - gt))
-            gt_counts.append(gt)
-            pred_counts.append(pred_count.item())
+        for scale_idx, (scale, weight) in enumerate(zip(self.scales, self.scale_weights)):
+            scale_count_losses = []
+            
+            if scale == 1:
+                # Scala originale
+                pred_scaled = pred
+                cell_area_scaled = cell_area
+            else:
+                # Pooling per ridurre risoluzione
+                pred_scaled = F.avg_pool2d(pred, kernel_size=scale, stride=scale)
+                # Il count totale deve essere preservato, quindi moltiplichiamo per scale^2
+                pred_scaled = pred_scaled * (scale ** 2)
+                cell_area_scaled = cell_area
+            
+            for i, pts in enumerate(points_list):
+                gt = len(pts)
+                pred_count = pred_scaled[i].sum() / cell_area_scaled
+                
+                scale_count_losses.append(torch.abs(pred_count - gt))
+                
+                # Salva per metriche (solo scala 1)
+                if scale == 1:
+                    gt_counts.append(gt)
+                    pred_counts_scale1.append(pred_count.item())
+            
+            scale_loss = torch.stack(scale_count_losses).mean()
+            total_count_loss = total_count_loss + weight * scale_loss
+            
+            losses[f'count_s{scale}'] = scale_loss.item()
         
-        losses['count'] = torch.stack(count_losses).mean()
+        losses['count'] = total_count_loss
         
-        # Spatial loss (semplificata)
-        H, W = pred.shape[-2:]
+        # =====================================================================
+        # SPATIAL LOSS (solo a scala 1)
+        # =====================================================================
         spatial_losses = []
         
         for i, pts in enumerate(points_list):
@@ -311,10 +169,14 @@ class P2RLossV8(nn.Module):
             
             # Crea target gaussiano
             target = torch.zeros(H, W, device=device)
+            scale_h = H / H_in
+            scale_w = W / W_in
+            
             for pt in pts:
-                x = int((pt[0] / cell_area).clamp(0, W-1).item())
-                y = int((pt[1] / cell_area).clamp(0, H-1).item())
-                # Gaussiana semplice
+                x = int((pt[0] * scale_w).clamp(0, W-1).item())
+                y = int((pt[1] * scale_h).clamp(0, H-1).item())
+                
+                # Gaussiana 5x5
                 for dy in range(-2, 3):
                     for dx in range(-2, 3):
                         ny, nx = y + dy, x + dx
@@ -331,27 +193,123 @@ class P2RLossV8(nn.Module):
         
         losses['spatial'] = torch.stack(spatial_losses).mean()
         
-        # Scale loss
+        # =====================================================================
+        # SCALE REGULARIZATION
+        # =====================================================================
         if log_scale is not None:
-            scale = torch.exp(log_scale)
-            scale_penalty = F.relu(self.min_radius - scale) + F.relu(scale - self.max_radius)
-            losses['scale'] = scale_penalty.mean()
+            scale_val = torch.exp(log_scale)
+            scale_penalty = F.relu(self.min_radius - scale_val) + F.relu(scale_val - self.max_radius)
+            losses['scale_reg'] = scale_penalty.mean()
         else:
-            losses['scale'] = torch.tensor(0.0, device=device)
+            losses['scale_reg'] = torch.tensor(0.0, device=device)
         
-        # Total
+        # =====================================================================
+        # TOTAL
+        # =====================================================================
         total = (
             self.count_weight * losses['count'] +
             self.spatial_weight * losses['spatial'] +
-            self.scale_weight * losses['scale']
+            self.scale_loss_weight * losses['scale_reg']
         )
         
         losses['total'] = total
         losses['gt_counts'] = gt_counts
-        losses['pred_counts'] = pred_counts
+        losses['pred_counts'] = pred_counts_scale1
         
         return losses
 
+
+# =============================================================================
+# ENHANCED TRANSFORMS - FIX V8.1 per device mismatch
+# =============================================================================
+
+class EnhancedTransformsV8:
+    """
+    Augmentation potenziate per V8.
+    
+    Nota: Questo wrapper viene usato DOPO le transforms standard del progetto.
+    Applica augmentation addizionali solo su immagini (non su density/points).
+    
+    FIX V8.1: mean/std vengono spostati sul device corretto dell'immagine
+    """
+    
+    def __init__(self, cfg):
+        data_cfg = cfg.get('DATA', {})
+        
+        # Color jitter
+        cj_cfg = data_cfg.get('COLOR_JITTER', {})
+        self.use_color_jitter = cj_cfg.get('ENABLED', False) if isinstance(cj_cfg, dict) else False
+        if self.use_color_jitter:
+            self.color_jitter = T.ColorJitter(
+                brightness=cj_cfg.get('BRIGHTNESS', 0.2),
+                contrast=cj_cfg.get('CONTRAST', 0.2),
+                saturation=cj_cfg.get('SATURATION', 0.2),
+                hue=cj_cfg.get('HUE', 0.1),
+            )
+        
+        # Random grayscale
+        self.gray_prob = data_cfg.get('RANDOM_GRAY_PROB', 0.0)
+        
+        # Gaussian blur
+        blur_cfg = data_cfg.get('GAUSSIAN_BLUR', {})
+        self.use_blur = blur_cfg.get('ENABLED', False) if isinstance(blur_cfg, dict) else False
+        self.blur_prob = blur_cfg.get('PROB', 0.1) if isinstance(blur_cfg, dict) else 0.1
+        self.blur_kernels = blur_cfg.get('KERNEL_SIZE', [3, 5]) if isinstance(blur_cfg, dict) else [3, 5]
+        
+        # Pre-registra mean/std come tensori base (verranno spostati su device al primo uso)
+        self._mean_base = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self._std_base = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        self._device_cache = None
+        self._mean = None
+        self._std = None
+    
+    def _ensure_device(self, device):
+        """Sposta mean/std sul device corretto (con caching)."""
+        if self._device_cache != device:
+            self._mean = self._mean_base.to(device)
+            self._std = self._std_base.to(device)
+            self._device_cache = device
+    
+    def __call__(self, image):
+        """
+        Applica augmentation solo sull'immagine.
+        Input: Tensor [C, H, W] normalizzato (può essere su GPU)
+        Output: Tensor [C, H, W] con augmentation (stesso device dell'input)
+        """
+        device = image.device
+        
+        # Sposta mean/std sul device corretto (cached)
+        self._ensure_device(device)
+        
+        # Denormalizza per applicare trasformazioni
+        image = image * self._std + self._mean
+        image = image.clamp(0, 1)
+        
+        # Color jitter (richiede PIL, quindi sposta su CPU temporaneamente)
+        if self.use_color_jitter and random.random() < 0.8:
+            image_cpu = image.cpu()
+            image_pil = TF.to_pil_image(image_cpu)
+            image_pil = self.color_jitter(image_pil)
+            image = TF.to_tensor(image_pil).to(device)
+        
+        # Random grayscale
+        if self.gray_prob > 0 and random.random() < self.gray_prob:
+            image = TF.rgb_to_grayscale(image, num_output_channels=3)
+        
+        # Gaussian blur
+        if self.use_blur and random.random() < self.blur_prob:
+            kernel_size = random.choice(self.blur_kernels)
+            image = TF.gaussian_blur(image, kernel_size=[kernel_size, kernel_size])
+        
+        # Rinormalizza (usa mean/std già sul device corretto)
+        image = (image - self._mean) / self._std
+        
+        return image
+
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
 
 @torch.no_grad()
 def validate(model, val_loader, device, default_down):
@@ -387,18 +345,34 @@ def validate(model, val_loader, device, default_down):
     return {'mae': mae, 'rmse': rmse}
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device, default_down, epoch, grad_clip=1.0):
-    """Training di una epoca."""
+# =============================================================================
+# TRAINING
+# =============================================================================
+
+def train_epoch(
+    model, train_loader, optimizer, criterion, 
+    device, default_down, epoch, 
+    grad_clip=1.0, augment_fn=None
+):
+    """Training di una epoca con multi-scale loss."""
     model.train()
     
     loss_meter = AverageMeter()
     mae_meter = AverageMeter()
+    count_s1_meter = AverageMeter()
+    count_s2_meter = AverageMeter()
+    count_s4_meter = AverageMeter()
     
     pbar = tqdm(train_loader, desc=f"Stage2 V8 [Ep {epoch}]")
     
     for images, densities, points in pbar:
         images = images.to(device)
         points_list = [p.to(device) for p in points]
+        
+        # Applica augmentation addizionale (V8)
+        # Nota: images è già su device, augment_fn gestisce il device correttamente
+        if augment_fn is not None:
+            images = torch.stack([augment_fn(img) for img in images])
         
         _, _, H_in, W_in = images.shape
         
@@ -413,8 +387,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, default_down,
         down_h, down_w = down_tuple
         cell_area = down_h * down_w
         
-        # Loss
-        losses = criterion(pred, points_list, cell_area, log_scale)
+        # Multi-scale loss
+        losses = criterion(pred, points_list, cell_area, H_in, W_in, log_scale)
         loss = losses['total']
         
         # Backward
@@ -432,12 +406,27 @@ def train_epoch(model, train_loader, optimizer, criterion, device, default_down,
         loss_meter.update(loss.item())
         mae_meter.update(mae)
         
+        # Loss per scala
+        if 'count_s1' in losses:
+            count_s1_meter.update(losses['count_s1'])
+        if 'count_s2' in losses:
+            count_s2_meter.update(losses['count_s2'])
+        if 'count_s4' in losses:
+            count_s4_meter.update(losses['count_s4'])
+        
         pbar.set_postfix({
             'L': f"{loss_meter.avg:.3f}",
-            'MAE': f"{mae_meter.avg:.1f}"
+            'MAE': f"{mae_meter.avg:.1f}",
+            's1': f"{count_s1_meter.avg:.1f}" if count_s1_meter.count > 0 else "-",
         })
     
-    return {'loss': loss_meter.avg, 'mae': mae_meter.avg}
+    return {
+        'loss': loss_meter.avg, 
+        'mae': mae_meter.avg,
+        'count_s1': count_s1_meter.avg,
+        'count_s2': count_s2_meter.avg,
+        'count_s4': count_s4_meter.avg,
+    }
 
 
 def get_lr(optimizer):
@@ -445,6 +434,10 @@ def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     import argparse
@@ -473,12 +466,17 @@ def main():
     lr_backbone = float(p2r_cfg.get('LR_BACKBONE', 1e-6))
     default_down = data_cfg.get('P2R_DOWNSAMPLE', 8)
     
+    # Multi-scale config
+    use_multi_scale = loss_cfg.get('USE_MULTI_SCALE', True)
+    scales = loss_cfg.get('SCALES', [1, 2, 4])
+    scale_weights = loss_cfg.get('SCALE_WEIGHTS', [1.0, 0.5, 0.25])
+    
     run_name = cfg.get('RUN_NAME', 'p2r_zip_v8')
     output_dir = os.path.join(cfg["EXP"]["OUT_DIR"], run_name)
     os.makedirs(output_dir, exist_ok=True)
     
     print("=" * 60)
-    print("🚀 Stage 2 V8 - P2R Training Potenziato")
+    print("🚀 Stage 2 V8.1 - Multi-Scale Loss + Augmentation (FIXED)")
     print("=" * 60)
     print(f"Config: {args.config}")
     print(f"Device: {device}")
@@ -487,12 +485,14 @@ def main():
     print(f"LR: {lr}, LR backbone: {lr_backbone}")
     print(f"Patience: {patience}")
     print(f"Grad clip: {grad_clip}")
+    print(f"Multi-scale: {use_multi_scale}")
+    if use_multi_scale:
+        print(f"  Scales: {scales}")
+        print(f"  Weights: {scale_weights}")
     print(f"Output: {output_dir}")
     print("=" * 60)
     
-    # Dataset con augmentation potenziate
-    # Nota: usiamo le transform standard del progetto, le augmentation
-    # sono configurate nel config
+    # Dataset
     from datasets.transforms import build_transforms
     
     train_tf = build_transforms(data_cfg, is_train=True)
@@ -533,6 +533,13 @@ def main():
     print(f"Train samples: {len(train_ds)}")
     print(f"Val samples: {len(val_ds)}")
     
+    # Augmentation addizionale V8
+    augment_fn = EnhancedTransformsV8(cfg)
+    print(f"\nV8 Augmentation:")
+    print(f"  Color Jitter: {augment_fn.use_color_jitter}")
+    print(f"  Grayscale prob: {augment_fn.gray_prob}")
+    print(f"  Blur: {augment_fn.use_blur} (prob={augment_fn.blur_prob})")
+    
     # Modello
     bin_config = cfg["BINS_CONFIG"][cfg["DATASET"]]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
@@ -552,26 +559,48 @@ def main():
         },
     ).to(device)
     
-    # Carica Stage 1 checkpoint
-    stage1_path = os.path.join(output_dir, "best_model.pth")
+    # =========================================================================
+    # FIX V8.1: Carica Stage 1 checkpoint con priorità corretta
+    # =========================================================================
+    # Cerca checkpoint in ordine di priorità:
+    # 1. best_model.pth (output di Stage 1)
+    # 2. stage1_best.pth (nome alternativo)
+    # 3. Prova anche nella cartella V7 se non trovato
     
-    # Prova anche nella cartella V7 se V8 non ha Stage 1
-    if not os.path.isfile(stage1_path):
-        v7_path = os.path.join(cfg["EXP"]["OUT_DIR"], "shha_target60_v7", "stage1_best.pth")
-        if os.path.isfile(v7_path):
-            stage1_path = v7_path
-            print(f"⚠️ Usando Stage 1 da V7: {v7_path}")
+    stage1_loaded = False
+    stage1_candidates = [
+        os.path.join(output_dir, "best_model.pth"),           # Nome corretto Stage 1
+        os.path.join(output_dir, "stage1_best.pth"),          # Nome alternativo
+        os.path.join(output_dir, "last.pth"),                 # Last checkpoint
+    ]
     
-    if os.path.isfile(stage1_path):
-        state = torch.load(stage1_path, map_location=device)
-        if "model" in state:
-            state = state["model"]
-        model.load_state_dict(state, strict=False)
-        print(f"✅ Caricato Stage 1 da {stage1_path}")
-    else:
-        print(f"⚠️ Stage 1 non trovato, training da zero")
+    # Aggiungi anche path V7 come fallback
+    v7_dir = os.path.join(cfg["EXP"]["OUT_DIR"], "shha_target60_v7")
+    stage1_candidates.extend([
+        os.path.join(v7_dir, "best_model.pth"),
+        os.path.join(v7_dir, "stage1_best.pth"),
+    ])
+    
+    for stage1_path in stage1_candidates:
+        if os.path.isfile(stage1_path):
+            try:
+                state = torch.load(stage1_path, map_location=device)
+                if "model" in state:
+                    state = state["model"]
+                model.load_state_dict(state, strict=False)
+                print(f"✅ Caricato Stage 1 da: {stage1_path}")
+                stage1_loaded = True
+                break
+            except Exception as e:
+                print(f"⚠️ Errore caricamento {stage1_path}: {e}")
+                continue
+    
+    if not stage1_loaded:
+        print("⚠️ Stage 1 non trovato, training da zero")
+        print(f"   Cercato in: {stage1_candidates[:3]}")
     
     # Setup optimizer
+    print("\n🔧 Setup parametri:")
     param_groups = []
     
     # Backbone
@@ -612,19 +641,20 @@ def main():
     # Scheduler con warmup
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
-            return epoch / warmup_epochs
+            return (epoch + 1) / warmup_epochs
         else:
-            # Cosine decay
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
+            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
             return 0.5 * (1 + np.cos(np.pi * progress))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Loss
-    criterion = P2RLossV8(
+    # Multi-scale loss
+    criterion = MultiScaleP2RLoss(
+        scales=scales if use_multi_scale else [1],
+        scale_weights=scale_weights if use_multi_scale else [1.0],
         count_weight=loss_cfg.get('COUNT_WEIGHT', 2.0),
         spatial_weight=loss_cfg.get('SPATIAL_WEIGHT', 0.15),
-        scale_weight=loss_cfg.get('SCALE_WEIGHT', 0.5),
+        scale_loss_weight=loss_cfg.get('SCALE_WEIGHT', 0.5),
         min_radius=loss_cfg.get('MIN_RADIUS', 8.0),
         max_radius=loss_cfg.get('MAX_RADIUS', 64.0),
     )
@@ -655,6 +685,7 @@ def main():
     
     # Training loop
     print(f"\n🚀 START Training: {epochs} epochs")
+    print(f"   Baseline MAE: {best_mae:.2f}")
     print(f"   Target: MAE < 65.0")
     print()
     
@@ -662,7 +693,8 @@ def main():
         # Train
         train_results = train_epoch(
             model, train_loader, optimizer, criterion,
-            device, default_down, epoch, grad_clip
+            device, default_down, epoch, grad_clip,
+            augment_fn=augment_fn
         )
         
         scheduler.step()
@@ -716,7 +748,7 @@ def main():
     
     # Risultati finali
     print("\n" + "=" * 60)
-    print("🏁 STAGE 2 V8 COMPLETATO")
+    print("🏁 STAGE 2 V8.1 COMPLETATO")
     print("=" * 60)
     print(f"   Best MAE: {best_mae:.2f}")
     print(f"   Checkpoint: {output_dir}/stage2_best.pth")
@@ -724,11 +756,12 @@ def main():
     if best_mae < 65:
         print(f"   🎉 OBIETTIVO RAGGIUNTO! MAE < 65")
     elif best_mae < 68:
-        print(f"   ✅ Buon miglioramento rispetto a V7 (68.97)")
+        print(f"   ✅ Miglioramento rispetto a V7 (68.97)")
     else:
-        print(f"   ⚠️ Margine di miglioramento limitato")
+        print(f"   ⚠️ Performance simile a V7")
     
     print("=" * 60)
+    print(f"\n📌 Prossimo step: python train_stage3.py per bias correction")
 
 
 if __name__ == "__main__":

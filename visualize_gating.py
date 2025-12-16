@@ -298,7 +298,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualizza le mappe di gating P2R-ZIP.")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Percorso del checkpoint da caricare. Se omesso usa RUN_NAME/OUT_DIR da config.")
-    parser.add_argument("--stage", type=str, default="stage3",
+    parser.add_argument("--stage", type=str, default="stage2",
                         help="Stage di riferimento (1/2/3/4 oppure stage1/stage2/stage3/stage4).")
     parser.add_argument("--index", type=int, default=None,
                         help="Indice del campione di validazione da visualizzare (default: random).")

@@ -1,4 +1,23 @@
-# evaluate_stage1.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Evaluation Stage 1 - ZIP Pre-training
+
+METRICHE CALCOLATE:
+1. Loss (BCE)
+2. Accuracy: (TP + TN) / (TP + TN + FP + FN)
+3. Precision: TP / (TP + FP)
+4. Recall: TP / (TP + FN)
+5. F1-Score: 2 * (Precision * Recall) / (Precision + Recall)
+6. Coverage: % blocchi predetti come "pieni"
+
+dove:
+- TP: True Positives (blocchi pieni correttamente identificati)
+- TN: True Negatives (blocchi vuoti correttamente identificati)
+- FP: False Positives (blocchi vuoti predetti come pieni)
+- FN: False Negatives (blocchi pieni predetti come vuoti)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,16 +26,20 @@ from tqdm import tqdm
 import yaml
 import os
 import numpy as np
+import json
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
 
-# ============================================================
-# LOSS DI VALIDAZIONE (BCE - STESSA DEL TRAINING)
-# ============================================================
+
+# =============================================================================
+# LOSS (STESSA DEL TRAINING)
+# =============================================================================
+
 class PiHeadLoss(nn.Module):
+    """BCE Loss per π-head."""
     def __init__(self, pos_weight=5.0, block_size=16):
         super().__init__()
         self.pos_weight = pos_weight
@@ -50,70 +73,236 @@ class PiHeadLoss(nn.Module):
         loss = self.bce(logit_pieno, gt_occupancy)
         return loss
 
+
+# =============================================================================
+# VALIDATION CON METRICHE COMPLETE
+# =============================================================================
+
 @torch.no_grad()
-def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path):
+def validate_with_metrics(model, criterion, dataloader, device, config):
     """
-    Validazione Stage 1 (BCE Mode).
-    Monitora principalmente la Loss BCE e l'Active Ratio della maschera.
+    Validazione Stage 1 con metriche dettagliate.
+    
+    Returns:
+        dict con tutte le metriche
     """
     model.eval()
+    
     total_loss = 0.0
-    mae, mse = 0.0, 0.0
-    pi_active_stats = []
-
-    print("\n===== VALUTAZIONE STAGE 1 (BCE) =====")
-    print("Metrica Principale: BCE Loss & Active Ratio (Maschera)")
-    print("------------------------------------------------------")
-
-    progress_bar = tqdm(dataloader, desc="Validating ZIP Stage 1")
-
-    for idx, (images, gt_density, _) in enumerate(progress_bar):
+    
+    # Confusion Matrix
+    total_tp = 0  # True Positives
+    total_tn = 0  # True Negatives  
+    total_fp = 0  # False Positives
+    total_fn = 0  # False Negatives
+    
+    # Statistiche π
+    pi_mean_list = []
+    pi_std_list = []
+    coverage_list = []
+    
+    # Per MAE indicativo (non affidabile in Stage 1)
+    total_mae = 0.0
+    total_pred_count = 0.0
+    total_gt_count = 0.0
+    n_samples = 0
+    
+    block_size = config["DATA"]["ZIP_BLOCK_SIZE"]
+    
+    for images, gt_density, points in tqdm(dataloader, desc="Validate Stage1"):
         images, gt_density = images.to(device), gt_density.to(device)
-
+        
+        # Forward
         preds = model(images)
         loss = criterion(preds, gt_density)
         total_loss += loss.item()
-
-        # Statistiche Maschera
-        pi_logits = preds["logit_pi_maps"]
-        pi_probs = torch.sigmoid(pi_logits[:, 1:2]) # Probabilità "pieno"
         
-        active_ratio = (pi_probs > 0.5).float().mean().item() * 100
-        pi_active_stats.append(active_ratio)
+        # π predictions
+        pi_logits = preds["logit_pi_maps"]  # [B, 2, Hb, Wb]
+        pi_probs = torch.sigmoid(pi_logits[:, 1:2])  # Prob "pieno"
+        
+        # Ground truth occupancy
+        gt_counts_per_block = F.avg_pool2d(
+            gt_density,
+            kernel_size=block_size,
+            stride=block_size
+        ) * (block_size ** 2)
+        gt_occupancy = (gt_counts_per_block > 0.5).float()
+        
+        # Allinea dimensioni
+        if gt_occupancy.shape[-2:] != pi_probs.shape[-2:]:
+            gt_occupancy = F.interpolate(
+                gt_occupancy, 
+                size=pi_probs.shape[-2:], 
+                mode='nearest'
+            )
+        
+        # Predizioni binarie (threshold 0.5)
+        pred_occupancy = (pi_probs > 0.5).float()
+        
+        # Confusion matrix per batch
+        tp = ((pred_occupancy == 1) & (gt_occupancy == 1)).sum().item()
+        tn = ((pred_occupancy == 0) & (gt_occupancy == 0)).sum().item()
+        fp = ((pred_occupancy == 1) & (gt_occupancy == 0)).sum().item()
+        fn = ((pred_occupancy == 0) & (gt_occupancy == 1)).sum().item()
+        
+        total_tp += tp
+        total_tn += tn
+        total_fp += fp
+        total_fn += fn
+        
+        # Statistiche π
+        pi_mean_list.append(pi_probs.mean().item())
+        pi_std_list.append(pi_probs.std().item())
+        coverage_list.append((pi_probs > 0.5).float().mean().item() * 100)
+        
+        # MAE indicativo (usando λ maps)
+        lambda_maps = preds.get("lambda_maps")
+        if lambda_maps is not None:
+            pred_count_map = pi_probs * lambda_maps
+            
+            for idx, pts in enumerate(points):
+                gt = len(pts) if pts is not None else 0
+                pred = pred_count_map[idx].sum().item()
+                
+                total_mae += abs(pred - gt)
+                total_pred_count += pred
+                total_gt_count += gt
+                n_samples += 1
+    
+    # =========================================================================
+    # CALCOLA METRICHE AGGREGATE
+    # =========================================================================
+    
+    n_batches = len(dataloader)
+    avg_loss = total_loss / n_batches
+    
+    # Classification metrics
+    total_samples = total_tp + total_tn + total_fp + total_fn
+    
+    accuracy = (total_tp + total_tn) / max(total_samples, 1)
+    precision = total_tp / max(total_tp + total_fp, 1)
+    recall = total_tp / max(total_tp + total_fn, 1)
+    f1_score = 2 * (precision * recall) / max(precision + recall, 1e-6)
+    
+    # π statistics
+    avg_pi_mean = np.mean(pi_mean_list)
+    avg_pi_std = np.mean(pi_std_list)
+    avg_coverage = np.mean(coverage_list)
+    
+    # MAE (solo indicativo)
+    mae = total_mae / n_samples if n_samples > 0 else 0
+    bias = total_pred_count / total_gt_count if total_gt_count > 0 else 0
+    
+    # =========================================================================
+    # REPORT DETTAGLIATO
+    # =========================================================================
+    
+    print("\n" + "="*70)
+    print("📊 STAGE 1 VALIDATION RESULTS")
+    print("="*70)
+    
+    print(f"\n🔢 Confusion Matrix:")
+    print(f"   True Positives (TP):   {total_tp:,}")
+    print(f"   True Negatives (TN):   {total_tn:,}")
+    print(f"   False Positives (FP):  {total_fp:,}")
+    print(f"   False Negatives (FN):  {total_fn:,}")
+    print(f"   Total blocks:          {total_samples:,}")
+    
+    print(f"\n📈 Classification Metrics:")
+    print(f"   Accuracy:  {accuracy*100:.2f}%")
+    print(f"   Precision: {precision*100:.2f}%")
+    print(f"   Recall:    {recall*100:.2f}%")
+    print(f"   F1-Score:  {f1_score*100:.2f}%")
+    
+    print(f"\n🎯 π-Head Statistics:")
+    print(f"   Loss (BCE):      {avg_loss:.4f}")
+    print(f"   π Mean:          {avg_pi_mean:.3f}")
+    print(f"   π Std:           {avg_pi_std:.3f}")
+    print(f"   Coverage:        {avg_coverage:.1f}%")
+    
+    print(f"\n📊 Count Metrics (Indicativo):")
+    print(f"   MAE (π·λ):       {mae:.2f}")
+    print(f"   Bias:            {bias:.3f}")
+    print(f"   ⚠️  Non affidabile in Stage 1 - solo per monitoring")
+    
+    print("\n" + "="*70)
+    
+    # =========================================================================
+    # INTERPRETAZIONE
+    # =========================================================================
+    
+    print("\n💡 Interpretazione:")
+    
+    if recall < 0.85:
+        print(f"   ⚠️  Recall basso ({recall*100:.1f}%)")
+        print(f"       → Il modello perde troppi blocchi con persone (FN alto)")
+        print(f"       → Soluzione: aumentare pos_weight in BCE")
+    elif recall > 0.95:
+        print(f"   ✅ Recall alto ({recall*100:.1f}%)")
+        print(f"       → Buona copertura dei blocchi occupati")
+    
+    if precision < 0.70:
+        print(f"   ⚠️  Precision bassa ({precision*100:.1f}%)")
+        print(f"       → Troppi falsi positivi (FP alto)")
+        print(f"       → Il modello predice persone dove non ci sono")
+    elif precision > 0.85:
+        print(f"   ✅ Precision alta ({precision*100:.1f}%)")
+        print(f"       → Poche false detection")
+    
+    if f1_score > 0.80:
+        print(f"   🎯 F1-Score alto ({f1_score*100:.1f}%)")
+        print(f"       → Buon bilanciamento precision/recall")
+    elif f1_score < 0.70:
+        print(f"   ⚠️  F1-Score basso ({f1_score*100:.1f}%)")
+        print(f"       → Sbilanciamento tra precision e recall")
+    
+    if avg_coverage < 10:
+        print(f"   ⚠️  Coverage molto bassa ({avg_coverage:.1f}%)")
+        print(f"       → Il modello è troppo conservativo")
+    elif avg_coverage > 40:
+        print(f"   ⚠️  Coverage molto alta ({avg_coverage:.1f}%)")
+        print(f"       → Il modello è troppo aggressivo")
+    else:
+        print(f"   ✅ Coverage ragionevole ({avg_coverage:.1f}%)")
+    
+    print("\n" + "="*70)
+    
+    # =========================================================================
+    # RETURN RESULTS
+    # =========================================================================
+    
+    return {
+        'loss': avg_loss,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
+        'confusion_matrix': {
+            'tp': total_tp,
+            'tn': total_tn,
+            'fp': total_fp,
+            'fn': total_fn,
+        },
+        'pi_stats': {
+            'mean': avg_pi_mean,
+            'std': avg_pi_std,
+            'coverage': avg_coverage,
+        },
+        'count_metrics': {
+            'mae': mae,
+            'bias': bias,
+        }
+    }
 
-        # Calcolo conteggio (solo indicativo, lambda non è allenato)
-        lam_maps = preds["lambda_maps"]
-        pred_count = torch.sum(pi_probs * lam_maps).item()
-        gt_count = torch.sum(gt_density).item()
 
-        mae += abs(pred_count - gt_count)
-        mse += (pred_count - gt_count) ** 2
-
-        if idx % 20 == 0:
-            print(f"[IMG {idx:03d}] Loss(BCE)={loss.item():.4f} "
-                  f"| π>0.5={active_ratio:.1f}% "
-                  f"| π_mean={pi_probs.mean().item():.3f}")
-
-        progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'active': f"{active_ratio:.1f}%"
-        })
-
-    avg_loss = total_loss / len(dataloader)
-    avg_mae = mae / len(dataloader.dataset)
-    avg_active = np.mean(pi_active_stats)
-
-    print("\n--- RISULTATI FINALI ---")
-    print(f"Checkpoint:      {os.path.basename(checkpoint_path)}")
-    print(f"Validation Loss: {avg_loss:.4f} (BCE)")
-    print(f"Avg Active Mask: {avg_active:.2f}% (Target: 10-30% per folle sparse)")
-    print(f"MAE (Proxy):     {avg_mae:.2f} (⚠️ Non affidabile in Stage 1)")
-    print("-------------------------------------\n")
-
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     if not os.path.exists("config.yaml"):
-        print("❌ config.yaml non trovato.")
+        print("❌ config.yaml non trovato")
         return
         
     with open("config.yaml", 'r') as f:
@@ -121,6 +310,12 @@ def main():
 
     device = torch.device(config['DEVICE'])
     init_seeds(config['SEED'])
+
+    print("="*60)
+    print("🔍 EVALUATION STAGE 1 - ZIP Pre-training")
+    print("="*60)
+    print(f"Device: {device}")
+    print("="*60)
 
     # Setup Modello
     dataset_name = config['DATASET']
@@ -147,22 +342,22 @@ def main():
 
     # Caricamento Checkpoint
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
-    # Cerca prima il best_model, poi last.pth
+    
+    # Cerca checkpoint
     checkpoint_path = os.path.join(output_dir, "best_model.pth")
     if not os.path.exists(checkpoint_path):
         checkpoint_path = os.path.join(output_dir, "last.pth")
 
     if not os.path.isfile(checkpoint_path):
-        print(f"❌ Errore: Nessun checkpoint trovato in {output_dir}")
+        print(f"❌ Nessun checkpoint trovato in {output_dir}")
         return
 
-    print(f"✅ Caricamento checkpoint da {checkpoint_path}...")
+    print(f"\n✅ Caricamento checkpoint: {checkpoint_path}")
     raw_state = torch.load(checkpoint_path, map_location=device)
     state_dict = raw_state.get('model', raw_state)
     model.load_state_dict(state_dict, strict=False)
-    print("✅ Modello caricato.")
 
-    # Setup Loss (BCE)
+    # Setup Loss
     pos_weight = config.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
     criterion = PiHeadLoss(
         pos_weight=pos_weight,
@@ -173,6 +368,7 @@ def main():
     DatasetClass = get_dataset(config['DATASET'])
     data_cfg = config['DATA']
     val_tf = build_transforms(data_cfg, is_train=False)
+    
     val_dataset = DatasetClass(
         root=data_cfg['ROOT'],
         split=data_cfg['VAL_SPLIT'],
@@ -188,7 +384,45 @@ def main():
         collate_fn=collate_fn
     )
 
-    validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
+    print(f"\nValidation samples: {len(val_dataset)}")
+
+    # Validazione
+    results = validate_with_metrics(model, criterion, val_loader, device, config)
+
+    # Salva metriche
+    metrics_path = os.path.join(output_dir, "stage1_metrics.json")
+    
+    # Converti per JSON
+    results_json = {
+        'loss': float(results['loss']),
+        'accuracy': float(results['accuracy']),
+        'precision': float(results['precision']),
+        'recall': float(results['recall']),
+        'f1_score': float(results['f1_score']),
+        'confusion_matrix': results['confusion_matrix'],
+        'pi_stats': {k: float(v) for k, v in results['pi_stats'].items()},
+        'count_metrics': {k: float(v) for k, v in results['count_metrics'].items()},
+    }
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(results_json, f, indent=2)
+    
+    print(f"\n💾 Metriche salvate in: {metrics_path}")
+    
+    # Summary
+    print(f"\n📋 SUMMARY:")
+    print(f"   Accuracy:  {results['accuracy']*100:.2f}%")
+    print(f"   Precision: {results['precision']*100:.2f}%")
+    print(f"   Recall:    {results['recall']*100:.2f}%")
+    print(f"   F1-Score:  {results['f1_score']*100:.2f}%")
+    
+    if results['f1_score'] > 0.80 and results['recall'] > 0.90:
+        print(f"\n   ✅ Stage 1 performance eccellente!")
+    elif results['f1_score'] > 0.70:
+        print(f"\n   ✅ Stage 1 performance buona")
+    else:
+        print(f"\n   ⚠️  Stage 1 necessita miglioramenti")
+
 
 if __name__ == '__main__':
     main()

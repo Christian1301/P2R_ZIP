@@ -11,9 +11,9 @@ echo "🚀 Avvio Stage 2 (P2R)..."
 python3 train_stage2_p2r.py --config config.yaml --resume  > logs/stage2.log 2>&1
 echo "✅ Stage 2 completato!"
 
-echo "🚀 Avvio Stage 3 (JOINT)..."
-python3 train_stage3_joint.py  > logs/stage3.log 2>&1
-echo "✅ Stage 3 completato!"
+#echo "🚀 Avvio Stage 3 (JOINT)..."
+#python3 train_stage3_joint.py  > logs/stage3.log 2>&1
+#echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."
 
@@ -23,8 +23,11 @@ echo "✅ Valutazione 1 completata!"
 python3 evaluate_stage2.py > logs/ev_stage2.log 2>&1
 echo "✅ Valutazione 2 completata!"
 
-python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
-echo "✅ Valutazione 3 completata!"
+python3 tune_alpha.py > logs/tune_alpha.log 2>&1
+echo "✅ Tuning alpha completato!"
 
-python3 visualize_gating.py > logs/visualize_gating.log 2>&1
-echo "✅ Visualizzazione completata!"
+#python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
+#echo "✅ Valutazione 3 completata!"
+
+#python3 visualize_gating.py > logs/visualize_gating.log 2>&1
+#echo "✅ Visualizzazione completata!"

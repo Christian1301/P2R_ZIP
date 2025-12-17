@@ -1,184 +1,162 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Evaluation Stage 2 - SENZA ri-calibrazione
+
+⚠️ CRITICO: Usa log_scale dal checkpoint, NON ri-calibrare!
+"""
+
 import os
 import yaml
 import torch
-import numpy as np
-from tqdm import tqdm
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from losses.p2r_region_loss import P2RLossFixed
-from train_utils import (
-    collate_fn,
-    init_seeds,
-    calibrate_density_scale_v2 as calibrate_density_scale,
-)
+from train_utils import init_seeds, collate_fn, canonicalize_p2r_grid
 
 
 @torch.no_grad()
-def evaluate_p2r(model, loader, loss_fn, device, cfg):
-    """
-    Valutazione Stage 2:
-    - Supporta P2RHead con ReLU/(upscale²)
-    - Calcola conteggi corretti anche se la densità è upsamplata all'input
-    - Mostra statistiche diagnostiche dettagliate
-    """
+def validate_stage2(model, dataloader, device, default_down):
+    """Validazione IDENTICA al training."""
     model.eval()
-    total_loss, mae_errors, mse_errors = 0.0, 0.0, 0.0
-    total_pred, total_gt = 0.0, 0.0
-    default_down = cfg["DATA"].get("P2R_DOWNSAMPLE", 8)
-
-    for images, _, points in tqdm(loader, desc="[Validating Stage 2]"):
+    
+    all_mae = []
+    all_mse = []
+    total_pred = 0.0
+    total_gt = 0.0
+    
+    for images, gt_density, points in tqdm(dataloader, desc="Validate"):
         images = images.to(device)
-        points_list = [p.to(device) for p in points]
-        out = model(images)
-        pred_density = out.get("p2r_density", out.get("density"))
-        if pred_density is None:
-            raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
-
-        B, _, H_out, W_out = pred_density.shape
+        points_list = points
+        
+        # Forward - IDENTICO al training
+        outputs = model(images)
+        pred = outputs['p2r_density']
+        
         _, _, H_in, W_in = images.shape
-
-        if H_out == H_in and W_out == W_in:
-            down_h = down_w = float(default_down)
-        else:
-            down_h = H_in / max(H_out, 1)
-            down_w = W_in / max(W_out, 1)
-
-        if (abs(H_in - down_h * H_out) > 1.0 or abs(W_in - down_w * W_out) > 1.0) and not hasattr(evaluate_p2r, "_shape_warned"):
-            print(f"⚠️ Downsample non intero rilevato: input {H_in}x{W_in}, output {H_out}x{W_out}, "
-                  f"down_h={down_h:.4f}, down_w={down_w:.4f}")
-            evaluate_p2r._shape_warned = True
-
-        down_tuple = (down_h, down_w)
-        loss = loss_fn(pred_density, points_list, down=down_tuple)
-        total_loss += loss.item()
-
-        if H_out == H_in and W_out == W_in:
-            pred_count = torch.sum(pred_density, dim=(1, 2, 3))
-        else:
-            cell_area = down_h * down_w
-            pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
-
-        gt_count = torch.tensor([len(p) for p in points_list], dtype=torch.float32, device=device)
-        if not hasattr(evaluate_p2r, "_debug_done"):
-            print("===== DEBUG STAGE 2 =====")
-            print(f"Input size: {H_in}x{W_in}")
-            print(f"Output size: {H_out}x{W_out}")
-            print(f"Downsampling factor: ({down_h:.2f}x, {down_w:.2f}x)")
-            print(f"Density map range: [{pred_density.min().item():.4f}, {pred_density.max().item():.4f}]")
-            print(f"Mean density: {pred_density.mean().item():.6f}")
-            print(f"[DEBUG] Pred count (scaled): {pred_count[0].item():.2f}, GT count: {gt_count[0].item():.2f}")
-            print("=========================")
-            evaluate_p2r._debug_done = True
-
-        abs_diff = torch.abs(pred_count - gt_count)
-        mae_errors += abs_diff.sum().item()
-        mse_errors += ((pred_count - gt_count) ** 2).sum().item()
-        total_pred += pred_count.sum().item()
-        total_gt += gt_count.sum().item()
-
-    n = len(loader.dataset)
-    avg_loss = total_loss / len(loader)
-    mae = mae_errors / n
-    rmse = np.sqrt(mse_errors / n)
-    print("\n===== RISULTATI FINALI STAGE 2 =====")
-    print(f"Validation Loss: {avg_loss:.4f}")
-    print(f"MAE: {mae:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    if total_gt > 0:
-        bias = total_pred / total_gt
-        print(f"Pred / GT ratio: {bias:.3f} (tot_pred={total_pred:.1f}, tot_gt={total_gt:.1f})")
-    print("=====================================\n")
-
-    return avg_loss, mae, rmse, total_pred, total_gt
+        
+        # Canonicalize - IDENTICO al training
+        pred, down_tuple, _ = canonicalize_p2r_grid(pred, (H_in, W_in), default_down)
+        
+        down_h, down_w = down_tuple
+        cell_area = down_h * down_w
+        
+        # Calcolo MAE - IDENTICO al training
+        for i, pts in enumerate(points_list):
+            gt = len(pts) if pts is not None else 0
+            pred_count = (pred[i].sum() / cell_area).item()
+            
+            all_mae.append(abs(pred_count - gt))
+            all_mse.append((pred_count - gt) ** 2)
+            
+            total_pred += pred_count
+            total_gt += gt
+    
+    mae = np.mean(all_mae)
+    rmse = np.sqrt(np.mean(all_mse))
+    bias = total_pred / total_gt if total_gt > 0 else 0
+    
+    return {'mae': mae, 'rmse': rmse, 'bias': bias}
 
 
 def main():
-    with open("config.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-    device = torch.device(cfg["DEVICE"])
-    init_seeds(cfg["SEED"])
-    print(f"✅ Avvio valutazione Stage 2 su {device}")
-
-    DatasetClass = get_dataset(cfg["DATASET"])
-    data_cfg = cfg["DATA"]
-    transforms = build_transforms(data_cfg, is_train=False)
-    val_ds = DatasetClass(
-        root=data_cfg["ROOT"],
-        split=data_cfg["VAL_SPLIT"],
-        block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=transforms
+    with open('config.yaml') as f:
+        config = yaml.safe_load(f)
+    
+    device = torch.device(config['DEVICE'])
+    init_seeds(config['SEED'])
+    
+    print("="*60)
+    print("🔍 EVALUATION STAGE 2 (Allineato)")
+    print("="*60)
+    
+    # Setup modello
+    data_cfg = config['DATA']
+    bin_config = config['BINS_CONFIG'][config['DATASET']]
+    
+    zip_head_cfg = config.get('ZIP_HEAD', {})
+    
+    model = P2R_ZIP_Model(
+        bins=bin_config['bins'],
+        bin_centers=bin_config['bin_centers'],
+        backbone_name=config['MODEL']['BACKBONE'],
+        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
+        gate=config['MODEL']['GATE'],
+        upsample_to_input=False,
+        use_ste_mask=True,
+        zip_head_kwargs={
+            'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
+            'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
+            'use_softplus': zip_head_cfg.get('USE_SOFTPLUS', True),
+        },
+    ).to(device)
+    
+    # Carica checkpoint
+    output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
+    ckpt_path = os.path.join(output_dir, 'stage2_best.pth')
+    
+    print(f"\n✅ Caricamento: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint['model'], strict=False)
+    
+    # Mostra log_scale (NON modificarlo!)
+    if hasattr(model.p2r_head, 'log_scale'):
+        ls = model.p2r_head.log_scale.item()
+        print(f"\n📊 log_scale: {ls:.4f} (scala={np.exp(ls):.2f})")
+        print(f"   ⚠️ Usando valore dal checkpoint, NESSUNA ri-calibrazione!")
+    
+    # Dataset
+    DatasetClass = get_dataset(config['DATASET'])
+    val_transforms = build_transforms(data_cfg, is_train=False)
+    
+    val_dataset = DatasetClass(
+        root=data_cfg['ROOT'],
+        split=data_cfg['VAL_SPLIT'],
+        block_size=data_cfg['ZIP_BLOCK_SIZE'],
+        transforms=val_transforms,
     )
+    
     val_loader = DataLoader(
-        val_ds,
+        val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=cfg["OPTIM_P2R"]["NUM_WORKERS"],
+        num_workers=4,
         collate_fn=collate_fn,
-        pin_memory=True
     )
-    dataset_name = cfg["DATASET"]
-    bin_config = cfg["BINS_CONFIG"][dataset_name]
-    zip_head_cfg = cfg.get("ZIP_HEAD", {})
-    zip_head_kwargs = {
-        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
-        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
-        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
-        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
-    }
+    
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # Valida
+    default_down = data_cfg.get('P2R_DOWNSAMPLE', 8)
+    results = validate_stage2(model, val_loader, device, default_down)
+    
+    # Report
+    print("\n" + "="*60)
+    print("📊 RISULTATI")
+    print("="*60)
+    print(f"   MAE:  {results['mae']:.2f}")
+    print(f"   RMSE: {results['rmse']:.2f}")
+    print(f"   Bias: {results['bias']:.3f}")
+    
+    # Confronto
+    if 'mae' in checkpoint:
+        train_mae = checkpoint['mae']
+        diff = abs(results['mae'] - train_mae)
+        print(f"\n📈 Confronto con Training:")
+        print(f"   Training MAE:   {train_mae:.2f}")
+        print(f"   Evaluation MAE: {results['mae']:.2f}")
+        print(f"   Differenza:     {diff:.2f}")
+        
+        if diff < 1.0:
+            print(f"\n   ✅ ALLINEATO! Differenza < 1 punto")
+        else:
+            print(f"\n   ⚠️ Ancora discrepanza di {diff:.1f} punti")
+    
+    print("="*60)
 
-    model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"]["GATE"],
-        upsample_to_input=False,  
-        bins=bin_config["bins"],
-        bin_centers=bin_config["bin_centers"],
-        zip_head_kwargs=zip_head_kwargs,
-    ).to(device)
-    ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    ckpt_path = os.path.join(ckpt_dir, "stage2_best.pth")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
-    if not os.path.exists(ckpt_path):
-        print("❌ Nessun checkpoint Stage 2 trovato.")
-        return
-
-    print(f"✅ Checkpoint caricato correttamente da: {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location=device)
-    if "model" in state_dict:
-        model.load_state_dict(state_dict["model"], strict=False)
-    else:
-        model.load_state_dict(state_dict, strict=False)
-    loss_cfg = cfg.get("P2R_LOSS", {})
-    loss_kwargs = {}
-    if "SCALE_WEIGHT" in loss_cfg:
-        loss_kwargs["scale_weight"] = float(loss_cfg["SCALE_WEIGHT"])
-    if "POS_WEIGHT" in loss_cfg:
-        loss_kwargs["pos_weight"] = float(loss_cfg["POS_WEIGHT"])
-    if "CHUNK_SIZE" in loss_cfg:
-        loss_kwargs["chunk_size"] = int(loss_cfg["CHUNK_SIZE"])
-    if "MIN_RADIUS" in loss_cfg:
-        loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
-    if "MAX_RADIUS" in loss_cfg:
-        loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
-    loss_fn = P2RLossFixed(**loss_kwargs).to(device)
-    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
-    clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
-    max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
-    calibrate_density_scale(
-        model,
-        val_loader,
-        device,
-        default_down,
-        max_batches=None,
-        clamp_range=clamp_cfg,
-        max_adjust=max_adjust,
-    )
-    evaluate_p2r(model, val_loader, loss_fn, device, cfg)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

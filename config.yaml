@@ -85,26 +85,33 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 1 V2 - ZIP con Focal Loss (Migliore bilanciamento P/R)
+# STAGE 1 V2 - ZIP NLL (Formula originale del paper)
 # =================================================================
-# Focal Loss: FL = -α(1-p)^γ * log(p)
-# - alpha: peso classe positiva (>0.5 favorisce recall)
-# - gamma: focusing parameter (>0 riduce peso campioni facili)
+# ZIP NLL per blocchi vuoti: L = -log(π₀ + π₁ · e^{-λ})
+# ZIP NLL per blocchi pieni: L = -log(π₁)
+#
+# DIFFERENZA vs BCE:
+# - BCE penalizza qualsiasi π₁ > 0 per blocchi vuoti
+# - ZIP ammette π₁ > 0 se λ è piccolo (e^{-λ} > 0)
+# - Questo rende ZIP più "soft" sui confini
+#
+# LAMBDA_DEFAULT controlla quanto è "soft" la loss:
+# - λ=1.0: e^{-1} ≈ 0.37 → molto tollerante (alto recall)
+# - λ=2.0: e^{-2} ≈ 0.14 → bilanciato (default)
+# - λ=3.0: e^{-3} ≈ 0.05 → più strict (alta precision)
+# - λ=5.0: e^{-5} ≈ 0.007 → quasi come BCE
 # =================================================================
 ZIP_LOSS_V2:
-  # Focal Loss params
-  FOCAL_ALPHA: 0.75           # Peso classe positiva (0.75 = favorisce recall)
-  FOCAL_GAMMA: 2.0            # Focusing (2.0 = standard)
-  POS_WEIGHT: 3.0             # Peso aggiuntivo positivi
-  LABEL_SMOOTHING: 0.05       # Smoothing per robustezza
+  # ZIP NLL params
+  LAMBDA_DEFAULT: 2.0           # Valore λ per formula ZIP (2.0 = bilanciato)
   
   # Threshold
-  OCCUPANCY_THRESHOLD: 0.5    # Soglia per definire blocco "pieno"
+  OCCUPANCY_THRESHOLD: 0.5      # Soglia per definire blocco "pieno"
   
   # Loss weights
-  WEIGHT_FOCAL: 1.0           # Peso focal loss
-  WEIGHT_COUNT: 0.5           # Peso count loss
-  WEIGHT_LAMBDA_REG: 0.01     # Peso lambda regularization
+  WEIGHT_ZIP_NLL: 1.0           # Peso ZIP NLL loss
+  WEIGHT_COUNT: 0.0             # Peso count loss (0 = disabilitato, P2R fa il count)
+  WEIGHT_LAMBDA_REG: 0.0        # Peso lambda regularization (0 = disabilitato)
 
 # =================================================================
 # STAGE 2 - P2R TRAINING

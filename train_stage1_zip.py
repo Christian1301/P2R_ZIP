@@ -25,6 +25,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 import numpy as np
 import json
+from typing import Tuple
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -33,97 +34,119 @@ from train_utils import init_seeds, collate_fn
 
 
 # =============================================================================
-# FOCAL LOSS - Migliore bilanciamento Precision/Recall
+# ZIP π NLL - Loss originale dal paper ZIP (semplificata per Stage 1)
 # =============================================================================
 
-class FocalBCELoss(nn.Module):
+class ZIPiNLL(nn.Module):
     """
-    Focal Loss per classificazione binaria.
+    ZIP π Negative Log-Likelihood (semplificata per Stage 1).
     
-    FL(p) = -α * (1-p)^γ * log(p)     per classe positiva
-    FL(p) = -(1-α) * p^γ * log(1-p)   per classe negativa
+    Segue la formula del paper ZIP originale:
+    - Per blocchi VUOTI (gt=0): L = -log(π₀ + π₁ · e^{-λ})
+    - Per blocchi PIENI (gt>0): L = -log(π₁)
+    
+    Dove:
+    - π₀ = P(blocco vuoto)
+    - π₁ = P(blocco pieno) = 1 - π₀
+    - λ = valore medio atteso per blocchi pieni (default=2.0)
+    
+    DIFFERENZA CHIAVE vs BCE:
+    - BCE per vuoti: -log(1-p) → penalizza QUALSIASI p > 0
+    - ZIP per vuoti: -log(π₀ + π₁·e^{-λ}) → ammette π₁ > 0 se λ piccolo
+    
+    Questo rende ZIP più "soft" sui confini, il che può migliorare
+    il recall senza sacrificare troppa precision.
     
     Parametri:
-    - alpha: peso per classe positiva (default 0.75 per favorire recall)
-    - gamma: focusing parameter (default 2.0)
-      * gamma=0: equivalente a BCE
-      * gamma>0: riduce peso campioni facili
-    - pos_weight: peso aggiuntivo per positivi (come in BCE)
+    - lambda_default: valore λ medio per blocchi pieni
+      * λ=1.0: e^{-1} ≈ 0.37 → molto tollerante
+      * λ=2.0: e^{-2} ≈ 0.14 → bilanciato (default)
+      * λ=3.0: e^{-3} ≈ 0.05 → più strict
+      * λ=5.0: e^{-5} ≈ 0.007 → quasi come BCE
     """
     def __init__(
-        self, 
-        alpha: float = 0.75,      # Peso classe positiva
-        gamma: float = 2.0,       # Focusing parameter
-        pos_weight: float = 1.0,  # Peso aggiuntivo positivi
-        label_smoothing: float = 0.0,  # Label smoothing
+        self,
+        lambda_default: float = 2.0,
         reduction: str = 'mean'
     ):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.label_smoothing = label_smoothing
+        self.lambda_default = lambda_default
         self.reduction = reduction
+        
+        # Pre-calcola exp(-λ) per efficienza
+        self.register_buffer(
+            'exp_neg_lambda', 
+            torch.tensor(float(np.exp(-lambda_default)))
+        )
     
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        logit_pi: torch.Tensor,      # [B, 2, H, W] logits per π (2 classi)
+        gt_occupancy: torch.Tensor   # [B, 1, H, W] GT binario (0=vuoto, 1=pieno)
+    ) -> torch.Tensor:
         """
         Args:
-            logits: [B, 1, H, W] raw logits (prima di sigmoid)
-            targets: [B, 1, H, W] ground truth (0 o 1)
+            logit_pi: [B, 2, H, W] logits per le 2 classi (vuoto, pieno)
+            gt_occupancy: [B, 1, H, W] ground truth binario
+            
+        Returns:
+            loss: scalar
         """
-        # Label smoothing
-        if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        # π tramite softmax sulle 2 classi
+        pi = F.softmax(logit_pi, dim=1)  # [B, 2, H, W]
+        pi_vuoto = pi[:, 0:1, :, :]  # P(vuoto)
+        pi_pieno = pi[:, 1:2, :, :]  # P(pieno)
         
-        # Probabilità
-        probs = torch.sigmoid(logits)
+        # Maschere
+        is_empty = (gt_occupancy == 0).float()  # Blocchi vuoti
+        is_full = (gt_occupancy == 1).float()   # Blocchi pieni
         
-        # BCE base
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
+        # Loss per blocchi VUOTI (gt=0):
+        # L = -log(π₀ + π₁ · e^{-λ})
+        # Un blocco può essere osservato vuoto perché:
+        # 1. È davvero vuoto (contributo π₀)
+        # 2. È pieno ma Poisson(0|λ) = e^{-λ} (contributo π₁ · e^{-λ})
+        prob_observe_empty = pi_vuoto + pi_pieno * self.exp_neg_lambda
+        loss_empty = -torch.log(prob_observe_empty + 1e-8) * is_empty
         
-        # Focal weight: (1-p)^γ per positivi, p^γ per negativi
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        focal_weight = (1 - p_t) ** self.gamma
+        # Loss per blocchi PIENI (gt>0):
+        # L = -log(π₁)
+        # Se osserviamo count > 0, il blocco DEVE essere pieno
+        loss_full = -torch.log(pi_pieno + 1e-8) * is_full
         
-        # Alpha weight
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        
-        # Pos weight aggiuntivo
-        weight = torch.where(targets > 0.5, self.pos_weight, 1.0)
-        
-        # Focal loss
-        focal_loss = alpha_t * focal_weight * weight * bce
+        # Loss totale
+        loss = loss_empty + loss_full
         
         if self.reduction == 'mean':
-            return focal_loss.mean()
+            return loss.mean()
         elif self.reduction == 'sum':
-            return focal_loss.sum()
+            return loss.sum()
         else:
-            return focal_loss
+            return loss
 
 
 # =============================================================================
-# ZIP LOSS MIGLIORATA
+# ZIP LOSS V2 - Usa ZIPiNLL (fedele al paper)
 # =============================================================================
 
 class ZIPLossV2(nn.Module):
     """
-    Loss ZIP migliorata con Focal Loss e metriche dettagliate.
+    Loss ZIP per Stage 1 usando ZIPiNLL (formula originale del paper).
+    
+    Componenti:
+    1. ZIPiNLL: Classificazione blocchi vuoti/pieni
+    2. Count Loss (opzionale): L1 sul count predetto vs GT
+    3. Lambda Reg (opzionale): Regolarizzazione su λ
     """
     def __init__(
         self,
         block_size: int = 16,
-        # Focal Loss params
-        focal_alpha: float = 0.75,
-        focal_gamma: float = 2.0,
-        pos_weight: float = 3.0,
-        label_smoothing: float = 0.05,
+        # ZIPiNLL params
+        lambda_default: float = 2.0,
         # Occupancy threshold
         occupancy_threshold: float = 0.5,
         # Loss weights
-        weight_focal: float = 1.0,
+        weight_zip_nll: float = 1.0,
         weight_count: float = 0.5,
         weight_lambda_reg: float = 0.01,
     ):
@@ -131,14 +154,12 @@ class ZIPLossV2(nn.Module):
         self.block_size = block_size
         self.occupancy_threshold = occupancy_threshold
         
-        self.focal_loss = FocalBCELoss(
-            alpha=focal_alpha,
-            gamma=focal_gamma,
-            pos_weight=pos_weight,
-            label_smoothing=label_smoothing
+        self.zip_nll = ZIPiNLL(
+            lambda_default=lambda_default,
+            reduction='mean'
         )
         
-        self.weight_focal = weight_focal
+        self.weight_zip_nll = weight_zip_nll
         self.weight_count = weight_count
         self.weight_lambda_reg = weight_lambda_reg
     
@@ -162,51 +183,54 @@ class ZIPLossV2(nn.Module):
             loss: scalar
             metrics: dict con dettagli
         """
-        logit_pi = outputs['logit_pi_maps']
+        logit_pi = outputs['logit_pi_maps']  # [B, 2, H, W]
         lambda_maps = outputs['lambda_maps']
-        pi_probs = outputs['pi_probs']
-        
-        # Logit per classe "pieno" (canale 1)
-        logit_pieno = logit_pi[:, 1:2, :, :]
+        pi_probs = outputs['pi_probs']  # Probabilità classe "pieno"
         
         # GT occupancy
         gt_occupancy = self.compute_gt_occupancy(gt_density)
         
         # Allinea dimensioni
-        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
+        if gt_occupancy.shape[-2:] != logit_pi.shape[-2:]:
             gt_occupancy = F.interpolate(
                 gt_occupancy,
-                size=logit_pieno.shape[-2:],
+                size=logit_pi.shape[-2:],
                 mode='nearest'
             )
         
-        # 1. Focal Loss per classificazione
-        loss_focal = self.focal_loss(logit_pieno, gt_occupancy)
+        # 1. ZIP NLL Loss (formula originale del paper)
+        loss_zip_nll = self.zip_nll(logit_pi, gt_occupancy)
         
         # 2. Count loss (opzionale)
-        pred_count_map = pi_probs * lambda_maps
-        gt_count_map = F.avg_pool2d(
-            gt_density,
-            kernel_size=self.block_size,
-            stride=self.block_size
-        ) * (self.block_size ** 2)
-        
-        if gt_count_map.shape[-2:] != pred_count_map.shape[-2:]:
-            gt_count_map = F.interpolate(
-                gt_count_map,
-                size=pred_count_map.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        loss_count = F.l1_loss(pred_count_map, gt_count_map)
+        if self.weight_count > 0:
+            pred_count_map = pi_probs * lambda_maps
+            gt_count_map = F.avg_pool2d(
+                gt_density,
+                kernel_size=self.block_size,
+                stride=self.block_size
+            ) * (self.block_size ** 2)
+            
+            if gt_count_map.shape[-2:] != pred_count_map.shape[-2:]:
+                gt_count_map = F.interpolate(
+                    gt_count_map,
+                    size=pred_count_map.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            
+            loss_count = F.l1_loss(pred_count_map, gt_count_map)
+        else:
+            loss_count = torch.tensor(0.0, device=logit_pi.device)
         
         # 3. Lambda regularization
-        loss_lambda_reg = (lambda_maps ** 2).mean() * 0.001
+        if self.weight_lambda_reg > 0:
+            loss_lambda_reg = (lambda_maps ** 2).mean() * 0.001
+        else:
+            loss_lambda_reg = torch.tensor(0.0, device=logit_pi.device)
         
         # Total loss
         total_loss = (
-            self.weight_focal * loss_focal +
+            self.weight_zip_nll * loss_zip_nll +
             self.weight_count * loss_count +
             self.weight_lambda_reg * loss_lambda_reg
         )
@@ -227,9 +251,9 @@ class ZIPLossV2(nn.Module):
         
         metrics = {
             'total': total_loss.item(),
-            'focal': loss_focal.item(),
-            'count': loss_count.item(),
-            'lambda_reg': loss_lambda_reg.item(),
+            'zip_nll': loss_zip_nll.item(),
+            'count': loss_count.item() if isinstance(loss_count, torch.Tensor) else loss_count,
+            'lambda_reg': loss_lambda_reg.item() if isinstance(loss_lambda_reg, torch.Tensor) else loss_lambda_reg,
             'precision': precision,
             'recall': recall,
             'f1': f1,
@@ -265,9 +289,8 @@ def find_optimal_threshold(
     
     model.eval()
     
-    # Raccogli tutte le predizioni
-    all_pi_probs = []
-    all_gt_occupancy = []
+    # Accumula metriche per ogni threshold (non concatenare tensori di dim diverse)
+    threshold_stats = {t: {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0} for t in thresholds}
     
     for images, gt_density, _ in dataloader:
         images = images.to(device)
@@ -292,22 +315,26 @@ def find_optimal_threshold(
                 mode='nearest'
             )
         
-        all_pi_probs.append(pi_probs.cpu())
-        all_gt_occupancy.append(gt_occupancy.cpu())
+        # Calcola metriche per ogni threshold
+        for thresh in thresholds:
+            pred_binary = (pi_probs > thresh).float()
+            
+            tp = ((pred_binary == 1) & (gt_occupancy == 1)).sum().item()
+            tn = ((pred_binary == 0) & (gt_occupancy == 0)).sum().item()
+            fp = ((pred_binary == 1) & (gt_occupancy == 0)).sum().item()
+            fn = ((pred_binary == 0) & (gt_occupancy == 1)).sum().item()
+            
+            threshold_stats[thresh]['tp'] += tp
+            threshold_stats[thresh]['tn'] += tn
+            threshold_stats[thresh]['fp'] += fp
+            threshold_stats[thresh]['fn'] += fn
     
-    all_pi_probs = torch.cat(all_pi_probs, dim=0)
-    all_gt_occupancy = torch.cat(all_gt_occupancy, dim=0)
-    
-    # Test ogni threshold
+    # Calcola metriche finali per ogni threshold
     results = []
     
     for thresh in thresholds:
-        pred_binary = (all_pi_probs > thresh).float()
-        
-        tp = ((pred_binary == 1) & (all_gt_occupancy == 1)).sum().item()
-        tn = ((pred_binary == 0) & (all_gt_occupancy == 0)).sum().item()
-        fp = ((pred_binary == 1) & (all_gt_occupancy == 0)).sum().item()
-        fn = ((pred_binary == 0) & (all_gt_occupancy == 1)).sum().item()
+        stats = threshold_stats[thresh]
+        tp, tn, fp, fn = stats['tp'], stats['tn'], stats['fp'], stats['fn']
         
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
@@ -378,6 +405,7 @@ def train_one_epoch(
         
         pbar.set_postfix({
             'L': f"{loss.item():.3f}",
+            'NLL': f"{metrics['zip_nll']:.3f}",
             'P': f"{metrics['precision']*100:.1f}%",
             'R': f"{metrics['recall']*100:.1f}%",
             'F1': f"{metrics['f1']*100:.1f}%",
@@ -562,24 +590,20 @@ def main():
         }
     ).to(device)
     
-    # Loss V2 con Focal Loss
+    # Loss V2 con ZIP NLL (formula originale del paper)
     criterion = ZIPLossV2(
         block_size=block_size,
-        focal_alpha=float(zip_loss_cfg.get('FOCAL_ALPHA', 0.75)),
-        focal_gamma=float(zip_loss_cfg.get('FOCAL_GAMMA', 2.0)),
-        pos_weight=float(zip_loss_cfg.get('POS_WEIGHT', 3.0)),
-        label_smoothing=float(zip_loss_cfg.get('LABEL_SMOOTHING', 0.05)),
+        lambda_default=float(zip_loss_cfg.get('LAMBDA_DEFAULT', 2.0)),
         occupancy_threshold=float(zip_loss_cfg.get('OCCUPANCY_THRESHOLD', 0.5)),
-        weight_focal=float(zip_loss_cfg.get('WEIGHT_FOCAL', 1.0)),
+        weight_zip_nll=float(zip_loss_cfg.get('WEIGHT_ZIP_NLL', 1.0)),
         weight_count=float(zip_loss_cfg.get('WEIGHT_COUNT', 0.5)),
         weight_lambda_reg=float(zip_loss_cfg.get('WEIGHT_LAMBDA_REG', 0.01)),
     ).to(device)
     
-    print(f"\n⚙️ Focal Loss Config:")
-    print(f"   α (alpha):        {zip_loss_cfg.get('FOCAL_ALPHA', 0.75)}")
-    print(f"   γ (gamma):        {zip_loss_cfg.get('FOCAL_GAMMA', 2.0)}")
-    print(f"   pos_weight:       {zip_loss_cfg.get('POS_WEIGHT', 3.0)}")
-    print(f"   label_smoothing:  {zip_loss_cfg.get('LABEL_SMOOTHING', 0.05)}")
+    print(f"\n⚙️ ZIP NLL Config (formula originale paper):")
+    print(f"   λ_default:        {zip_loss_cfg.get('LAMBDA_DEFAULT', 2.0)}")
+    print(f"   e^{{-λ}}:           {np.exp(-float(zip_loss_cfg.get('LAMBDA_DEFAULT', 2.0))):.4f}")
+    print(f"   occupancy_thresh: {zip_loss_cfg.get('OCCUPANCY_THRESHOLD', 0.5)}")
     
     # Optimizer
     param_groups = [

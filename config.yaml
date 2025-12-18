@@ -2,7 +2,7 @@
 # CONFIGURAZIONE P2R-ZIP
 # =================================================================
 
-RUN_NAME: "shha_target60_v10"
+RUN_NAME: "shha_v10"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -57,7 +57,7 @@ ZIP_HEAD:
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 3000
+  EPOCHS: 2500
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
@@ -66,13 +66,13 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 800
+  EARLY_STOPPING_PATIENCE: 600
 
 ZIP_LOSS:
-  POS_WEIGHT_BCE: 3.5          # Era 5.0 → Riduce FP
+  POS_WEIGHT_BCE: 5.0
   COUNT_WEIGHT: 0.65
   LAMBDA_REG_WEIGHT: 0.01
-  OCCUPANCY_THRESHOLD: 1.0     # Era 0.5 → Solo blocchi con ≥1 persona
+  OCCUPANCY_THRESHOLD: 0.5
   WEIGHT_CE: 1.5
   WEIGHT_NLL: 1.0
   WEIGHT_COUNT: 0.8
@@ -83,6 +83,28 @@ ZIP_REG:
   PI_WEIGHT: 5.0e-4
   LAMBDA_TARGET: 5.0
   LAMBDA_WEIGHT: 1.0e-4
+
+# =================================================================
+# STAGE 1 V2 - ZIP con Focal Loss (Migliore bilanciamento P/R)
+# =================================================================
+# Focal Loss: FL = -α(1-p)^γ * log(p)
+# - alpha: peso classe positiva (>0.5 favorisce recall)
+# - gamma: focusing parameter (>0 riduce peso campioni facili)
+# =================================================================
+ZIP_LOSS_V2:
+  # Focal Loss params
+  FOCAL_ALPHA: 0.75           # Peso classe positiva (0.75 = favorisce recall)
+  FOCAL_GAMMA: 2.0            # Focusing (2.0 = standard)
+  POS_WEIGHT: 3.0             # Peso aggiuntivo positivi
+  LABEL_SMOOTHING: 0.05       # Smoothing per robustezza
+  
+  # Threshold
+  OCCUPANCY_THRESHOLD: 0.5    # Soglia per definire blocco "pieno"
+  
+  # Loss weights
+  WEIGHT_FOCAL: 1.0           # Peso focal loss
+  WEIGHT_COUNT: 0.5           # Peso count loss
+  WEIGHT_LAMBDA_REG: 0.01     # Peso lambda regularization
 
 # =================================================================
 # STAGE 2 - P2R TRAINING
@@ -150,7 +172,7 @@ OPTIM_JOINT:
 
 JOINT_LOSS:
   # *** PARAMETRO CRITICO ***
-  ALPHA: 0.4                    # Bilanciamento ZIP vs P2R
+  ALPHA: 0.5                    # Bilanciamento ZIP vs P2R
   
   # ZIP Loss components
   PI_POS_WEIGHT: 8.0            # Peso classe positiva (blocchi pieni)

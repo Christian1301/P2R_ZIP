@@ -4,10 +4,11 @@
 Stage 1 - ZIP Pre-training V2
 
 MIGLIORAMENTI:
-1. Focal Loss invece di BCE → Migliore bilanciamento Precision/Recall
+1. ZIP NLL Loss (formula originale paper) → Migliore bilanciamento Precision/Recall
 2. Label Smoothing → Robustezza ai casi borderline
 3. Threshold Ottimizzato → Trova threshold che massimizza F1
 4. Metriche dettagliate durante training
+5. Resume da checkpoint
 
 TARGET:
 - Recall > 85%
@@ -486,7 +487,7 @@ def validate(
 # CHECKPOINT
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, output_dir, is_best=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, no_improve, output_dir, is_best=False):
     os.makedirs(output_dir, exist_ok=True)
     
     state = {
@@ -496,6 +497,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, output
         'scheduler': scheduler.state_dict() if scheduler else None,
         'metrics': metrics,
         'best_f1': best_f1,
+        'no_improve': no_improve,
     }
     
     # Latest
@@ -520,7 +522,7 @@ def main():
     init_seeds(config['SEED'])
     
     print("="*70)
-    print("🚀 STAGE 1 V2 - ZIP Pre-training con Focal Loss")
+    print("🚀 STAGE 1 V2 - ZIP Pre-training con ZIP NLL")
     print("="*70)
     print(f"Device: {device}")
     print("="*70)
@@ -641,18 +643,41 @@ def main():
     output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
     os.makedirs(output_dir, exist_ok=True)
     
-    # Training
+    # Training state
     best_f1 = 0.0
+    start_epoch = 1
     patience = optim_cfg.get('EARLY_STOPPING_PATIENCE', 800)
     no_improve = 0
     val_interval = optim_cfg.get('VAL_INTERVAL', 5)
     
+    # Resume da checkpoint se esiste
+    resume_path = os.path.join(output_dir, 'last.pth')
+    if os.path.exists(resume_path):
+        print(f"\n🔄 Ripristino checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if checkpoint.get('scheduler') is not None:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        best_f1 = checkpoint.get('best_f1', 0.0)
+        no_improve = checkpoint.get('no_improve', 0)
+        
+        print(f"   Epoch: {checkpoint['epoch']} → riprendo da {start_epoch}")
+        print(f"   Best F1: {best_f1*100:.2f}%")
+        print(f"   No improve: {no_improve}/{patience}")
+        if checkpoint.get('metrics'):
+            m = checkpoint['metrics']
+            print(f"   Last metrics: P={m.get('precision', 0)*100:.1f}%, R={m.get('recall', 0)*100:.1f}%, F1={m.get('f1', 0)*100:.1f}%")
+    
     print(f"\n🚀 START Training")
-    print(f"   Epochs: {epochs}")
+    print(f"   Epochs: {start_epoch} → {epochs}")
     print(f"   Patience: {patience}")
     print(f"   Target: F1 > 78%, Recall > 85%, Precision > 70%\n")
     
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # Train
         train_metrics = train_one_epoch(
             model, criterion, train_loader, optimizer, device, epoch
@@ -681,7 +706,7 @@ def main():
             
             save_checkpoint(
                 model, optimizer, scheduler, epoch,
-                val_metrics, best_f1, output_dir, is_best
+                val_metrics, best_f1, no_improve, output_dir, is_best
             )
             
             # Early stopping

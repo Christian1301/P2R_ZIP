@@ -39,7 +39,7 @@ DATA:
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.2
+  ZIP_PI_THRESH: 0.6
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
   USE_STE_MASK: true
@@ -66,7 +66,7 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 600
+  EARLY_STOPPING_PATIENCE: 800
 
 ZIP_LOSS:
   POS_WEIGHT_BCE: 5.0
@@ -103,7 +103,7 @@ ZIP_REG:
 # =================================================================
 ZIP_LOSS_V2:
   # ZIP NLL params
-  LAMBDA_DEFAULT: 2.0           # Valore λ per formula ZIP (2.0 = bilanciato)
+  LAMBDA_DEFAULT: 0.5           # Valore λ per formula ZIP (2.0 = bilanciato)
   
   # Threshold
   OCCUPANCY_THRESHOLD: 0.5      # Soglia per definire blocco "pieno"
@@ -128,7 +128,7 @@ OPTIM_P2R:
   RESUME_LAST: true
   SAVE_BEST: true
   WARMUP_EPOCHS: 50
-  EARLY_STOPPING_PATIENCE: 200
+  EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 1.0
 
 P2R_LOSS:
@@ -162,7 +162,7 @@ P2R_LOSS:
 OPTIM_JOINT:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 600
+  EPOCHS: 2000
   
   # Learning rates differenziati
   LR_BACKBONE: 1.0e-6           # Fine-tuning leggero backbone
@@ -172,7 +172,7 @@ OPTIM_JOINT:
   SCHEDULER: "cosine"
   WARMUP_EPOCHS: 10
   VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 150
+  EARLY_STOPPING_PATIENCE: 500
   
   # Opzionale: congela BatchNorm nel backbone
   FREEZE_BN: false

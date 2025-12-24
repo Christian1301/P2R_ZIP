@@ -1,5 +1,8 @@
 # =================================================================
-# CONFIGURAZIONE P2R-ZIP
+# CONFIGURAZIONE P2R-ZIP V10 - RIPRISTINATA
+# =================================================================
+# Questa config ha prodotto MAE 66-72, funzionante.
+# NON modificare l'architettura, solo training params se necessario.
 # =================================================================
 
 RUN_NAME: "shha_v10"
@@ -18,7 +21,7 @@ DATA:
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
   
-  # Data Augmentation
+  # Augmentation standard (funzionante)
   CROP_SIZE: 384
   CROP_SCALE: [0.4, 1.0]
   
@@ -31,18 +34,19 @@ DATA:
   
   HORIZONTAL_FLIP: true
   RANDOM_GRAY_PROB: 0.1
+  
   GAUSSIAN_BLUR:
     ENABLED: true
     PROB: 0.1
     KERNEL_SIZE: [3, 5]
 
-# === MODELLO ===
+# === MODELLO (ORIGINALE - NON MODIFICARE) ===
 MODEL:
   BACKBONE: "vgg16_bn"
   ZIP_PI_THRESH: 0.6
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: true
+  USE_STE_MASK: false
 
 # === ZIP HEAD ===
 ZIP_HEAD:
@@ -68,50 +72,14 @@ OPTIM_ZIP:
   WARMUP_EPOCHS: 100
   EARLY_STOPPING_PATIENCE: 800
 
-ZIP_LOSS:
-  POS_WEIGHT_BCE: 5.0
-  COUNT_WEIGHT: 0.65
-  LAMBDA_REG_WEIGHT: 0.01
-  OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_CE: 1.5
-  WEIGHT_NLL: 1.0
-  WEIGHT_COUNT: 0.8
-  WEIGHT_ALIGN: 0.4
-
-ZIP_REG:
-  PI_TARGET: 0.15
-  PI_WEIGHT: 5.0e-4
-  LAMBDA_TARGET: 5.0
-  LAMBDA_WEIGHT: 1.0e-4
-
-# =================================================================
-# STAGE 1 V2 - ZIP NLL (Formula originale del paper)
-# =================================================================
-# ZIP NLL per blocchi vuoti: L = -log(π₀ + π₁ · e^{-λ})
-# ZIP NLL per blocchi pieni: L = -log(π₁)
-#
-# DIFFERENZA vs BCE:
-# - BCE penalizza qualsiasi π₁ > 0 per blocchi vuoti
-# - ZIP ammette π₁ > 0 se λ è piccolo (e^{-λ} > 0)
-# - Questo rende ZIP più "soft" sui confini
-#
-# LAMBDA_DEFAULT controlla quanto è "soft" la loss:
-# - λ=1.0: e^{-1} ≈ 0.37 → molto tollerante (alto recall)
-# - λ=2.0: e^{-2} ≈ 0.14 → bilanciato (default)
-# - λ=3.0: e^{-3} ≈ 0.05 → più strict (alta precision)
-# - λ=5.0: e^{-5} ≈ 0.007 → quasi come BCE
-# =================================================================
+# ZIP Loss V2 (originale)
 ZIP_LOSS_V2:
-  # ZIP NLL params
-  LAMBDA_DEFAULT: 0.5           # Valore λ per formula ZIP (2.0 = bilanciato)
-  
-  # Threshold
-  OCCUPANCY_THRESHOLD: 0.5      # Soglia per definire blocco "pieno"
-  
-  # Loss weights
-  WEIGHT_ZIP_NLL: 1.0           # Peso ZIP NLL loss
-  WEIGHT_COUNT: 0.0             # Peso count loss (0 = disabilitato, P2R fa il count)
-  WEIGHT_LAMBDA_REG: 0.0        # Peso lambda regularization (0 = disabilitato)
+  LAMBDA_DEFAULT: 1.0
+  POS_WEIGHT: 1.0
+  OCCUPANCY_THRESHOLD: 0.5
+  WEIGHT_ZIP_NLL: 1.0
+  WEIGHT_COUNT: 0.0
+  WEIGHT_LAMBDA_REG: 0.0
 
 # =================================================================
 # STAGE 2 - P2R TRAINING
@@ -132,9 +100,9 @@ OPTIM_P2R:
   GRAD_CLIP: 1.0
 
 P2R_LOSS:
-  COUNT_WEIGHT: 2.0
-  SCALE_WEIGHT: 0.5
-  SPATIAL_WEIGHT: 0.15
+  COUNT_WEIGHT: 2.5
+  SCALE_WEIGHT: 0.3
+  SPATIAL_WEIGHT: 0.1
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -144,69 +112,31 @@ P2R_LOSS:
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - JOINT TRAINING (Loss Congiunta)
+# STAGE 3 - JOINT TRAINING
 # =================================================================
-# Formula: L_total = (1-α)·L_ZIP + α·L_P2R
-#
-# α controlla il bilanciamento:
-# - α = 0.0: solo ZIP (focus su classificazione blocchi)
-# - α = 0.5: bilanciamento neutro
-# - α = 1.0: solo P2R (focus su density map)
-#
-# Raccomandazioni:
-# - α = 0.3-0.4: se Stage 1 è già molto forte
-# - α = 0.5: default bilanciato
-# - α = 0.6-0.7: se Stage 2 ha performance migliori di Stage 1
-# =================================================================
-
 OPTIM_JOINT:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 2000
+  EPOCHS: 1000
   
-  # Learning rates differenziati
-  LR_BACKBONE: 1.0e-6           # Fine-tuning leggero backbone
-  LR_HEADS: 5.0e-5              # ZIP + P2R heads
+  LR_BACKBONE: 5.0e-7
+  LR_ZIP_HEAD: 2.0e-5
+  LR_P2R_HEAD: 3.0e-5
   
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
-  WARMUP_EPOCHS: 10
+  WARMUP_EPOCHS: 20
   VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 500
-  
-  # Opzionale: congela BatchNorm nel backbone
-  FREEZE_BN: false
+  EARLY_STOPPING_PATIENCE: 200
+  GRAD_CLIP: 1.0
+  FREEZE_BN: true
 
 JOINT_LOSS:
-  # *** PARAMETRO CRITICO ***
-  ALPHA: 0.5                    # Bilanciamento ZIP vs P2R
-  
-  # ZIP Loss components
-  PI_POS_WEIGHT: 8.0            # Peso classe positiva (blocchi pieni)
-  OCCUPANCY_THRESHOLD: 0.5      # Soglia per definire blocco "pieno"
-  
-  # P2R Loss components
-  COUNT_WEIGHT: 2.0             # Peso count loss
-  SPATIAL_WEIGHT: 0.15          # Peso spatial loss
-
-# =================================================================
-# STAGE 4 - BIAS CORRECTION (Opzionale)
-# =================================================================
-OPTIM_STAGE4:
-  BATCH_SIZE: 4
-  NUM_WORKERS: 4
-  EPOCHS: 150
-  LR_P2R: 1.0e-6
-  LR_LOG_SCALE: 1.0e-5
-  LR_PI: 1.0e-4
-  WEIGHT_DECAY: 1.0e-4
-  VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 40
-
-STAGE4_LOSS:
-  OVERESTIMATE_WEIGHT: 2.0
-  COUNT_WEIGHT: 1.0
-  PI_WEIGHT: 0.3
+  ALPHA: 0.7
+  PI_POS_WEIGHT: 1.0
+  OCCUPANCY_THRESHOLD: 0.5
+  COUNT_WEIGHT: 2.5
+  SPATIAL_WEIGHT: 0.1
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

@@ -8,7 +8,8 @@ python3 train_stage1_zip.py  > logs/stage1.log 2>&1
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
-python3 train_stage2_p2r.py --config config.yaml --resume  > logs/stage2.log 2>&1
+#python3 train_stage2_p2r.py --config config.yaml --resume  > logs/stage2.log 2>&1
+python3 train_stage2_v13.py --config config.yaml --dm-weight 0.5 --ot-weight 0.3 --epochs 5000 > logs/stage2.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."

@@ -1,347 +1,388 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Stage 3 evaluation script with π-masking support.
+Evaluate Stage 3 - Con Soft Weighting
 
-Usa la soglia ZIP_PI_THRESH dal config per applicare il masking.
+Valuta il modello con diverse modalità:
+1. RAW: Density pura senza masking
+2. MASKED: Hard masking con threshold τ
+3. SOFT: Soft weighting con alpha α
+
+Mostra metriche per fascia di densità.
 """
 
 import os
 import yaml
 import torch
 import torch.nn.functional as F
-import numpy as np
-from tqdm import tqdm
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+import argparse
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import (
-    init_seeds,
-    canonicalize_p2r_grid,
-    collate_fn,
-    calibrate_density_scale_v2 as calibrate_density_scale,
-)
+from train_utils import collate_fn, canonicalize_p2r_grid
 
 
-def _load_checkpoint(model, output_dir, device):
-    candidates = [
-        os.path.join(output_dir, "stage4_best.pth"),
-        os.path.join(output_dir, "stage3_best.pth"),
-        os.path.join(output_dir, "stage2_best.pth"),
-    ]
-
-    for ckpt_path in candidates:
-        if not os.path.isfile(ckpt_path):
-            continue
-        print(f"🔄 Caricamento pesi da: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device)
-
-        if isinstance(ckpt, dict):
-            if "model_state_dict" in ckpt:
-                state_dict = ckpt["model_state_dict"]
-            elif "model" in ckpt:
-                state_dict = ckpt["model"]
-            else:
-                state_dict = ckpt
-        else:
-            state_dict = ckpt
-
-        missing = model.load_state_dict(state_dict, strict=False)
-        if missing.missing_keys or missing.unexpected_keys:
-            print(
-                f"⚠️ load_state_dict mismatch → missing={missing.missing_keys}, "
-                f"unexpected={missing.unexpected_keys}"
-            )
-        return True
-
-    print("❌ Nessun checkpoint trovato per Stage 4/3/2")
-    return False
-
-
-def compute_count_raw(pred_density, down_h, down_w):
-    """Conteggio RAW (senza maschera)."""
-    cell_area = down_h * down_w
-    return torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
-
-
-def compute_count_masked(pred_density, pi_probs, down_h, down_w, threshold=0.5):
-    """Conteggio MASKED (con maschera π)."""
-    cell_area = down_h * down_w
-    if pi_probs.shape[-2:] != pred_density.shape[-2:]:
+def apply_soft_weighting(density, pi_probs, alpha=0.2):
+    """Soft weighting: density × (1 - α + α × π)"""
+    if pi_probs.shape[-2:] != density.shape[-2:]:
         pi_probs = F.interpolate(
-            pi_probs, 
-            size=pred_density.shape[-2:], 
-            mode='bilinear', 
-            align_corners=False
+            pi_probs, size=density.shape[-2:], mode='bilinear', align_corners=False
+        )
+    weights = (1 - alpha) + alpha * pi_probs
+    return density * weights
+
+
+def apply_hard_mask(density, pi_probs, threshold=0.5):
+    """Hard masking: density × (π > τ)"""
+    if pi_probs.shape[-2:] != density.shape[-2:]:
+        pi_probs = F.interpolate(
+            pi_probs, size=density.shape[-2:], mode='bilinear', align_corners=False
         )
     mask = (pi_probs > threshold).float()
-    masked_density = pred_density * mask
-    return torch.sum(masked_density, dim=(1, 2, 3)) / cell_area, mask.mean().item() * 100
+    return density * mask
 
 
 @torch.no_grad()
-def evaluate_stage3(model, dataloader, device, default_down, pi_threshold=0.5):
-    """
-    Valutazione Stage 3 con π-masking.
+def calibrate_log_scale(model, loader, device, default_down, num_batches=15):
+    """Calibra log_scale per correggere bias sistematico."""
+    model.eval()
     
-    Args:
-        model: modello P2R-ZIP
-        dataloader: validation DataLoader
-        device: device
-        default_down: downsample factor
-        pi_threshold: soglia per π-masking (da config)
+    pred_counts = []
+    gt_counts = []
+    
+    for batch_idx, (images, _, points) in enumerate(loader):
+        if batch_idx >= num_batches:
+            break
+        
+        images = images.to(device)
+        points_list = [p.to(device) for p in points]
+        
+        outputs = model(images)
+        pred = outputs['p2r_density']
+        
+        _, _, H_in, W_in = images.shape
+        pred, down_tuple, _ = canonicalize_p2r_grid(pred, (H_in, W_in), default_down)
+        
+        cell_area = down_tuple[0] * down_tuple[1]
+        
+        for i, pts in enumerate(points_list):
+            gt = len(pts)
+            if gt > 0:
+                pred_count = (pred[i].sum() / cell_area).item()
+                pred_counts.append(pred_count)
+                gt_counts.append(gt)
+    
+    if len(gt_counts) == 0:
+        print("⚠️ Nessun dato per calibrazione")
+        return
+    
+    ratios = [p/g for p, g in zip(pred_counts, gt_counts)]
+    bias_global = sum(pred_counts) / sum(gt_counts)
+    bias_median = np.median(ratios)
+    
+    print(f"📊 Statistiche Calibrazione:")
+    print(f"   Bias globale (sum): {bias_global:.3f}")
+    print(f"   Bias mediano: {bias_median:.3f}")
+    print(f"   Std ratio: {np.std(ratios):.3f}")
+    print(f"   Range ratio: [{min(ratios):.3f}, {max(ratios):.3f}]")
+    
+    outlier_high = sum(1 for r in ratios if r > 1.5)
+    outlier_low = sum(1 for r in ratios if r < 0.67)
+    print(f"   Outlier (>1.5x): {outlier_high}/{len(ratios)}")
+    print(f"   Outlier (<0.67x): {outlier_low}/{len(ratios)}")
+    
+    # Calibra se bias significativo
+    if abs(bias_median - 1.0) > 0.05:
+        adjust = np.log(bias_median)
+        adjust = np.clip(adjust, -1.0, 1.0)
+        
+        old_scale = model.p2r_head.log_scale.item()
+        model.p2r_head.log_scale.data -= torch.tensor(adjust, device=device)
+        new_scale = model.p2r_head.log_scale.item()
+        
+        print(f"🔧 Calibrazione: bias={bias_median:.3f} → log_scale {old_scale:.4f}→{new_scale:.4f} (scala={np.exp(new_scale):.4f})")
+
+
+@torch.no_grad()
+def evaluate(model, dataloader, device, default_down, pi_threshold=0.5, soft_alpha=0.2):
+    """
+    Valuta con tre modalità: RAW, MASKED (hard), SOFT.
     """
     model.eval()
-
-    # Metriche RAW
-    abs_errors_raw, sq_errors_raw = [], []
-    # Metriche MASKED
-    abs_errors_masked, sq_errors_masked = [], []
     
-    sparse_errors, medium_errors, dense_errors = [], [], []
-    density_means, density_maxima = [], []
-    pi_activity = []
-    total_pred_raw, total_pred_masked, total_gt = 0.0, 0.0, 0.0
-    coverages = []
-
-    print(f"\n===== VALUTAZIONE STAGE 3 (π-threshold={pi_threshold}) =====")
-
-    for images, _, points in tqdm(dataloader, desc="[Eval Stage 3]"):
-        images = images.to(device)
-        points_gpu = [p.to(device) if p is not None else None for p in points]
-
-        outputs = model(images)
-        pred_density = outputs["p2r_density"]
-
-        _, _, h_in, w_in = images.shape
-        pred_density, down_tuple, _ = canonicalize_p2r_grid(
-            pred_density, (h_in, w_in), default_down, warn_tag="stage3_eval"
-        )
-
-        down_h, down_w = down_tuple
-        
-        # Count RAW
-        pred_count_raw = compute_count_raw(pred_density, down_h, down_w)
-        
-        # Get π probs
-        pi_probs = outputs.get("pi_probs")
-        if pi_probs is None:
-            pi_logits = outputs.get("logit_pi_maps")
-            if pi_logits is not None:
-                pi_probs = torch.softmax(pi_logits, dim=1)[:, 1:2]
-            else:
-                # Fallback: no masking
-                pi_probs = torch.ones_like(pred_density)
-        
-        # Count MASKED
-        pred_count_masked, coverage = compute_count_masked(
-            pred_density, pi_probs, down_h, down_w, threshold=pi_threshold
-        )
-        coverages.append(coverage)
-
-        gt_counts = torch.tensor(
-            [len(p) if p is not None else 0 for p in points_gpu],
-            device=device,
-            dtype=torch.float32,
-        )
-
-        # Errori RAW
-        batch_errors_raw = torch.abs(pred_count_raw - gt_counts)
-        abs_errors_raw.extend(batch_errors_raw.cpu().tolist())
-        sq_errors_raw.extend(((pred_count_raw - gt_counts) ** 2).cpu().tolist())
-        
-        # Errori MASKED
-        batch_errors_masked = torch.abs(pred_count_masked - gt_counts)
-        abs_errors_masked.extend(batch_errors_masked.cpu().tolist())
-        sq_errors_masked.extend(((pred_count_masked - gt_counts) ** 2).cpu().tolist())
-
-        total_pred_raw += pred_count_raw.sum().item()
-        total_pred_masked += pred_count_masked.sum().item()
-        total_gt += gt_counts.sum().item()
-
-        dens_cpu = pred_density.detach().cpu()
-        density_means.append(dens_cpu.mean().item())
-        density_maxima.append(dens_cpu.max().item())
-
-        # π activity
-        if pi_probs is not None:
-            active_ratio = (pi_probs > 0.5).float().mean().item() * 100.0
-            pi_activity.append(active_ratio)
-
-        # Per-density analysis
-        for err_raw, err_masked, gt_val in zip(
-            batch_errors_raw.cpu().tolist(), 
-            batch_errors_masked.cpu().tolist(),
-            gt_counts.cpu().tolist()
-        ):
-            if gt_val <= 100:
-                sparse_errors.append((err_raw, err_masked, gt_val))
-            elif gt_val <= 500:
-                medium_errors.append((err_raw, err_masked, gt_val))
-            else:
-                dense_errors.append((err_raw, err_masked, gt_val))
-
-    if not abs_errors_raw:
-        print("⚠️ Val loader vuoto, nessuna metrica calcolata")
-        return {}
-
-    # Calcola metriche
-    mae_raw = float(np.mean(abs_errors_raw))
-    rmse_raw = float(np.sqrt(np.mean(sq_errors_raw)))
-    bias_raw = total_pred_raw / total_gt if total_gt > 0 else 0.0
-    
-    mae_masked = float(np.mean(abs_errors_masked))
-    rmse_masked = float(np.sqrt(np.mean(sq_errors_masked)))
-    bias_masked = total_pred_masked / total_gt if total_gt > 0 else 0.0
-    
-    avg_coverage = np.mean(coverages)
-    improvement = mae_raw - mae_masked
-
-    # Report
-    print("\n" + "=" * 65)
-    print("📊 RISULTATI STAGE 3")
-    print("=" * 65)
-    
-    print(f"\n{'Metrica':<15} {'RAW':<12} {'MASKED (τ={:.2f})':<18} {'Δ':<10}".format(pi_threshold))
-    print("-" * 55)
-    print(f"{'MAE':<15} {mae_raw:<12.2f} {mae_masked:<18.2f} {improvement:+.2f}")
-    print(f"{'RMSE':<15} {rmse_raw:<12.2f} {rmse_masked:<18.2f} {rmse_raw - rmse_masked:+.2f}")
-    print(f"{'Bias':<15} {bias_raw:<12.3f} {bias_masked:<18.3f} {bias_raw - bias_masked:+.3f}")
-    
-    print(f"\n📈 Coverage medio: {avg_coverage:.1f}%")
-    
-    if pi_activity:
-        print(f"   π-head active ratio: {np.mean(pi_activity):.1f}%")
-
-    # Per-density breakdown
-    def _fmt_bucket(name, errors):
-        if not errors:
-            return f"   {name}: n/a"
-        raw_errs = [e[0] for e in errors]
-        masked_errs = [e[1] for e in errors]
-        imp = np.mean(raw_errs) - np.mean(masked_errs)
-        status = "✅" if imp > 0 else "⚠️"
-        return f"   {name}: RAW={np.mean(raw_errs):.1f} → MASKED={np.mean(masked_errs):.1f} ({imp:+.1f}) {status} [{len(errors)} imgs]"
-
-    print("\n📊 Per densità:")
-    print(_fmt_bucket("Sparse  (0-100)", sparse_errors))
-    print(_fmt_bucket("Medium (100-500)", medium_errors))
-    print(_fmt_bucket("Dense  (500+)", dense_errors))
-
-    # Risultato finale
-    print("\n" + "=" * 65)
-    print("🏁 RISULTATO FINALE")
-    print("=" * 65)
-    print(f"""
-   ┌─────────────────────────────────────────────┐
-   │  MAE RAW:       {mae_raw:6.2f}                      │
-   │  MAE MASKED:    {mae_masked:6.2f}  (τ = {pi_threshold})            │
-   │  ──────────────────────────────────────     │
-   │  MIGLIORAMENTO: {improvement:+6.2f}                      │
-   │  BIAS:          {bias_masked:.3f}                       │
-   │  COVERAGE:      {avg_coverage:5.1f}%                      │
-   └─────────────────────────────────────────────┘
-""")
-    
-    if mae_masked < 65:
-        print("   🎉 TARGET RAGGIUNTO! MAE < 65")
-    elif mae_masked < 68:
-        print("   ✅ Ottimo risultato! MAE < 68")
-
-    print("=" * 65)
-
-    return {
-        "mae_raw": mae_raw,
-        "mae_masked": mae_masked,
-        "mae": mae_masked,  # Metrica principale = MASKED
-        "rmse_raw": rmse_raw,
-        "rmse_masked": rmse_masked,
-        "bias_raw": bias_raw,
-        "bias_masked": bias_masked,
-        "coverage": avg_coverage,
-        "improvement": improvement,
-        "pi_threshold": pi_threshold,
-        "pi_active": float(np.mean(pi_activity)) if pi_activity else None,
+    # Risultati per modalità
+    results = {
+        'raw': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
+        'masked': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
+        'soft': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
     }
+    
+    # Per analisi per densità
+    density_bins = {
+        'sparse': (0, 100),
+        'medium': (100, 500),
+        'dense': (500, float('inf')),
+    }
+    density_results = {
+        mode: {bin_name: {'mae': [], 'count': 0} for bin_name in density_bins}
+        for mode in ['raw', 'masked', 'soft']
+    }
+    
+    coverages = []
+    pi_ratios = []
+    
+    for images, densities, points in tqdm(dataloader, desc="Evaluating"):
+        images = images.to(device)
+        points_list = [p.to(device) for p in points]
+        
+        outputs = model(images)
+        raw_density = outputs['p2r_density']
+        pi_probs = outputs['pi_probs']
+        
+        _, _, H_in, W_in = images.shape
+        raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
+        cell_area = down_tuple[0] * down_tuple[1]
+        
+        # Resize π
+        if pi_probs.shape[-2:] != raw_density.shape[-2:]:
+            pi_probs_resized = F.interpolate(
+                pi_probs, size=raw_density.shape[-2:], mode='bilinear', align_corners=False
+            )
+        else:
+            pi_probs_resized = pi_probs
+        
+        # Coverage e π ratio
+        coverage = (pi_probs_resized > pi_threshold).float().mean().item() * 100
+        coverages.append(coverage)
+        pi_ratios.append(pi_probs_resized.mean().item())
+        
+        # Density variants
+        masked_density = apply_hard_mask(raw_density, pi_probs, pi_threshold)
+        soft_density = apply_soft_weighting(raw_density, pi_probs, soft_alpha)
+        
+        for i, pts in enumerate(points_list):
+            gt = len(pts)
+            
+            # Counts
+            pred_raw = (raw_density[i].sum() / cell_area).item()
+            pred_masked = (masked_density[i].sum() / cell_area).item()
+            pred_soft = (soft_density[i].sum() / cell_area).item()
+            
+            # Update results
+            for mode, pred in [('raw', pred_raw), ('masked', pred_masked), ('soft', pred_soft)]:
+                results[mode]['mae'].append(abs(pred - gt))
+                results[mode]['mse'].append((pred - gt) ** 2)
+                results[mode]['pred'] += pred
+                results[mode]['gt'] += gt
+                
+                # Per density bin
+                for bin_name, (lo, hi) in density_bins.items():
+                    if lo <= gt < hi:
+                        density_results[mode][bin_name]['mae'].append(abs(pred - gt))
+                        density_results[mode][bin_name]['count'] += 1
+    
+    # Calcola metriche finali
+    final_results = {}
+    
+    for mode in ['raw', 'masked', 'soft']:
+        r = results[mode]
+        final_results[mode] = {
+            'mae': np.mean(r['mae']),
+            'rmse': np.sqrt(np.mean(r['mse'])),
+            'bias': r['pred'] / r['gt'] if r['gt'] > 0 else 0,
+        }
+        
+        # Per densità
+        final_results[mode]['by_density'] = {}
+        for bin_name in density_bins:
+            dr = density_results[mode][bin_name]
+            if dr['mae']:
+                final_results[mode]['by_density'][bin_name] = {
+                    'mae': np.mean(dr['mae']),
+                    'count': dr['count'],
+                }
+    
+    final_results['coverage'] = np.mean(coverages)
+    final_results['pi_mean'] = np.mean(pi_ratios)
+    
+    return final_results
+
+
+def print_results(results, pi_threshold, soft_alpha):
+    """Stampa risultati in formato tabellare."""
+    
+    print("=" * 70)
+    print("📊 RISULTATI VALUTAZIONE")
+    print("=" * 70)
+    
+    # Tabella principale
+    print(f"\n{'Metrica':<12} {'RAW':<15} {'MASKED (τ={:.2f})':<20} {'SOFT (α={:.2f})':<15}".format(
+        pi_threshold, soft_alpha))
+    print("-" * 62)
+    
+    for metric in ['mae', 'rmse', 'bias']:
+        raw = results['raw'][metric]
+        masked = results['masked'][metric]
+        soft = results['soft'][metric]
+        
+        if metric == 'bias':
+            print(f"{metric.upper():<12} {raw:<15.3f} {masked:<20.3f} {soft:<15.3f}")
+        else:
+            print(f"{metric.upper():<12} {raw:<15.2f} {masked:<20.2f} {soft:<15.2f}")
+    
+    print(f"\n📈 Coverage medio (τ={pi_threshold}): {results['coverage']:.1f}%")
+    print(f"   π-head active ratio: {results['pi_mean']*100:.1f}%")
+    
+    # Per densità
+    print("\n📊 Per densità:")
+    density_labels = {
+        'sparse': 'Sparse  (0-100)',
+        'medium': 'Medium (100-500)',
+        'dense': 'Dense  (500+)',
+    }
+    
+    for bin_name in ['sparse', 'medium', 'dense']:
+        raw_data = results['raw']['by_density'].get(bin_name, {})
+        masked_data = results['masked']['by_density'].get(bin_name, {})
+        soft_data = results['soft']['by_density'].get(bin_name, {})
+        
+        raw_mae = raw_data.get('mae', 0)
+        masked_mae = masked_data.get('mae', 0)
+        soft_mae = soft_data.get('mae', 0)
+        count = raw_data.get('count', 0)
+        
+        delta_masked = raw_mae - masked_mae
+        delta_soft = raw_mae - soft_mae
+        
+        print(f"   {density_labels[bin_name]}: RAW={raw_mae:.1f} → MASKED={masked_mae:.1f} (Δ{delta_masked:+.1f}) | SOFT={soft_mae:.1f} (Δ{delta_soft:+.1f}) [{count} imgs]")
+    
+    # Box finale
+    print("\n" + "=" * 70)
+    print("🏁 RISULTATO FINALE")
+    print("=" * 70)
+    
+    best_mode = min(['raw', 'masked', 'soft'], key=lambda m: results[m]['mae'])
+    best_mae = results[best_mode]['mae']
+    
+    print(f"   ┌{'─'*50}┐")
+    print(f"   │  MAE RAW:        {results['raw']['mae']:<30.2f}│")
+    print(f"   │  MAE MASKED:     {results['masked']['mae']:<30.2f}│")
+    print(f"   │  MAE SOFT:       {results['soft']['mae']:<30.2f}│")
+    print(f"   │{'─'*50}│")
+    print(f"   │  MIGLIORE:       {best_mode.upper():<30}│")
+    print(f"   │  MAE:            {best_mae:<30.2f}│")
+    print(f"   └{'─'*50}┘")
+    print("=" * 70)
+    
+    # Raccomandazione
+    print("\n💡 RACCOMANDAZIONE:")
+    if results['raw']['mae'] < results['masked']['mae'] and results['raw']['mae'] < results['soft']['mae']:
+        print("   → Usa MAE RAW come metrica principale")
+        print("   → Il π-head non sta aggiungendo valore, considera:")
+        print("     1. Re-train Stage 1 con Focal Loss")
+        print("     2. Aumentare pos_weight per migliorare recall")
+    elif results['soft']['mae'] < results['masked']['mae']:
+        print("   → Soft weighting funziona meglio di hard masking")
+        print(f"   → Prova diversi valori di α (attuale: {soft_alpha})")
+    else:
+        print("   → Hard masking funziona bene")
+        print(f"   → Il threshold τ={pi_threshold} è appropriato")
 
 
 def main():
-    if not os.path.exists("config.yaml"):
-        print("❌ config.yaml non trovato")
-        return
-
-    with open("config.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-
-    device = torch.device(cfg["DEVICE"])
-    init_seeds(cfg["SEED"])
-
-    # *** LEGGE SOGLIA DAL CONFIG ***
-    pi_threshold = cfg["MODEL"].get("ZIP_PI_THRESH", 0.5)
-    print(f"✅ Usando π-threshold = {pi_threshold} (da config)")
-
-    data_cfg = cfg["DATA"]
-    val_transforms = build_transforms(data_cfg, is_train=False)
-    DatasetClass = get_dataset(cfg["DATASET"])
-    val_dataset = DatasetClass(
-        root=data_cfg["ROOT"],
-        split=data_cfg["VAL_SPLIT"],
-        block_size=data_cfg["ZIP_BLOCK_SIZE"],
-        transforms=val_transforms,
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config.yaml')
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--pi-thresh', type=float, default=None)
+    parser.add_argument('--soft-alpha', type=float, default=0.2)
+    parser.add_argument('--no-calibrate', action='store_true')
+    args = parser.parse_args()
+    
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+    
+    device = torch.device(config['DEVICE'])
+    
+    data_cfg = config['DATA']
+    default_down = data_cfg.get('P2R_DOWNSAMPLE', 8)
+    block_size = data_cfg.get('ZIP_BLOCK_SIZE', 16)
+    
+    pi_threshold = args.pi_thresh if args.pi_thresh is not None else config['MODEL']['ZIP_PI_THRESH']
+    soft_alpha = args.soft_alpha
+    
+    print(f"✅ Usando π-threshold = {pi_threshold} (da {'args' if args.pi_thresh else 'config'})")
+    print(f"✅ Usando soft-alpha = {soft_alpha}")
+    
+    # Dataset
+    val_tf = build_transforms(data_cfg, is_train=False)
+    DatasetClass = get_dataset(config['DATASET'])
+    val_ds = DatasetClass(
+        root=data_cfg['ROOT'],
+        split=data_cfg['VAL_SPLIT'],
+        block_size=block_size,
+        transforms=val_tf
     )
-
-    optim_cfg = cfg.get("OPTIM_STAGE4", cfg.get("OPTIM_STAGE3", {}))
-    num_workers = int(optim_cfg.get("NUM_WORKERS", 4))
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        val_ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn
     )
-
-    dataset_name = cfg["DATASET"]
-    bin_cfg = cfg["BINS_CONFIG"][dataset_name]
-    zip_head_kwargs = {
-        "lambda_scale": cfg["ZIP_HEAD"].get("LAMBDA_SCALE", 0.5),
-        "lambda_max": cfg["ZIP_HEAD"].get("LAMBDA_MAX", 8.0),
-        "use_softplus": cfg["ZIP_HEAD"].get("USE_SOFTPLUS", True),
-        "lambda_noise_std": 0.0,
-    }
-
+    
+    # Model
+    bin_config = config['BINS_CONFIG'][config['DATASET']]
+    zip_head_cfg = config.get('ZIP_HEAD', {})
+    
     model = P2R_ZIP_Model(
-        bins=bin_cfg["bins"],
-        bin_centers=bin_cfg["bin_centers"],
-        backbone_name=cfg["MODEL"]["BACKBONE"],
+        backbone_name=config['MODEL']['BACKBONE'],
         pi_thresh=pi_threshold,
-        gate=cfg["MODEL"]["GATE"],
-        upsample_to_input=cfg["MODEL"].get("UPSAMPLE_TO_INPUT", False),
-        zip_head_kwargs=zip_head_kwargs,
+        gate=config['MODEL']['GATE'],
+        upsample_to_input=config['MODEL'].get('UPSAMPLE_TO_INPUT', False),
+        bins=bin_config['bins'],
+        bin_centers=bin_config['bin_centers'],
+        use_ste_mask=config['MODEL'].get('USE_STE_MASK', False),
+        zip_head_kwargs={
+            'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
+            'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
+            'use_softplus': zip_head_cfg.get('USE_SOFTPLUS', True),
+        },
     ).to(device)
+    
+    # Load checkpoint
+    run_name = config.get('RUN_NAME', 'shha_v11')
+    output_dir = os.path.join(config['EXP']['OUT_DIR'], run_name)
+    
+    if args.checkpoint:
+        ckpt_path = args.checkpoint
+    else:
+        # Cerca automaticamente
+        for name in ['stage3_best.pth', 'stage3_latest.pth', 'stage2_best.pth', 'best_model.pth']:
+            path = os.path.join(output_dir, name)
+            if os.path.isfile(path):
+                ckpt_path = path
+                break
+        else:
+            raise FileNotFoundError(f"Nessun checkpoint trovato in {output_dir}")
+    
+    print(f"🔄 Caricamento pesi da: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device)
+    if 'model' in state:
+        state = state['model']
+    model.load_state_dict(state, strict=False)
+    
+    # Calibrazione
+    if not args.no_calibrate:
+        print("🔧 Calibrazione log_scale pre-eval...")
+        calibrate_log_scale(model, val_loader, device, default_down)
+    
+    # Valutazione
+    print(f"\n{'='*5} VALUTAZIONE (π-threshold={pi_threshold}, soft-α={soft_alpha}) {'='*5}")
+    results = evaluate(model, val_loader, device, default_down, pi_threshold, soft_alpha)
+    
+    # Stampa risultati
+    print_results(results, pi_threshold, soft_alpha)
 
-    out_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    if not _load_checkpoint(model, out_dir, device):
-        return
 
-    p2r_cfg = cfg.get("P2R_LOSS", {})
-    default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
-
-    print("\n🔧 Calibrazione log_scale pre-eval...")
-    calibrate_density_scale(
-        model,
-        val_loader,
-        device,
-        default_down,
-        max_batches=15,
-        clamp_range=p2r_cfg.get("LOG_SCALE_CLAMP"),
-        max_adjust=0.5,
-    )
-
-    # *** USA LA SOGLIA DAL CONFIG ***
-    evaluate_stage3(model, val_loader, device, default_down, pi_threshold=pi_threshold)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

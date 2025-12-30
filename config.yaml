@@ -5,7 +5,7 @@
 # NON modificare l'architettura, solo training params se necessario.
 # =================================================================
 
-RUN_NAME: "shha_v10"
+RUN_NAME: "shha_v14"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -110,6 +110,12 @@ P2R_LOSS:
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
+  # Density Weighting (V10b test)
+  # weight = 1 + α * (gt_count / ref)^β
+  # α=0 disabilita (baseline), α=0.3 leggero
+  DENSITY_ALPHA: 0.3
+  DENSITY_BETA: 0.5
+  REFERENCE_COUNT: 300.0
 
 # =================================================================
 # STAGE 3 - JOINT TRAINING

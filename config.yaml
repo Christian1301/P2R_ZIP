@@ -1,168 +1,178 @@
-# =================================================================
-# CONFIGURAZIONE P2R-ZIP V10 - RIPRISTINATA
-# =================================================================
-# Questa config ha prodotto MAE 66-72, funzionante.
-# NON modificare l'architettura, solo training params se necessario.
-# =================================================================
+# ============================================================
+# CONFIG V15 - Con ZIP NLL Loss per Stage 1
+# Target: MAE < 60 su ShanghaiTech Part A
+# ============================================================
 
-RUN_NAME: "shha_v14"
-SEED: 2025
-DEVICE: "cuda"
+# Run identification
+RUN_NAME: "shha_v15"
+EXPERIMENT_DIR: "exp"
 
-# === DATASET ===
-DATASET: "shha"
-DATA:
+# ============================================================
+# DATASET - MANTIENI LA TUA CONFIGURAZIONE ORIGINALE
+# ============================================================
+DATASET:
+  NAME: "ShanghaiTechA"
   ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
-  ZIP_BLOCK_SIZE: 16
-  P2R_DOWNSAMPLE: 8
-  IMG_EXTS: [".jpg", ".png"]
-  NORM_MEAN: [0.485, 0.456, 0.406]
-  NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train_data"
-  VAL_SPLIT: "val_data"
-  
-  # Augmentation standard (funzionante)
-  CROP_SIZE: 384
-  CROP_SCALE: [0.4, 1.0]
-  
-  COLOR_JITTER:
-    ENABLED: true
-    BRIGHTNESS: 0.2
-    CONTRAST: 0.2
-    SATURATION: 0.2
-    HUE: 0.1
-  
-  HORIZONTAL_FLIP: true
-  RANDOM_GRAY_PROB: 0.1
-  
-  GAUSSIAN_BLUR:
-    ENABLED: true
-    PROB: 0.1
-    KERNEL_SIZE: [3, 5]
+  BLOCK_SIZE: 16
+  NUM_WORKERS: 4
 
-# === MODELLO (ORIGINALE - NON MODIFICARE) ===
+# Model architecture
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.6
-  GATE: "multiply"
-  UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: false
+  BACKBONE_PRETRAINED: true
+  FREEZE_BACKBONE_STAGE1: true
+  FREEZE_BACKBONE_STAGE2: false
+  FREEZE_BACKBONE_STAGE3: true
+  
+  # ZIP Head parameters
+  ZIP_HIDDEN_DIM: 256
+  ZIP_PI_THRESH: 0.2           # Threshold per inference (può essere tuned post-training)
+  
+  # P2R Head parameters  
+  P2R_FEA_CHANNEL: 256
+  P2R_OUT_STRIDE: 16
 
-# === ZIP HEAD ===
+# ============================================================
+# ZIP HEAD - Parametri architettura
+# ============================================================
 ZIP_HEAD:
-  LAMBDA_SCALE: 1.2
-  LAMBDA_MAX: 8.0
-  USE_SOFTPLUS: true
-  LAMBDA_NOISE_STD: 0.0
+  LAMBDA_SCALE: 1.2            # Scala per softplus
+  LAMBDA_MAX: 8.0              # Clamp massimo per lambda
+  USE_SOFTPLUS: true           # Usa softplus invece di exp per lambda
 
-# =================================================================
-# STAGE 1 - ZIP PRE-TRAINING
-# =================================================================
+# ============================================================
+# STAGE 1: ZIP Pre-training con ZIP NLL
+# ============================================================
 OPTIM_ZIP:
-  BATCH_SIZE: 6
-  NUM_WORKERS: 4
-  EPOCHS: 2500
-  WEIGHT_DECAY: 3.0e-5
-  SCHEDULER: "cosine"
-  VAL_INTERVAL: 5
-  RESUME_LAST: true
-  SAVE_BEST: true
-  BASE_LR: 8.0e-5
-  LR_BACKBONE: 4.0e-5
-  WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 800
-
-# ZIP Loss V2 (originale)
-ZIP_LOSS_V2:
-  LAMBDA_DEFAULT: 1.0
-  POS_WEIGHT: 1.0
-  OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_ZIP_NLL: 1.0
-  WEIGHT_COUNT: 0.0
-  WEIGHT_LAMBDA_REG: 0.0
-
-# =================================================================
-# STAGE 2 - P2R TRAINING
-# =================================================================
-OPTIM_P2R:
+  EPOCHS: 3000
   BATCH_SIZE: 8
-  NUM_WORKERS: 4
-  EPOCHS: 5000
-  LR: 5.0e-5
-  LR_BACKBONE: 1.0e-6
+  LR: 1.0e-4                   # Learning rate per ZIP head
+  LR_BACKBONE: 1.0e-5          # Learning rate backbone (più conservativo)
+  HEAD_LR: 1.0e-4              # Alias per LR head
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  VAL_INTERVAL: 5
-  RESUME_LAST: true
-  SAVE_BEST: true
-  WARMUP_EPOCHS: 50
+  WARMUP_EPOCHS: 50            # Warmup più lungo per stabilità
   EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 1.0
+  VAL_INTERVAL: 5              # Valida ogni 5 epochs
+  NUM_WORKERS: 4
+
+# ============================================================
+# STAGE 1 V4: ZIP NLL Loss Configuration
+# ============================================================
+ZIP_LOSS_V4:
+  # Pesi loss
+  WEIGHT_NLL: 1.0              # Peso principale ZIP NLL
+  WEIGHT_LAMBDA_REG: 0.01      # Regularizzazione lambda (evita valori estremi)
+  WEIGHT_PI_ENTROPY: 0.0       # Entropy regularization (0 = disabilitato)
+  
+  # Parametri
+  LAMBDA_MAX_TARGET: 8.0       # Target massimo per lambda reg
+  OCCUPANCY_THRESHOLD: 0.5     # Soglia per GT occupancy (per metriche)
+  PI_THRESHOLD: 0.5            # Soglia per predizione binaria (per metriche)
+
+# ============================================================
+# STAGE 1 V3: ZIP Loss (LEGACY - non usato con V4)
+# ============================================================
+ZIP_LOSS_V3:
+  USE_FOCAL: false
+  FOCAL_GAMMA: 2.0
+  POS_WEIGHT: 5.0
+  OCCUPANCY_THRESHOLD: 0.5
+  WEIGHT_CLASSIFICATION: 1.0
+  WEIGHT_COUNT: 0.1
+  WEIGHT_LAMBDA_REG: 0.01
+
+# ============================================================
+# STAGE 2: P2R Training - PARAMETRI CRITICI
+# ============================================================
+OPTIM_P2R:
+  EPOCHS: 5000                 # Training lungo per convergenza
+  BATCH_SIZE: 8
+  LR: 5.0e-5                   # Learning rate conservativo
+  LR_BACKBONE: 1.0e-6          # Backbone quasi congelato
+  WEIGHT_DECAY: 1.0e-4
+  WARMUP_EPOCHS: 50            # Warmup lungo per stabilità
+  EARLY_STOPPING_PATIENCE: 2500
+  GRAD_CLIP: 1.0
+  
+  # Scheduler
+  SCHEDULER: "cosine"
+  MIN_LR: 1.0e-7
 
 P2R_LOSS:
-  COUNT_WEIGHT: 2.5
-  SCALE_WEIGHT: 0.3
-  SPATIAL_WEIGHT: 0.1
-  MIN_RADIUS: 8.0
-  MAX_RADIUS: 64.0
-  CHUNK_SIZE: 2048
-  LOG_SCALE_INIT: 4.0
+  # Multi-scale loss
+  USE_MULTI_SCALE: true
+  SCALES: [1, 2, 4]
+  SCALE_WEIGHTS: [1.0, 0.5, 0.25]
+  
+  # Loss weights
+  COUNT_WEIGHT: 2.0            # Enfatizza count accuracy
+  SPATIAL_WEIGHT: 0.15         # Guida localizzazione
+  SCALE_WEIGHT: 0.5            # Penalizza errore relativo
+  
+  # Log scale initialization
+  LOG_SCALE_INIT: 4.0          # exp(4)≈55
   LOG_SCALE_CLAMP: [-2.0, 10.0]
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
-  CALIBRATE_BATCHES: 10
-  # Density Weighting (V10b test)
-  # weight = 1 + α * (gt_count / ref)^β
-  # α=0 disabilita (baseline), α=0.3 leggero
-  DENSITY_ALPHA: 0.3
-  DENSITY_BETA: 0.5
-  REFERENCE_COUNT: 300.0
+  LOG_SCALE_LR_MULT: 0.1
 
-# =================================================================
-# STAGE 3 - JOINT TRAINING
-# =================================================================
+# ============================================================
+# STAGE 3: Joint Training
+# ============================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 6
-  NUM_WORKERS: 4
-  EPOCHS: 1000
-  
-  LR_BACKBONE: 5.0e-7
-  LR_ZIP_HEAD: 2.0e-5
-  LR_P2R_HEAD: 3.0e-5
-  
+  EPOCHS: 2000
+  BATCH_SIZE: 8
+  LR: 1.0e-5
+  LR_BACKBONE: 0.0             # Backbone completamente congelato
+  LR_ZIP: 0.0                  # ZIP head congelato
+  LR_P2R: 1.0e-5               # Solo fine-tuning P2R
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  WARMUP_EPOCHS: 20
-  VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 200
-  GRAD_CLIP: 1.0
-  FREEZE_BN: true
+  WARMUP_EPOCHS: 10
+  EARLY_STOPPING_PATIENCE: 1000
+  GRAD_CLIP: 0.5
 
 JOINT_LOSS:
-  ALPHA: 0.7
-  PI_POS_WEIGHT: 1.0
-  OCCUPANCY_THRESHOLD: 0.5
-  COUNT_WEIGHT: 2.5
-  SPATIAL_WEIGHT: 0.1
+  COUNT_WEIGHT: 1.0
+  MASK_WEIGHT: 0.0             # Non modificare maschera in Stage 3
+  USE_SOFT_MASK: true
+  SOFT_ALPHA: 0.2
+  FREEZE_ZIP_HEAD: true
+  FREEZE_P2R_BACKBONE_ONLY: true
 
-# === BIN CONFIGURATION ===
-BINS_CONFIG:
-  shha:
-    bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
-    bin_centers: [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0]
-  shhb:
-    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
-    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  qnrf:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-  jhu:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-  nwpu:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
+# ============================================================
+# Data Augmentation
+# ============================================================
+AUGMENTATION:
+  TRAIN:
+    RANDOM_CROP: true
+    CROP_SIZE: [384, 384]
+    HORIZONTAL_FLIP: true
+    FLIP_PROB: 0.5
+    COLOR_JITTER: true
+    JITTER_BRIGHTNESS: 0.2
+    JITTER_CONTRAST: 0.2
+    JITTER_SATURATION: 0.1
+    JITTER_HUE: 0.05
+    RANDOM_GRAYSCALE: true
+    GRAYSCALE_PROB: 0.1
+    GAUSSIAN_BLUR: true
+    BLUR_PROB: 0.1
+    BLUR_KERNEL: [3, 7]
+  
+  VAL:
+    RESIZE: false
+
+# ============================================================
+# Logging and Checkpoints
+# ============================================================
+LOGGING:
+  LOG_INTERVAL: 50
+  VAL_INTERVAL: 1
+  SAVE_BEST_ONLY: true
+  TENSORBOARD: true
 
 EXP:
   OUT_DIR: "exp"
-  SAVE_BEST: true
-  SAVE_WORST_CASES: true
+
+# Device
+DEVICE: "cuda"
+SEED: 42

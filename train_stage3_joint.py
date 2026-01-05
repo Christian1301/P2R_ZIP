@@ -42,6 +42,43 @@ from train_utils import (
 )
 
 
+ALIAS_DATASETS = {
+    'shha': 'shha',
+    'shanghaitecha': 'shha',
+    'shanghaitechparta': 'shha',
+    'shanghaitechaparta': 'shha',
+    'shhb': 'shhb',
+    'shanghaitechpartb': 'shhb',
+    'ucf': 'ucf',
+    'ucfqnrf': 'ucf',
+    'nwpu': 'nwpu',
+    'jhu': 'jhu'
+}
+
+DEFAULT_BINS_CONFIG = {
+    'shha': {
+        'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
+        'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
+    },
+    'shhb': {
+        'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
+        'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
+    },
+    'ucf': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'nwpu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'jhu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+}
+
+
 # =============================================================================
 # SOFT WEIGHTING UTILITIES
 # =============================================================================
@@ -512,14 +549,37 @@ def main():
     with open('config.yaml') as f:
         config = yaml.safe_load(f)
     
-    device = torch.device(config['DEVICE'])
-    init_seeds(config['SEED'])
+    device = torch.device(config.get('DEVICE', 'cuda'))
+    init_seeds(config.get('SEED', 42))
     
     print("="*60)
     print("🚀 Stage 3 V2 - JOINT TRAINING con Soft Weighting")
     print("="*60)
     
-    data_cfg = config['DATA']
+    dataset_section = config.get('DATASET', 'shha')
+    data_section = config.get('DATA')
+    if isinstance(dataset_section, dict):
+        dataset_name_raw = dataset_section.get('NAME', 'shha')
+        data_cfg = {}
+        if isinstance(data_section, dict):
+            data_cfg.update(data_section)
+        data_cfg.update(dataset_section)
+    else:
+        dataset_name_raw = dataset_section
+        data_cfg = data_section.copy() if isinstance(data_section, dict) else {}
+
+    normalized = ''.join(ch for ch in str(dataset_name_raw).lower() if ch.isalnum())
+    dataset_name = ALIAS_DATASETS.get(normalized, str(dataset_name_raw).lower())
+
+    if not data_cfg:
+        raise KeyError("DATA or DATASET configuration missing for Stage 3.")
+    if 'ROOT' not in data_cfg:
+        raise KeyError("Dataset ROOT path missing in configuration.")
+    if 'NORM_MEAN' not in data_cfg:
+        data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
+    if 'NORM_STD' not in data_cfg:
+        data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
+
     optim_cfg = config.get('OPTIM_JOINT', {})
     joint_cfg = config.get('JOINT_LOSS', {})
     
@@ -540,16 +600,16 @@ def main():
     train_tf = build_transforms(data_cfg, is_train=True)
     val_tf = build_transforms(data_cfg, is_train=False)
     
-    DatasetClass = get_dataset(config['DATASET'])
+    DatasetClass = get_dataset(dataset_name)
     train_ds = DatasetClass(
         root=data_cfg['ROOT'],
-        split=data_cfg['TRAIN_SPLIT'],
+        split=data_cfg.get('TRAIN_SPLIT', 'train'),
         block_size=block_size,
         transforms=train_tf
     )
     val_ds = DatasetClass(
         root=data_cfg['ROOT'],
-        split=data_cfg['VAL_SPLIT'],
+        split=data_cfg.get('VAL_SPLIT', 'val'),
         block_size=block_size,
         transforms=val_tf
     )
@@ -567,7 +627,7 @@ def main():
         val_ds,
         batch_size=1,
         shuffle=False,
-        num_workers=4,
+        num_workers=optim_cfg.get('VAL_NUM_WORKERS', optim_cfg.get('NUM_WORKERS', 4)),
         collate_fn=collate_fn,
         pin_memory=True
     )
@@ -575,17 +635,24 @@ def main():
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     
     # Model
-    bin_config = config['BINS_CONFIG'][config['DATASET']]
+    bins_config = config.get('BINS_CONFIG', {})
+    if dataset_name in bins_config:
+        bin_config = bins_config[dataset_name]
+    elif dataset_name in DEFAULT_BINS_CONFIG:
+        bin_config = DEFAULT_BINS_CONFIG[dataset_name]
+    else:
+        raise KeyError(f"BINS_CONFIG missing definition for dataset '{dataset_name}' and no default is available.")
     zip_head_cfg = config.get('ZIP_HEAD', {})
+    model_cfg = config.get('MODEL', {})
     
     model = P2R_ZIP_Model(
-        backbone_name=config['MODEL']['BACKBONE'],
-        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
-        gate=config['MODEL']['GATE'],
-        upsample_to_input=config['MODEL'].get('UPSAMPLE_TO_INPUT', False),
+        backbone_name=model_cfg.get('BACKBONE', 'vgg16_bn'),
+        pi_thresh=model_cfg.get('ZIP_PI_THRESH', 0.5),
+        gate=model_cfg.get('GATE', 'multiply'),
+        upsample_to_input=model_cfg.get('UPSAMPLE_TO_INPUT', False),
         bins=bin_config['bins'],
         bin_centers=bin_config['bin_centers'],
-        use_ste_mask=config['MODEL'].get('USE_STE_MASK', False),
+        use_ste_mask=model_cfg.get('USE_STE_MASK', False),
         zip_head_kwargs={
             'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
             'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
@@ -595,7 +662,8 @@ def main():
     
     # Output dir
     run_name = config.get('RUN_NAME', 'shha_v11')
-    output_dir = os.path.join(config['EXP']['OUT_DIR'], run_name)
+    exp_cfg = config.get('EXP', {})
+    output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), run_name)
     os.makedirs(output_dir, exist_ok=True)
     
     # Carica Stage 2

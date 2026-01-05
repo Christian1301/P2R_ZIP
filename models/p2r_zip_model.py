@@ -87,12 +87,15 @@ class P2R_ZIP_Model(nn.Module):
         self.zip_head = ZIPHead(self.backbone.out_channels, bins=self.bins, **zip_head_kwargs)
         
         p2r_head_kwargs = p2r_head_kwargs or {}
+        # Legacy configs might include unsupported args like up_scale/out_channel
+        p2r_head_kwargs.pop("up_scale", None)
+        p2r_head_kwargs.pop("out_channel", None)
         if "in_channel" not in p2r_head_kwargs:
             p2r_head_kwargs["in_channel"] = 512
         if "fea_channel" not in p2r_head_kwargs:
             p2r_head_kwargs["fea_channel"] = 64
-        if "up_scale" not in p2r_head_kwargs:
-            p2r_head_kwargs["up_scale"] = 2
+        if "out_stride" not in p2r_head_kwargs:
+            p2r_head_kwargs["out_stride"] = 16
         self.p2r_head = P2RHead(**p2r_head_kwargs)
 
         self.pi_thresh = pi_thresh

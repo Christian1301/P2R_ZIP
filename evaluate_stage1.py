@@ -33,6 +33,38 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
 
+# Default bin configurations for common datasets
+DEFAULT_BINS_CONFIG = {
+    'shha': {
+        'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
+        'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
+    },
+    'shhb': {
+        'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
+        'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
+    },
+    'ucf': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'nwpu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'jhu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+}
+
+DATASET_ALIAS_MAP = {
+    'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
+    'shhb': 'shhb', 'shanghaitechb': 'shhb', 'shanghaitechpartb': 'shhb',
+    'ucf': 'ucf', 'ucfqnrf': 'ucf',
+    'nwpu': 'nwpu', 'jhu': 'jhu',
+}
+
+
 
 # =============================================================================
 # LOSS (STESSA DEL TRAINING)
@@ -107,7 +139,7 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
     total_gt_count = 0.0
     n_samples = 0
     
-    block_size = config["DATA"]["ZIP_BLOCK_SIZE"]
+    block_size = config.get('DATA', config.get('DATASET', {})).get('ZIP_BLOCK_SIZE', config.get('DATA', config.get('DATASET', {})).get('BLOCK_SIZE', 16))
     
     for images, gt_density, points in tqdm(dataloader, desc="Validate Stage1"):
         images, gt_density = images.to(device), gt_density.to(device)
@@ -317,10 +349,44 @@ def main():
     print(f"Device: {device}")
     print("="*60)
 
-    # Setup Modello
-    dataset_name = config['DATASET']
-    bin_config = config['BINS_CONFIG'][dataset_name]
+    # Setup Modello - gestione robusta config
+    dataset_section = config.get('DATASET', {})
+    data_section = config.get('DATA')
+    
+    # Estrai nome dataset
+    if isinstance(dataset_section, dict):
+        dataset_name_raw = dataset_section.get('NAME', 'shha')
+        data_cfg = dict(dataset_section)  # Usa DATASET come DATA
+        if isinstance(data_section, dict):
+            data_cfg.update(data_section)
+    else:
+        dataset_name_raw = dataset_section
+        data_cfg = data_section.copy() if isinstance(data_section, dict) else {}
+    
+    # Normalizza nome dataset
+    normalized = ''.join(c for c in str(dataset_name_raw).lower() if c.isalnum())
+    dataset_name = DATASET_ALIAS_MAP.get(normalized, dataset_name_raw.lower() if isinstance(dataset_name_raw, str) else 'shha')
+    
+    # Ottieni bins config
+    bins_config = config.get('BINS_CONFIG', {})
+    if dataset_name in bins_config:
+        bin_config = bins_config[dataset_name]
+    elif dataset_name in DEFAULT_BINS_CONFIG:
+        bin_config = DEFAULT_BINS_CONFIG[dataset_name]
+    else:
+        raise KeyError(f"No BINS_CONFIG for dataset '{dataset_name}'")
+    
     bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
+    
+    # Defaults per data_cfg
+    if 'NORM_MEAN' not in data_cfg:
+        data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
+    if 'NORM_STD' not in data_cfg:
+        data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
+    if 'ZIP_BLOCK_SIZE' not in data_cfg:
+        data_cfg['ZIP_BLOCK_SIZE'] = data_cfg.get('BLOCK_SIZE', 16)
+    if 'VAL_SPLIT' not in data_cfg:
+        data_cfg['VAL_SPLIT'] = 'val'
 
     zip_head_cfg = config.get("ZIP_HEAD", {})
     zip_head_kwargs = {
@@ -330,18 +396,23 @@ def main():
         "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
+    model_cfg = config.get('MODEL', {})
     model = P2R_ZIP_Model(
         bins=bins,
         bin_centers=bin_centers,
-        backbone_name=config['MODEL']['BACKBONE'],
-        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
-        gate=config['MODEL']['GATE'],
-        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
+        backbone_name=model_cfg.get('BACKBONE', 'vgg16_bn'),
+        pi_thresh=model_cfg.get('ZIP_PI_THRESH', 0.5),
+        gate=model_cfg.get('GATE', 'multiply'),
+        upsample_to_input=model_cfg.get('UPSAMPLE_TO_INPUT', False),
         zip_head_kwargs=zip_head_kwargs,
     ).to(device)
 
     # Caricamento Checkpoint
-    output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
+    exp_cfg = config.get('EXP', {})
+    output_dir = os.path.join(
+        exp_cfg.get('OUT_DIR', config.get('EXPERIMENT_DIR', 'exp')),
+        config.get('RUN_NAME', 'stage1')
+    )
     
     # Cerca checkpoint
     checkpoint_path = os.path.join(output_dir, "best_model.pth")
@@ -361,12 +432,11 @@ def main():
     pos_weight = config.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
     criterion = PiHeadLoss(
         pos_weight=pos_weight,
-        block_size=config['DATA']['ZIP_BLOCK_SIZE']
+        block_size=data_cfg['ZIP_BLOCK_SIZE']
     ).to(device)
 
     # Dataset
-    DatasetClass = get_dataset(config['DATASET'])
-    data_cfg = config['DATA']
+    DatasetClass = get_dataset(dataset_name)
     val_tf = build_transforms(data_cfg, is_train=False)
     
     val_dataset = DatasetClass(
@@ -380,7 +450,7 @@ def main():
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=config['OPTIM_ZIP']['NUM_WORKERS'],
+        num_workers=config.get('OPTIM_ZIP', {}).get('NUM_WORKERS', 4),
         collate_fn=collate_fn
     )
 

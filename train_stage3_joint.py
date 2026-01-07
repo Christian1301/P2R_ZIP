@@ -528,7 +528,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, results, best_mae, outpu
 
 def load_stage2_checkpoint(model, output_dir, device):
     """Carica Stage 2."""
-    for name in ['stage2_best.pth', 'best_model.pth']:
+    for name in ['stage2_bypass_best.pth', 'best_model.pth']:
         path = os.path.join(output_dir, name)
         if os.path.isfile(path):
             print(f"✅ Caricamento Stage 2: {path}")

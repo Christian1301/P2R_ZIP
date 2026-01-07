@@ -19,6 +19,32 @@ from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn, canonicalize_p2r_grid
 
 
+# Default bin definitions shared across scripts so evaluate works even if
+# the config does not explicitly contain BINS_CONFIG.
+DEFAULT_BINS_CONFIG = {
+    'shha': {
+        'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
+        'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
+    },
+    'shhb': {
+        'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
+        'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
+    },
+    'ucf': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'nwpu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'jhu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+}
+
+
 @torch.no_grad()
 def validate_stage2(model, dataloader, device, default_down):
     """Validazione IDENTICA al training."""
@@ -65,29 +91,77 @@ def validate_stage2(model, dataloader, device, default_down):
 
 def main():
     with open('config.yaml') as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
     
-    device = torch.device(config['DEVICE'])
-    init_seeds(config['SEED'])
+    device = torch.device(config.get('DEVICE', 'cuda'))
+    init_seeds(config.get('SEED', 42))
     
     print("="*60)
     print("🔍 EVALUATION STAGE 2 (Allineato)")
     print("="*60)
     
-    # Setup modello
-    data_cfg = config['DATA']
-    bin_config = config['BINS_CONFIG'][config['DATASET']]
+    # Setup modello / dataset compatto anche per vecchi config
+    dataset_section = config.get('DATASET', 'shha')
+    data_section = config.get('DATA')
+
+    if isinstance(dataset_section, dict):
+        dataset_name_raw = dataset_section.get('NAME', 'shha')
+        data_cfg = {}
+        if isinstance(data_section, dict):
+            data_cfg.update(data_section)
+        data_cfg.update(dataset_section)
+    else:
+        dataset_name_raw = dataset_section
+        data_cfg = data_section.copy() if isinstance(data_section, dict) else {}
+
+    alias_map = {
+        'shha': 'shha',
+        'shanghaitecha': 'shha',
+        'shanghaitechparta': 'shha',
+        'shanghaitechaparta': 'shha',
+        'shhb': 'shhb',
+        'shanghaitechpartb': 'shhb',
+        'ucf': 'ucf',
+        'ucfqnrf': 'ucf',
+        'nwpu': 'nwpu',
+        'jhu': 'jhu',
+    }
+    normalized_name = ''.join(ch for ch in str(dataset_name_raw).lower() if ch.isalnum())
+    dataset_name = alias_map.get(normalized_name, str(dataset_name_raw).lower())
+
+    if not data_cfg:
+        raise KeyError("Dataset configuration missing. Provide DATA or DATASET entries with ROOT information.")
+
+    if 'ROOT' not in data_cfg:
+        raise KeyError("Dataset ROOT path missing in DATA / DATASET configuration.")
+
+    if 'NORM_MEAN' not in data_cfg:
+        data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
+    if 'NORM_STD' not in data_cfg:
+        data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
+
+    val_split = data_cfg.get('VAL_SPLIT', data_cfg.get('SPLIT', 'val'))
+    zip_block_size = data_cfg.get('ZIP_BLOCK_SIZE', data_cfg.get('BLOCK_SIZE', 16))
+
+    bins_config = config.get('BINS_CONFIG', {})
+    if dataset_name in bins_config:
+        bin_config = bins_config[dataset_name]
+    elif dataset_name in DEFAULT_BINS_CONFIG:
+        bin_config = DEFAULT_BINS_CONFIG[dataset_name]
+    else:
+        raise KeyError(f"BINS_CONFIG missing definition for dataset '{dataset_name}' and no default is available.")
     
+    model_cfg = config.get('MODEL', {})
     zip_head_cfg = config.get('ZIP_HEAD', {})
     
     model = P2R_ZIP_Model(
         bins=bin_config['bins'],
         bin_centers=bin_config['bin_centers'],
-        backbone_name=config['MODEL']['BACKBONE'],
-        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
-        gate=config['MODEL']['GATE'],
-        upsample_to_input=False,
-        use_ste_mask=True,
+        backbone_name=model_cfg.get('BACKBONE', 'vgg16_bn'),
+        pi_thresh=model_cfg.get('ZIP_PI_THRESH', 0.5),
+        gate=model_cfg.get('GATE', 'multiply'),
+        upsample_to_input=model_cfg.get('UPSAMPLE_TO_INPUT', False),
+        use_ste_mask=model_cfg.get('USE_STE_MASK', False),
         zip_head_kwargs={
             'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
             'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
@@ -96,8 +170,9 @@ def main():
     ).to(device)
     
     # Carica checkpoint
-    output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
-    ckpt_path = os.path.join(output_dir, 'stage2_best.pth')
+    exp_cfg = config.get('EXP', {})
+    output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), config.get('RUN_NAME', 'stage2_eval'))
+    ckpt_path = os.path.join(output_dir, 'stage2_bypass_best.pth')
     
     print(f"\n✅ Caricamento: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -110,13 +185,13 @@ def main():
         print(f"   ⚠️ Usando valore dal checkpoint, NESSUNA ri-calibrazione!")
     
     # Dataset
-    DatasetClass = get_dataset(config['DATASET'])
+    DatasetClass = get_dataset(dataset_name)
     val_transforms = build_transforms(data_cfg, is_train=False)
     
     val_dataset = DatasetClass(
         root=data_cfg['ROOT'],
-        split=data_cfg['VAL_SPLIT'],
-        block_size=data_cfg['ZIP_BLOCK_SIZE'],
+        split=val_split,
+        block_size=zip_block_size,
         transforms=val_transforms,
     )
     

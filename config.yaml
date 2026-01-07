@@ -86,18 +86,28 @@ ZIP_LOSS_V3:
 # STAGE 2: P2R Training - PARAMETRI CRITICI
 # ============================================================
 OPTIM_P2R:
-  EPOCHS: 5000                 # Training lungo per convergenza
+  EPOCHS: 3000                 # Ridotto per regularizzazione
   BATCH_SIZE: 8
   LR: 5.0e-5                   # Learning rate conservativo
   LR_BACKBONE: 1.0e-6          # Backbone quasi congelato
-  WEIGHT_DECAY: 1.0e-4
+  WEIGHT_DECAY: 1.0e-2         # Aumentato per regularizzazione (era 1e-4)
   WARMUP_EPOCHS: 50            # Warmup lungo per stabilità
-  EARLY_STOPPING_PATIENCE: 2500
+  EARLY_STOPPING_PATIENCE: 500 # Ridotto (era 2500)
   GRAD_CLIP: 1.0
   
   # Scheduler
   SCHEDULER: "cosine"
   MIN_LR: 1.0e-7
+  
+  # Regularizzazione P2R Head
+  DROPOUT: 0.3                 # Dropout nei layer intermedi
+  FINAL_DROPOUT: 0.5           # Dropout prima del layer finale
+  
+  # Data Augmentation Aggressiva
+  USE_AGGRESSIVE_AUG: true     # Abilita augmentation aggressiva
+  AUG_SCALE_RANGE: [0.8, 1.2]  # Random scale
+  AUG_ROTATION: 15             # Rotazione ±15°
+  AUG_ERASING_PROB: 0.3        # Random erasing probability
 
 P2R_LOSS:
   # Multi-scale loss
@@ -119,16 +129,17 @@ P2R_LOSS:
 # STAGE 3: Joint Training
 # ============================================================
 OPTIM_JOINT:
-  EPOCHS: 2000
   BATCH_SIZE: 8
-  LR: 1.0e-5
-  LR_BACKBONE: 0.0             # Backbone completamente congelato
-  LR_ZIP: 0.0                  # ZIP head congelato
-  LR_P2R: 1.0e-5               # Solo fine-tuning P2R
+  LR: 1.0e-5          
   WEIGHT_DECAY: 1.0e-4
-  WARMUP_EPOCHS: 10
   EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 0.5
+  EPOCHS: 2000
+  LR_BACKBONE: 0              # Frozen
+  LR_ZIP_HEAD: 1.0e-6         # Era 2e-5 → 20x più basso
+  LR_P2R_HEAD: 5.0e-6         # Era 3e-5 → 6x più basso
+  WARMUP_EPOCHS: 100          # Era 20 → warmup molto più lungo
+  VAL_INTERVAL: 5
 
 JOINT_LOSS:
   COUNT_WEIGHT: 1.0

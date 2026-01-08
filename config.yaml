@@ -1,24 +1,4 @@
-# =================================================================
-# CONFIGURAZIONE V8 - MULTI-SCALE + AUGMENTATION + MORE EPOCHS
-# =================================================================
-# 
-# OBIETTIVO: Migliorare MAE 68.97 → target 63-66
-#
-# MODIFICHE DA V7:
-# 1. Multi-scale loss con scales [1, 2, 4]
-# 2. Stage 2: 3000 → 5000 epoche
-# 3. Data augmentation potenziata:
-#    - CROP_SCALE: [0.5, 1.0] → [0.4, 1.0]
-#    - Color jitter (brightness, contrast, saturation, hue)
-#    - Random grayscale 10%
-#    - Gaussian blur 10%
-# 4. Warmup epochs + gradient clipping
-#
-# RISULTATI V7:
-# - Stage 2: MAE 68.97 (baseline da battere)
-# =================================================================
-
-RUN_NAME: "shha_target60_v9"
+RUN_NAME: "shha_p2rzip_final_v9"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -34,11 +14,9 @@ DATA:
   TRAIN_SPLIT: "train_data"
   VAL_SPLIT: "val_data"
   
-  # *** V8: Data Augmentation POTENZIATA ***
   CROP_SIZE: 384
-  CROP_SCALE: [0.4, 1.0]        # Era [0.5, 1.0] - più variazione di scala
+  CROP_SCALE: [0.4, 1.0]
   
-  # *** V8: Color Jitter ***
   COLOR_JITTER:
     ENABLED: true
     BRIGHTNESS: 0.2
@@ -46,9 +24,8 @@ DATA:
     SATURATION: 0.2
     HUE: 0.1
   
-  # *** V8: Altri augment ***
   HORIZONTAL_FLIP: true
-  RANDOM_GRAY_PROB: 0.1         # 10% probabilità grayscale
+  RANDOM_GRAY_PROB: 0.1
   GAUSSIAN_BLUR:
     ENABLED: true
     PROB: 0.1
@@ -70,12 +47,12 @@ ZIP_HEAD:
   LAMBDA_NOISE_STD: 0.0
 
 # =================================================================
-# STAGE 1 - ZIP PRE-TRAINING (come V7)
+# STAGE 1 - ZIP PRE-TRAINING
 # =================================================================
 OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
-  EPOCHS: 2500
+  EPOCHS: 2000
   WEIGHT_DECAY: 3.0e-5
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
@@ -84,7 +61,7 @@ OPTIM_ZIP:
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
   WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 600
+  EARLY_STOPPING_PATIENCE: 1000
 
 ZIP_LOSS:
   POS_WEIGHT_BCE: 5.0
@@ -103,78 +80,51 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (MASSIMIZZATO V8)
-# =================================================================
-# Strategia: Multi-scale loss + più epoche + augmentation aggressiva
+# STAGE 2 - P2R TRAINING
 # =================================================================
 OPTIM_P2R:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
-  
-  # *** V8: MOLTO più epoche ***
-  EPOCHS: 5000                  # Era 3000 in V7
-  
-  # LR stabile (come V7)
+  EPOCHS: 4000
   LR: 5.0e-5
-  LR_BACKBONE: 1.0e-6           # Fine-tuning leggero backbone
-  
+  LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
-  
-  # *** V8: Warmup per stabilità iniziale ***
   WARMUP_EPOCHS: 50
-  
-  # *** V8: Patience MOLTO aumentata ***
-  EARLY_STOPPING_PATIENCE: 200  # Era 120 in V7
-  
-  # *** V8: Gradient clipping per stabilità ***
+  EARLY_STOPPING_PATIENCE: 1200
   GRAD_CLIP: 1.0
 
-# =================================================================
-# P2R LOSS V8 - MULTI-SCALE
-# =================================================================
 P2R_LOSS:
-  # *** V8: MULTI-SCALE LOSS ***
   USE_MULTI_SCALE: true
-  SCALES: [1, 2, 4]             # Scale factors per pooling
-  SCALE_WEIGHTS: [1.0, 0.5, 0.25]  # Pesi decrescenti per scale maggiori
-  
-  # Loss weights
+  SCALES: [1, 2, 4]
+  SCALE_WEIGHTS: [1.0, 0.5, 0.25]
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
   SPATIAL_WEIGHT: 0.15
-  
-  # P2R parameters
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
-  LOG_SCALE_INIT: 4.0
+  LOG_SCALE_INIT: 2.5     # Coerente con il codice python
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - BIAS CORRECTION (opzionale, dopo Stage 2)
+# STAGE 3 - JOINT TRAINING (COMBINED LOSS)
 # =================================================================
-OPTIM_STAGE3:
-  ENABLED: true                 # Puoi disabilitare se Stage 2 è sufficiente
-  BATCH_SIZE: 4
+OPTIM_JOINT:
+  BATCH_SIZE: 4   # Ridotto per VRAM (Backbone unfrozen)
   NUM_WORKERS: 4
-  EPOCHS: 150
-  LR_P2R: 1.0e-6
-  LR_LOG_SCALE: 1.0e-5
-  LR_PI: 1.0e-4
-  WEIGHT_DECAY: 1.0e-4
-  VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 40
+  EPOCHS: 1000     # Fine-tuning finale
+  # I Learning Rate sono specificati in train_stage3_joint.py
 
-STAGE3_LOSS:
-  OVERESTIMATE_WEIGHT: 2.0
-  COUNT_WEIGHT: 1.0
-  PI_WEIGHT: 0.3
+JOINT_LOSS:
+  # Bilanciamento: 0.3 significa 70% peso ZIP, 30% peso P2R
+  # Questo aiuta a mantenere la struttura globale (ZIP) mentre P2R raffina
+  SOFT_WEIGHT_ALPHA: 0.3 
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

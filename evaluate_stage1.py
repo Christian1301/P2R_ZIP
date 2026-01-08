@@ -1,4 +1,11 @@
 # evaluate_stage1.py
+# -*- coding: utf-8 -*-
+"""
+Evaluate Stage 1 V-Final
+Calcola metriche complete (Accuracy, Recall, Precision) per valutare 
+la qualità della maschera ZIP (Background vs Foreground).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,111 +14,93 @@ from tqdm import tqdm
 import yaml
 import os
 import numpy as np
+import argparse
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
 
-# ============================================================
-# LOSS DI VALIDAZIONE (BCE - STESSA DEL TRAINING)
-# ============================================================
-class PiHeadLoss(nn.Module):
-    def __init__(self, pos_weight=5.0, block_size=16):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.block_size = block_size
-        self.bce = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight]),
-            reduction='mean'
-        )
+def compute_zip_metrics(pred_logits, gt_density, block_size, occupancy_threshold=0.5):
+    """
+    Calcola metriche di classificazione per la maschera ZIP.
+    """
+    # 1. Ground Truth
+    # Downsample densità per ottenere conteggio nel blocco
+    gt_counts = F.avg_pool2d(gt_density, block_size, stride=block_size) * (block_size ** 2)
     
-    def compute_gt_occupancy(self, gt_density):
-        gt_counts_per_block = F.avg_pool2d(
-            gt_density,
-            kernel_size=self.block_size,
-            stride=self.block_size
-        ) * (self.block_size ** 2)
-        return (gt_counts_per_block > 1e-3).float()
+    # Allinea dimensioni se necessario (gestione padding/rounding del modello)
+    if gt_counts.shape[-2:] != pred_logits.shape[-2:]:
+        gt_counts = F.interpolate(gt_counts, size=pred_logits.shape[-2:], mode='nearest')
+        
+    # GT Occupancy: 1 se c'è gente, 0 altrimenti
+    gt_occupancy = (gt_counts > occupancy_threshold).float()
     
-    def forward(self, predictions, gt_density):
-        logit_pi_maps = predictions["logit_pi_maps"]
-        logit_pieno = logit_pi_maps[:, 1:2, :, :] 
-        gt_occupancy = self.compute_gt_occupancy(gt_density)
-        
-        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
-            gt_occupancy = F.interpolate(
-                gt_occupancy, size=logit_pieno.shape[-2:], mode='nearest'
-            )
-        
-        if self.bce.pos_weight.device != logit_pieno.device:
-            self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
-            
-        loss = self.bce(logit_pieno, gt_occupancy)
-        return loss
+    # 2. Predizioni
+    pi_prob = torch.sigmoid(pred_logits)
+    pred_occupancy = (pi_prob > 0.5).float()
+    
+    # 3. Metriche (Accumulatori)
+    # Calcoliamo su tutto il batch appiattito
+    tp = (pred_occupancy * gt_occupancy).sum().item()
+    fp = (pred_occupancy * (1 - gt_occupancy)).sum().item()
+    fn = ((1 - pred_occupancy) * gt_occupancy).sum().item()
+    tn = ((1 - pred_occupancy) * (1 - gt_occupancy)).sum().item()
+    
+    return {
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "gt_pos": gt_occupancy.sum().item(),
+        "total_pixels": gt_occupancy.numel()
+    }
 
 @torch.no_grad()
-def validate_checkpoint(model, criterion, dataloader, device, config, checkpoint_path):
-    """
-    Validazione Stage 1 (BCE Mode).
-    Monitora principalmente la Loss BCE e l'Active Ratio della maschera.
-    """
+def evaluate_model(model, dataloader, device, config):
     model.eval()
-    total_loss = 0.0
-    mae, mse = 0.0, 0.0
-    pi_active_stats = []
-
-    print("\n===== VALUTAZIONE STAGE 1 (BCE) =====")
-    print("Metrica Principale: BCE Loss & Active Ratio (Maschera)")
-    print("------------------------------------------------------")
-
-    progress_bar = tqdm(dataloader, desc="Validating ZIP Stage 1")
-
-    for idx, (images, gt_density, _) in enumerate(progress_bar):
+    
+    # Accumulatori globali
+    stats = {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "gt_pos": 0, "total_pixels": 0}
+    
+    block_size = config['DATA']['ZIP_BLOCK_SIZE']
+    thresh = config.get("ZIP_LOSS", {}).get("OCCUPANCY_THRESHOLD", 0.5)
+    
+    print(f"⚙️  Parametri Valutazione: Block={block_size}, Threshold={thresh}")
+    
+    for images, gt_density, _ in tqdm(dataloader, desc="Evaluating Stage 1"):
         images, gt_density = images.to(device), gt_density.to(device)
-
-        preds = model(images)
-        loss = criterion(preds, gt_density)
-        total_loss += loss.item()
-
-        # Statistiche Maschera
-        pi_logits = preds["logit_pi_maps"]
-        pi_probs = torch.sigmoid(pi_logits[:, 1:2]) # Probabilità "pieno"
         
-        active_ratio = (pi_probs > 0.5).float().mean().item() * 100
-        pi_active_stats.append(active_ratio)
+        outputs = model(images)
+        logit_pi = outputs["logit_pi_maps"][:, 1:2] # Canale 1 = Presenza
+        
+        batch_stats = compute_zip_metrics(logit_pi, gt_density, block_size, thresh)
+        
+        for k in stats:
+            stats[k] += batch_stats[k]
+            
+    # Calcolo Metriche Finali
+    eps = 1e-6
+    accuracy = (stats['tp'] + stats['tn']) / (stats['total_pixels'] + eps) * 100
+    precision = stats['tp'] / (stats['tp'] + stats['fp'] + eps) * 100
+    recall = stats['tp'] / (stats['tp'] + stats['fn'] + eps) * 100
+    f1_score = 2 * (precision * recall) / (precision + recall + eps)
+    
+    # Percentuale di area predetta come positiva
+    pred_pos_ratio = (stats['tp'] + stats['fp']) / (stats['total_pixels'] + eps) * 100
+    gt_pos_ratio = stats['gt_pos'] / (stats['total_pixels'] + eps) * 100
 
-        # Calcolo conteggio (solo indicativo, lambda non è allenato)
-        lam_maps = preds["lambda_maps"]
-        pred_count = torch.sum(pi_probs * lam_maps).item()
-        gt_count = torch.sum(gt_density).item()
-
-        mae += abs(pred_count - gt_count)
-        mse += (pred_count - gt_count) ** 2
-
-        if idx % 20 == 0:
-            print(f"[IMG {idx:03d}] Loss(BCE)={loss.item():.4f} "
-                  f"| π>0.5={active_ratio:.1f}% "
-                  f"| π_mean={pi_probs.mean().item():.3f}")
-
-        progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'active': f"{active_ratio:.1f}%"
-        })
-
-    avg_loss = total_loss / len(dataloader)
-    avg_mae = mae / len(dataloader.dataset)
-    avg_active = np.mean(pi_active_stats)
-
-    print("\n--- RISULTATI FINALI ---")
-    print(f"Checkpoint:      {os.path.basename(checkpoint_path)}")
-    print(f"Validation Loss: {avg_loss:.4f} (BCE)")
-    print(f"Avg Active Mask: {avg_active:.2f}% (Target: 10-30% per folle sparse)")
-    print(f"MAE (Proxy):     {avg_mae:.2f} (⚠️ Non affidabile in Stage 1)")
-    print("-------------------------------------\n")
-
+    return {
+        "Accuracy": accuracy,
+        "Precision": precision,
+        "Recall": recall,
+        "F1-Score": f1_score,
+        "Predicted Area (%)": pred_pos_ratio,
+        "GT Area (%)": gt_pos_ratio
+    }
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default=None, help="Path specifico al checkpoint (opzionale)")
+    args = parser.parse_args()
+
     if not os.path.exists("config.yaml"):
         print("❌ config.yaml non trovato.")
         return
@@ -122,61 +111,15 @@ def main():
     device = torch.device(config['DEVICE'])
     init_seeds(config['SEED'])
 
-    # Setup Modello
+    # 1. Setup Dataset
     dataset_name = config['DATASET']
-    bin_config = config['BINS_CONFIG'][dataset_name]
-    bins, bin_centers = bin_config['bins'], bin_config['bin_centers']
-
-    zip_head_cfg = config.get("ZIP_HEAD", {})
-    zip_head_kwargs = {
-        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
-        "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
-        "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
-        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
-    }
-
-    model = P2R_ZIP_Model(
-        bins=bins,
-        bin_centers=bin_centers,
-        backbone_name=config['MODEL']['BACKBONE'],
-        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
-        gate=config['MODEL']['GATE'],
-        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
-        zip_head_kwargs=zip_head_kwargs,
-    ).to(device)
-
-    # Caricamento Checkpoint
-    output_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
-    # Cerca prima il best_model, poi last.pth
-    checkpoint_path = os.path.join(output_dir, "best_model.pth")
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = os.path.join(output_dir, "last.pth")
-
-    if not os.path.isfile(checkpoint_path):
-        print(f"❌ Errore: Nessun checkpoint trovato in {output_dir}")
-        return
-
-    print(f"✅ Caricamento checkpoint da {checkpoint_path}...")
-    raw_state = torch.load(checkpoint_path, map_location=device)
-    state_dict = raw_state.get('model', raw_state)
-    model.load_state_dict(state_dict, strict=False)
-    print("✅ Modello caricato.")
-
-    # Setup Loss (BCE)
-    pos_weight = config.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
-    criterion = PiHeadLoss(
-        pos_weight=pos_weight,
-        block_size=config['DATA']['ZIP_BLOCK_SIZE']
-    ).to(device)
-
-    # Dataset
-    DatasetClass = get_dataset(config['DATASET'])
-    data_cfg = config['DATA']
-    val_tf = build_transforms(data_cfg, is_train=False)
+    DatasetClass = get_dataset(dataset_name)
+    val_tf = build_transforms(config['DATA'], is_train=False)
+    
     val_dataset = DatasetClass(
-        root=data_cfg['ROOT'],
-        split=data_cfg['VAL_SPLIT'],
-        block_size=data_cfg['ZIP_BLOCK_SIZE'],
+        root=config['DATA']['ROOT'],
+        split=config['DATA']['VAL_SPLIT'],
+        block_size=config['DATA']['ZIP_BLOCK_SIZE'],
         transforms=val_tf,
     )
 
@@ -184,11 +127,68 @@ def main():
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=config['OPTIM_ZIP']['NUM_WORKERS'],
+        num_workers=4,
         collate_fn=collate_fn
     )
 
-    validate_checkpoint(model, criterion, val_loader, device, config, checkpoint_path)
+    # 2. Setup Modello
+    bin_config = config['BINS_CONFIG'][dataset_name]
+    model = P2R_ZIP_Model(
+        backbone_name=config['MODEL']['BACKBONE'],
+        pi_thresh=config['MODEL']['ZIP_PI_THRESH'],
+        bins=bin_config['bins'], 
+        bin_centers=bin_config['bin_centers'],
+        upsample_to_input=config['MODEL']['UPSAMPLE_TO_INPUT'],
+    ).to(device)
+
+    # 3. Identifica Checkpoints da testare
+    out_dir = os.path.join(config['EXP']['OUT_DIR'], config['RUN_NAME'])
+    
+    checkpoints = []
+    if args.ckpt:
+        checkpoints.append(("Custom", args.ckpt))
+    else:
+        # Cerca i due candidati principali
+        p1 = os.path.join(out_dir, "best_model.pth")     # Best Loss
+        p2 = os.path.join(out_dir, "stage1_best_acc.pth") # Best Accuracy (se esiste)
+        
+        if os.path.exists(p1): checkpoints.append(("Best Loss (Standard)", p1))
+        if os.path.exists(p2): checkpoints.append(("Best Accuracy", p2))
+        
+        if not checkpoints:
+            # Fallback
+            p3 = os.path.join(out_dir, "last.pth")
+            if os.path.exists(p3): checkpoints.append(("Last Epoch", p3))
+
+    if not checkpoints:
+        print(f"❌ Nessun checkpoint trovato in {out_dir}")
+        return
+
+    print(f"📊 Avvio Valutazione Stage 1 su {len(checkpoints)} checkpoint(s)\n")
+
+    for name, path in checkpoints:
+        print(f"🔹 Valutando: {name}")
+        print(f"   Path: {path}")
+        
+        try:
+            ckpt = torch.load(path, map_location=device)
+            state = ckpt['model'] if 'model' in ckpt else ckpt
+            model.load_state_dict(state, strict=False)
+            
+            results = evaluate_model(model, val_loader, device, config)
+            
+            print(f"   ✅ Risultati:")
+            print(f"      Accuracy:  {results['Accuracy']:.2f}%")
+            print(f"      Precision: {results['Precision']:.2f}%")
+            print(f"      Recall:    {results['Recall']:.2f}%")
+            print(f"      F1-Score:  {results['F1-Score']:.2f}%")
+            print(f"      GT Area:   {results['GT Area (%)']:.2f}% (Dataset reale)")
+            print(f"      Pred Area: {results['Predicted Area (%)']:.2f}% (Maschera predetta)")
+            print("-" * 60)
+            
+        except Exception as e:
+            print(f"   ⚠️ Errore caricamento {path}: {e}")
+            print("-" * 60)
 
 if __name__ == '__main__':
     main()

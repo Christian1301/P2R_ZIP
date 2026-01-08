@@ -1,18 +1,11 @@
 # models/p2r_head.py
 # -*- coding: utf-8 -*-
 """
-P2RHead Module - VERSIONE CORRETTA V2
+P2RHead Module - VERSIONE OTTIMIZZATA V9
 
-PROBLEMA RISOLTO:
-La versione originale inizializzava log_scale a -1.0 (scala=0.37) e lo clampava
-a [-1.5, 1.0] (scala max=2.7). Questo impediva al modello di predire conteggi
-nell'ordine delle centinaia.
-
-SOLUZIONE:
-- log_scale inizializzato a 4.0 (scala ~55)
-- Nessun clamp restrittivo di default
-- GroupNorm per stabilizzare le feature in input
-- BatchNorm nei layer conv per training più stabile
+Modifiche:
+- Inizializzazione log_scale più conservativa (2.5 invece di 4.0)
+  per ridurre il bias di sovrastima iniziale e facilitare il fine-tuning.
 """
 
 import torch
@@ -46,20 +39,14 @@ def conv_3x3(in_channels, out_channels, bn=True):
 
 class P2RHead(nn.Module):
     """
-    Decoder P2R con inizializzazione corretta per crowd counting.
-    
-    Modifiche rispetto all'originale:
-    1. log_scale inizializzato a 4.0 (era -1.0)
-    2. GroupNorm sulle feature in input per stabilità
-    3. BatchNorm nei layer conv
-    4. Output: ReLU * exp(log_scale)
+    Decoder P2R con inizializzazione bilanciata.
     """
     
     def __init__(
         self, 
-        in_channel: int = 512,      # Default per VGG backbone (era 128)
+        in_channel: int = 512,
         fea_channel: int = 64, 
-        up_scale: int = 2,          # Default 2 per upscale 2x (era 1)
+        up_scale: int = 2,
         out_channel: int = 1, 
         debug: bool = False
     ):
@@ -68,18 +55,17 @@ class P2RHead(nn.Module):
         self.up_scale = up_scale
         self.base_stride = 8
         
-        # CORREZIONE CRITICA: log_scale inizializzato MOLTO più alto
-        # exp(4.0) ≈ 55, ragionevole per density counting
-        # L'originale usava -1.0 → exp(-1.0) ≈ 0.37, troppo basso!
+        # MODIFICA V9: Inizializzazione a 2.5 (scala ~12) invece di 4.0 (scala ~55)
+        # Questo riduce il rischio di esplosione del conteggio nelle prime fasi
         self.log_scale = nn.Parameter(
-            torch.tensor(4.0, dtype=torch.float32), 
+            torch.tensor(2.5, dtype=torch.float32), 
             requires_grad=True
         )
         
         # GroupNorm per stabilizzare le feature in input
         self.input_norm = nn.GroupNorm(32, in_channel)
         
-        # Decoder con BatchNorm per training più stabile
+        # Decoder
         self.layer1 = conv_3x3(in_channel, fea_channel, bn=True)
         self.layer2 = conv_3x3(fea_channel, fea_channel, bn=True)
         
@@ -93,13 +79,9 @@ class P2RHead(nn.Module):
         # Inizializzazione output layer
         init.kaiming_normal_(self.conv_out.weight, mode='fan_out', nonlinearity='relu')
         if self.conv_out.bias is not None:
-            init.constant_(self.conv_out.bias, 0.1)  # Bias leggermente positivo
+            init.constant_(self.conv_out.bias, 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.debug:
-            print(f"[P2RHead] Input: shape={tuple(x.shape)}, "
-                  f"range=[{x.min().item():.4f}, {x.max().item():.4f}]")
-
         # Normalizza input per stabilità
         x = self.input_norm(x)
         
@@ -113,13 +95,7 @@ class P2RHead(nn.Module):
         scale = torch.exp(self.log_scale)
         out = torch.relu(out) * scale
 
-        if self.debug:
-            print(f"[P2RHead] Output: shape={tuple(out.shape)}, "
-                  f"range=[{out.min().item():.4f}, {out.max().item():.4f}], "
-                  f"scale={scale.item():.4f}")
-
         return out
     
     def get_scale(self) -> float:
-        """Ritorna il fattore di scala corrente."""
         return torch.exp(self.log_scale).item()

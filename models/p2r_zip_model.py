@@ -1,13 +1,13 @@
 # P2R_ZIP/models/p2r_zip_model.py
-# VERSIONE CORRETTA V2 - Con Straight-Through Estimator (STE)
+# VERSIONE CORRETTA V3 - Logic Strict Gating (Output Masking)
 #
 # PROBLEMA RISOLTO:
-# La versione originale usava soft mask in training e hard mask in eval,
-# causando mismatch e performance degradate (MAE 291 vs target 65).
+# Anche con feature masking (gated = feat * mask), i bias dei layer convoluzionali
+# producevano valori non-zero (es. 0.001) nelle zone vuote.
 #
 # SOLUZIONE:
-# Straight-Through Estimator: forward usa hard mask, backward usa soft gradients.
-# Questo permette alla P2R head di "vedere" lo stesso masking in train e eval.
+# Output Masking: dens = dens * mask.
+# Forza matematicamente lo zero assoluto nelle zone scartate dallo ZIP.
 
 import torch
 import torch.nn as nn
@@ -22,13 +22,6 @@ from .p2r_head import P2RHead
 class STEMask(torch.autograd.Function):
     """
     Straight-Through Estimator per il masking.
-    
-    Forward: applica hard threshold (binario)
-    Backward: passa gradienti attraverso soft mask (differenziabile)
-    
-    Questo permette:
-    - Training: gradienti fluiscono attraverso il π-head
-    - Inference: comportamento identico al training (hard mask)
     """
     @staticmethod
     def forward(ctx, soft_mask, threshold):
@@ -39,26 +32,17 @@ class STEMask(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         soft_mask, = ctx.saved_tensors
-        # Passa il gradiente attraverso la soft mask
-        # Usa sigmoid derivative come proxy: σ(x)(1-σ(x))
-        # Ma qui soft_mask è già una probabilità, quindi usiamo direttamente
-        grad_input = grad_output * soft_mask * (1 - soft_mask + 0.1)  # +0.1 per evitare zero gradients
+        grad_input = grad_output * soft_mask * (1 - soft_mask + 0.1)
         return grad_input, None
 
 
 def ste_mask(soft_mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-    """Applica STE masking."""
     return STEMask.apply(soft_mask, threshold)
 
 
 class P2R_ZIP_Model(nn.Module):
     """
-    Modello P2R-ZIP con masking unificato via STE.
-    
-    Modifiche V2:
-    1. STE per train/eval consistency
-    2. Opzione per bypass masking (usa raw density)
-    3. Debug logging migliorato
+    Modello P2R-ZIP con Strict Gating logic.
     """
     
     def __init__(
@@ -70,8 +54,8 @@ class P2R_ZIP_Model(nn.Module):
         gate: str = "multiply",
         upsample_to_input: bool = True,
         debug: bool = False,
-        use_ste_mask: bool = True,  # NUOVO: abilita STE
-        mask_residual: float = 0.0,  # NUOVO: residual connection (0 = no residual)
+        use_ste_mask: bool = True,
+        mask_residual: float = 0.0,
         zip_head_kwargs: Optional[dict] = None,
         p2r_head_kwargs: Optional[dict] = None,
     ):
@@ -103,111 +87,80 @@ class P2R_ZIP_Model(nn.Module):
         self.mask_residual = mask_residual
 
     def _compute_mask(self, pi_not_zero: torch.Tensor) -> torch.Tensor:
-        """
-        Calcola la maschera con comportamento CONSISTENTE tra train e eval.
-        
-        Usa STE: forward hard, backward soft.
-        """
+        """Calcola la maschera ZIP."""
         if self.use_ste_mask:
-            # STE: stesso comportamento in train e eval
-            # Forward: hard threshold
-            # Backward: gradienti passano attraverso soft mask
             if self.training:
                 mask = ste_mask(pi_not_zero, self.pi_thresh)
             else:
                 mask = (pi_not_zero > self.pi_thresh).float()
         else:
-            # Comportamento legacy (DEPRECATO - causa mismatch)
             if self.training:
-                mask = pi_not_zero + 0.1
-                mask = torch.clamp(mask, 0.0, 1.0)
+                mask = torch.clamp(pi_not_zero + 0.1, 0.0, 1.0)
             else:
                 mask = (pi_not_zero > self.pi_thresh).float()
         
-        # Opzionale: residual connection per non azzerare completamente
         if self.mask_residual > 0:
             mask = mask + self.mask_residual * (1 - mask)
-        
         return mask
 
     def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> dict:
-        """
-        Forward pass con output dettagliati.
-        
-        Args:
-            x: Input tensor [B, 3, H, W]
-            return_intermediates: Se True, ritorna anche feature intermedie
-            
-        Returns:
-            dict con:
-            - logit_pi_maps: [B, 2, Hb, Wb] logits π-head
-            - logit_bin_maps: [B, num_bins-1, Hb, Wb] logits bin
-            - lambda_maps: [B, 1, Hb, Wb] rate Poisson
-            - pred_density_zip: [B, 1, Hb, Wb] densità ZIP (π * λ)
-            - p2r_density: [B, 1, H', W'] densità P2R
-            - p2r_density_raw: [B, 1, H', W'] densità P2R SENZA masking (per debug)
-            - mask: [B, 1, Hf, Wf] maschera applicata
-            - pi_probs: [B, 1, Hb, Wb] probabilità π (softmax)
-        """
         B, C, H, W = x.shape
         
-        # Backbone features
+        # 1. Backbone
         feat = self.backbone(x)
         
-        # ZIP head
+        # 2. ZIP Head (Classificazione Blocchi)
         zip_outputs = self.zip_head(feat, self.bin_centers)
         logit_pi_maps = zip_outputs["logit_pi_maps"]
         lambda_maps = zip_outputs["lambda_maps"]
         
-        # Probabilità π (canale 1 = "pieno")
         pi_softmax = logit_pi_maps.softmax(dim=1)
         pi_not_zero = pi_softmax[:, 1:]  # [B, 1, Hb, Wb]
         
-        # Maschera con STE
+        # 3. Maschera ZIP
         mask = self._compute_mask(pi_not_zero)
         
-        # Resize mask to feature size se necessario
+        # Resize mask per feature gating
         if mask.shape[-2:] != feat.shape[-2:]:
-            mask_resized = F.interpolate(
-                mask, size=feat.shape[-2:], 
-                mode="bilinear", align_corners=False
-            )
+            mask_feat = F.interpolate(mask, size=feat.shape[-2:], mode="nearest")
         else:
-            mask_resized = mask
+            mask_feat = mask
         
-        # Debug logging
-        if self.debug:
-            with torch.no_grad():
-                active_ratio = mask.mean().item() * 100
-                pi_mean = pi_not_zero.mean().item()
-                print(f"[P2R_ZIP] π_mean={pi_mean:.3f}, mask_active={active_ratio:.1f}%, "
-                      f"thresh={self.pi_thresh}, ste={self.use_ste_mask}")
-        
-        # Gating
+        # 4. Feature Gating (Input Masking)
+        # Questo aiuta il modello a non vedere il noise
         if self.gate == "multiply":
-            gated = feat * mask_resized
+            gated = feat * mask_feat
         elif self.gate == "concat":
-            gated = torch.cat([feat, mask_resized.expand_as(feat[:, :1, :, :])], dim=1)
+            gated = torch.cat([feat, mask_feat.expand_as(feat[:, :1, :, :])], dim=1)
         else:
-            raise ValueError(f"gate deve essere 'multiply' o 'concat', ricevuto: {self.gate}")
+            raise ValueError(f"gate ignoto: {self.gate}")
         
-        # P2R head
+        # 5. P2R Head (Regressione)
         dens = self.p2r_head(gated)
         
-        # Calcola anche density RAW (senza masking) per confronto
+        # Calcolo RAW per debug/visualizzazione (senza masking)
+        dens_raw = None
         if return_intermediates or self.debug:
             with torch.no_grad():
-                dens_raw = self.p2r_head(feat)
+                dens_raw = self.p2r_head(feat) # P2R su feature originali
                 if self.upsample_to_input:
                     dens_raw = F.interpolate(dens_raw, size=(H, W), mode="bilinear", align_corners=False)
-        else:
-            dens_raw = None
-        
-        # Upsample se richiesto
+
+        # Upsample densità finale
         if self.upsample_to_input:
             dens = F.interpolate(dens, size=(H, W), mode="bilinear", align_corners=False)
         
-        # ZIP density map
+        # 6. STRICT OUTPUT MASKING (La tua richiesta specifica)
+        # Forza a 0.0 l'output dove ZIP dice "vuoto".
+        # Elimina i bias residui del P2R.
+        if mask.shape[-2:] != dens.shape[-2:]:
+            mask_final = F.interpolate(mask, size=dens.shape[-2:], mode="nearest")
+        else:
+            mask_final = mask
+            
+        dens = dens * mask_final
+
+        # Output ZIP density (solo per riferimento)
         pred_density_zip = pi_not_zero * lambda_maps
         
         outputs = {
@@ -215,7 +168,7 @@ class P2R_ZIP_Model(nn.Module):
             "logit_bin_maps": zip_outputs["logit_bin_maps"],
             "lambda_maps": lambda_maps,
             "pred_density_zip": pred_density_zip,
-            "p2r_density": dens,
+            "p2r_density": dens,              # Output finale mascherato
             "mask": mask,
             "pi_probs": pi_not_zero,
         }
@@ -225,29 +178,5 @@ class P2R_ZIP_Model(nn.Module):
         
         return outputs
     
-    def get_count_from_density(
-        self, 
-        density: torch.Tensor, 
-        cell_area: float = 1.0,
-        apply_mask: bool = False,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Calcola il conteggio dalla density map.
-        
-        Args:
-            density: [B, 1, H, W] density map
-            cell_area: area di ogni cella (per downsampling)
-            apply_mask: se applicare la maschera π
-            mask: maschera custom, se None usa self.mask
-            
-        Returns:
-            [B] conteggio per ogni immagine
-        """
-        if apply_mask and mask is not None:
-            if mask.shape[-2:] != density.shape[-2:]:
-                mask = F.interpolate(mask, size=density.shape[-2:], mode="nearest")
-            density = density * mask
-        
-        count = torch.sum(density, dim=(1, 2, 3)) / cell_area
-        return count
+    def get_count_from_density(self, density, cell_area=1.0):
+        return torch.sum(density, dim=(1, 2, 3)) / cell_area

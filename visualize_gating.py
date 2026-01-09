@@ -182,17 +182,29 @@ def get_predictions(model, img_tensor):
         "p2r_raw": p2r_raw, 
     }
 
-def draw_patch_grid(img_rgb, patch_h, patch_w, color=(200, 200, 200), thickness=1):
-    """Disegna una griglia di patch sull'immagine."""
+def draw_patch_grid(img_rgb, patch_h, patch_w, color=(255, 0, 0), thickness=2):
+    """
+    Disegna una griglia di patch sull'immagine.
+    MODIFICA: Colore Rosso (255, 0, 0) e spessore 2 per visibilità.
+    """
     img_grid = img_rgb.copy()
     h, w = img_grid.shape[:2]
 
+    # Assicurati che il passo sia almeno 1 pixel
+    step_x = max(1, int(patch_w))
+    step_y = max(1, int(patch_h))
+
     # Linee verticali
-    for x in range(0, w, patch_w):
+    for x in range(0, w, step_x):
         cv2.line(img_grid, (x, 0), (x, h), color, thickness)
+    
     # Linee orizzontali
-    for y in range(0, h, patch_h):
+    for y in range(0, h, step_y):
         cv2.line(img_grid, (0, y), (w, y), color, thickness)
+
+    # Disegna anche i bordi finali per chiudere la griglia
+    cv2.line(img_grid, (w-1, 0), (w-1, h), color, thickness)
+    cv2.line(img_grid, (0, h-1), (w, h-1), color, thickness)
 
     return img_grid
 

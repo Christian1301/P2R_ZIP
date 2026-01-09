@@ -1,4 +1,4 @@
-RUN_NAME: "shha_p2rzip_final_v9"
+RUN_NAME: "shha_p2rzip_vgg19bn"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -33,11 +33,12 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
+  BACKBONE: "vgg19_bn"
   ZIP_PI_THRESH: 0.2
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: true
+  # IMPORTANTE: Disabilita STE per abilitare il Soft Gating in training nello stage 3
+  USE_STE_MASK: false
 
 # === ZIP HEAD ===
 ZIP_HEAD:
@@ -116,15 +117,17 @@ P2R_LOSS:
 # STAGE 3 - JOINT TRAINING (COMBINED LOSS)
 # =================================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 4   # Ridotto per VRAM (Backbone unfrozen)
+  BATCH_SIZE: 4   
   NUM_WORKERS: 4
-  EPOCHS: 1000     # Fine-tuning finale
-  # I Learning Rate sono specificati in train_stage3_joint.py
+  EPOCHS: 500       # Epoche ridotte per fine-tuning delicato
+  LR_BACKBONE: 1.0e-6  # LR bassissimo per non rompere le feature
+  LR_HEADS: 1.0e-5     # LR basso per raffinamento
 
 JOINT_LOSS:
-  # Bilanciamento: 0.95 significa 5% peso ZIP, 95% peso P2R
-  # Quasi solo P2R, ZIP minimo per stabilità maschera
-  SOFT_WEIGHT_ALPHA: 0.95 
+  # Pesi fissi per stabilità
+  FIXED_ZIP_WEIGHT: 0.1     # Mantiene la struttura senza dominare
+  FIXED_P2R_WEIGHT: 1.0     # Priorità al conteggio MAE
+  USE_SOFT_WEIGHTING: false # Disabilita uncertainty weighting automatico
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

@@ -1,13 +1,9 @@
-# P2R_ZIP/models/p2r_zip_model.py
-# VERSIONE CORRETTA V3 - Logic Strict Gating (Output Masking)
+# models/p2r_zip_model.py
+# VERSIONE V4 - Soft Gating Training Support
 #
-# PROBLEMA RISOLTO:
-# Anche con feature masking (gated = feat * mask), i bias dei layer convoluzionali
-# producevano valori non-zero (es. 0.001) nelle zone vuote.
-#
-# SOLUZIONE:
-# Output Masking: dens = dens * mask.
-# Forza matematicamente lo zero assoluto nelle zone scartate dallo ZIP.
+# MODIFICHE:
+# - Supporto per Soft Gating durante il training (gradient flow garantito).
+# - Output Masking applicato SOLO in valutazione (non "uccide" il training del P2R).
 
 import torch
 import torch.nn as nn
@@ -20,9 +16,7 @@ from .p2r_head import P2RHead
 
 
 class STEMask(torch.autograd.Function):
-    """
-    Straight-Through Estimator per il masking.
-    """
+    """Straight-Through Estimator per il masking."""
     @staticmethod
     def forward(ctx, soft_mask, threshold):
         hard_mask = (soft_mask > threshold).float()
@@ -42,7 +36,7 @@ def ste_mask(soft_mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
 
 class P2R_ZIP_Model(nn.Module):
     """
-    Modello P2R-ZIP con Strict Gating logic.
+    Modello P2R-ZIP con supporto Dual Mode (Hard Gating Eval / Soft Gating Train).
     """
     
     def __init__(
@@ -88,16 +82,19 @@ class P2R_ZIP_Model(nn.Module):
 
     def _compute_mask(self, pi_not_zero: torch.Tensor) -> torch.Tensor:
         """Calcola la maschera ZIP."""
+        # Se use_ste_mask è False (es. Stage 3), usiamo Soft Masking puro in training
+        if self.training and not self.use_ste_mask:
+            return pi_not_zero  # Soft mask (probabilità)
+
+        # Altrimenti logica standard (STE o Hard Threshold)
         if self.use_ste_mask:
             if self.training:
                 mask = ste_mask(pi_not_zero, self.pi_thresh)
             else:
                 mask = (pi_not_zero > self.pi_thresh).float()
         else:
-            if self.training:
-                mask = torch.clamp(pi_not_zero + 0.1, 0.0, 1.0)
-            else:
-                mask = (pi_not_zero > self.pi_thresh).float()
+            # Fallback se non in training
+            mask = (pi_not_zero > self.pi_thresh).float()
         
         if self.mask_residual > 0:
             mask = mask + self.mask_residual * (1 - mask)
@@ -117,7 +114,7 @@ class P2R_ZIP_Model(nn.Module):
         pi_softmax = logit_pi_maps.softmax(dim=1)
         pi_not_zero = pi_softmax[:, 1:]  # [B, 1, Hb, Wb]
         
-        # 3. Maschera ZIP
+        # 3. Maschera ZIP (Soft in training Stage 3, Hard in Eval/Stage 2)
         mask = self._compute_mask(pi_not_zero)
         
         # Resize mask per feature gating
@@ -127,7 +124,6 @@ class P2R_ZIP_Model(nn.Module):
             mask_feat = mask
         
         # 4. Feature Gating (Input Masking)
-        # Questo aiuta il modello a non vedere il noise
         if self.gate == "multiply":
             gated = feat * mask_feat
         elif self.gate == "concat":
@@ -138,11 +134,11 @@ class P2R_ZIP_Model(nn.Module):
         # 5. P2R Head (Regressione)
         dens = self.p2r_head(gated)
         
-        # Calcolo RAW per debug/visualizzazione (senza masking)
+        # Calcolo RAW per debug
         dens_raw = None
         if return_intermediates or self.debug:
             with torch.no_grad():
-                dens_raw = self.p2r_head(feat) # P2R su feature originali
+                dens_raw = self.p2r_head(feat)
                 if self.upsample_to_input:
                     dens_raw = F.interpolate(dens_raw, size=(H, W), mode="bilinear", align_corners=False)
 
@@ -150,15 +146,20 @@ class P2R_ZIP_Model(nn.Module):
         if self.upsample_to_input:
             dens = F.interpolate(dens, size=(H, W), mode="bilinear", align_corners=False)
         
-        # 6. STRICT OUTPUT MASKING (La tua richiesta specifica)
-        # Forza a 0.0 l'output dove ZIP dice "vuoto".
-        # Elimina i bias residui del P2R.
-        if mask.shape[-2:] != dens.shape[-2:]:
-            mask_final = F.interpolate(mask, size=dens.shape[-2:], mode="nearest")
-        else:
-            mask_final = mask
-            
-        dens = dens * mask_final
+        # 6. STRICT OUTPUT MASKING
+        # CRUCIALE: In training (se soft), NON applichiamo output masking rigido.
+        # Lasciamo che P2R impari a predire zero dove serve, guidato dal feature gating.
+        # In Validazione/Inference, applichiamo il taglio netto per pulire il rumore.
+        
+        apply_output_masking = not self.training
+        
+        if apply_output_masking:
+            # In eval 'mask' è già binaria (0 o 1) grazie a _compute_mask
+            if mask.shape[-2:] != dens.shape[-2:]:
+                mask_final = F.interpolate(mask, size=dens.shape[-2:], mode="nearest")
+            else:
+                mask_final = mask
+            dens = dens * mask_final
 
         # Output ZIP density (solo per riferimento)
         pred_density_zip = pi_not_zero * lambda_maps
@@ -168,7 +169,7 @@ class P2R_ZIP_Model(nn.Module):
             "logit_bin_maps": zip_outputs["logit_bin_maps"],
             "lambda_maps": lambda_maps,
             "pred_density_zip": pred_density_zip,
-            "p2r_density": dens,              # Output finale mascherato
+            "p2r_density": dens,              
             "mask": mask,
             "pi_probs": pi_not_zero,
         }

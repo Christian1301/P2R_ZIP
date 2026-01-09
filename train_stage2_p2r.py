@@ -443,7 +443,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml')
-    parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--no-resume', action='store_true', help='Disabilita resume automatico')
     args = parser.parse_args()
     
     # Carica config
@@ -659,13 +659,14 @@ def main():
         max_radius=loss_cfg.get('MAX_RADIUS', 64.0),
     )
     
-    # Resume se richiesto
+    # Resume automatico
     start_epoch = 1
     best_mae = float('inf')
     no_improve_count = 0
-    
+
     checkpoint_path = os.path.join(output_dir, "stage2_last.pth")
-    if args.resume and os.path.isfile(checkpoint_path):
+    if not args.no_resume and os.path.isfile(checkpoint_path):
+        print(f"🔄 Trovato checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
@@ -673,7 +674,7 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         best_mae = ckpt.get('best_mae', float('inf'))
         no_improve_count = ckpt.get('no_improve_count', 0)
-        print(f"✅ Resumed from epoch {start_epoch-1}, best MAE: {best_mae:.2f}")
+        print(f"✅ Resume da epoca {start_epoch}, best MAE: {best_mae:.2f}")
     
     # Valutazione iniziale
     print("\n📋 Valutazione iniziale:")
@@ -735,16 +736,15 @@ def main():
                 print(f"\n⛔ Early stopping @ epoch {epoch} (no improvement for {patience} epochs)")
                 break
         
-        # Salva checkpoint periodico
-        if epoch % 100 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_mae': best_mae,
-                'no_improve_count': no_improve_count,
-            }, os.path.join(output_dir, "stage2_last.pth"))
+        # Salva checkpoint per resume (ogni epoca)
+        torch.save({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_mae': best_mae,
+            'no_improve_count': no_improve_count,
+        }, os.path.join(output_dir, "stage2_last.pth"))
     
     # Risultati finali
     print("\n" + "=" * 60)

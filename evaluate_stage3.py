@@ -328,16 +328,18 @@ def main():
     p2r_cfg = cfg.get("P2R_LOSS", {})
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
 
-    print("\n🔧 Calibrazione log_scale pre-eval...")
-    calibrate_density_scale(
-        model,
-        val_loader,
-        device,
-        default_down,
-        max_batches=15,
-        clamp_range=p2r_cfg.get("LOG_SCALE_CLAMP"),
-        max_adjust=0.5,
-    )
+    # NOTA: Calibrazione disabilitata - usava log_scale diverso dal training
+    # print("\n🔧 Calibrazione log_scale pre-eval...")
+    # calibrate_density_scale(
+    #     model,
+    #     val_loader,
+    #     device,
+    #     default_down,
+    #     max_batches=15,
+    #     clamp_range=p2r_cfg.get("LOG_SCALE_CLAMP"),
+    #     max_adjust=0.5,
+    # )
+    print("\n📋 Valutazione senza calibrazione (usa pesi salvati così come sono)")
 
     # *** USA LA SOGLIA DAL CONFIG ***
     evaluate_stage3(model, val_loader, device, default_down, pi_threshold=pi_threshold)

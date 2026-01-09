@@ -198,11 +198,17 @@ def validate(model, criterion, dataloader, device):
 
 
 def main():
-    if not os.path.exists("config.yaml"):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config.yaml')
+    parser.add_argument('--no-resume', action='store_true', help='Disabilita resume automatico')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.config):
         print("❌ Config mancante")
         return
 
-    with open("config.yaml") as f: config = yaml.safe_load(f)
+    with open(args.config) as f: config = yaml.safe_load(f)
     device = torch.device(config["DEVICE"])
     init_seeds(config["SEED"])
 
@@ -252,13 +258,28 @@ def main():
     # 4. Training Loop
     out_dir = os.path.join(config["EXP"]["OUT_DIR"], config["RUN_NAME"])
     os.makedirs(out_dir, exist_ok=True)
-    
+
     best_loss = float('inf')
     best_acc = 0.0  # NUOVA METRICA
-    
+    start_epoch = 1
+
+    # Resume automatico
+    checkpoint_path = os.path.join(out_dir, "stage1_last.pth")
+    if not args.no_resume and os.path.isfile(checkpoint_path):
+        print(f"🔄 Trovato checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt and scheduler is not None:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt['epoch'] + 1
+        best_loss = ckpt.get('best_loss', float('inf'))
+        best_acc = ckpt.get('best_acc', 0.0)
+        print(f"✅ Resume da epoca {start_epoch}, best_loss: {best_loss:.4f}, best_acc: {best_acc:.2f}%")
+
     print(f"🚀 Avvio Stage 1 (Salvataggio: Best Loss & Best Acc)")
-    
-    for epoch in range(1, optim_cfg["EPOCHS"] + 1):
+
+    for epoch in range(start_epoch, optim_cfg["EPOCHS"] + 1):
         # Train
         train_loss, train_met = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device, epoch)
         
@@ -282,6 +303,16 @@ def main():
                     os.path.join(out_dir, "stage1_best_acc.pth")
                 )
                 print(f"   ⭐ New Best Accuracy: {best_acc:.2f}%")
+
+        # Salvataggio checkpoint per resume (ogni epoca)
+        torch.save({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict() if scheduler else None,
+            'best_loss': best_loss,
+            'best_acc': best_acc,
+        }, os.path.join(out_dir, "stage1_last.pth"))
 
 if __name__ == "__main__":
     main()

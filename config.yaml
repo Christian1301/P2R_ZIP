@@ -122,9 +122,9 @@ OPTIM_JOINT:
   # I Learning Rate sono specificati in train_stage3_joint.py
 
 JOINT_LOSS:
-  # Bilanciamento: 0.3 significa 70% peso ZIP, 30% peso P2R
-  # Questo aiuta a mantenere la struttura globale (ZIP) mentre P2R raffina
-  SOFT_WEIGHT_ALPHA: 0.3 
+  # Bilanciamento: 0.95 significa 5% peso ZIP, 95% peso P2R
+  # Quasi solo P2R, ZIP minimo per stabilità maschera
+  SOFT_WEIGHT_ALPHA: 0.95 
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

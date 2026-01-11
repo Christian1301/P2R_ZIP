@@ -267,7 +267,7 @@ def main():
     checkpoint_path = os.path.join(out_dir, "stage1_last.pth")
     if not args.no_resume and os.path.isfile(checkpoint_path):
         print(f"🔄 Trovato checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt and scheduler is not None:

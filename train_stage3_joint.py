@@ -3,11 +3,6 @@
 """
 Stage 3 V-Final FIXED - Joint Training con Pesi Fissi e Backbone Unfreeze
 Obiettivo: Fine-tuning collaborativo ZIP + P2R
-
-MODIFICHE CRITICHE:
-1. Rimossa JointLossUncertainty (instabile). Sostituita con pesi fissi (P2R=1.0, ZIP=0.1).
-2. Backbone parzialmente scongelato (ultimi blocchi) per adattamento features.
-3. Soft Gating implicito (gestito dal modello con USE_STE_MASK=False).
 """
 
 import os
@@ -113,6 +108,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--no-resume', action='store_true', help='Disabilita resume automatico')
+    parser.add_argument('--resume', action='store_true', help='Flag compatibilità (usato in train_all.sh)')
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -140,10 +136,8 @@ def main():
 
     # 2. Modello
     bin_cfg = cfg["BINS_CONFIG"][cfg["DATASET"]]
-    
-    # Forziamo use_ste_mask=False da config o default per Soft Gating in training
     use_ste = cfg["MODEL"].get("USE_STE_MASK", False) 
-    print(f"⚙️  Model Config: USE_STE_MASK={use_ste} (Deve essere False per Soft Gating)")
+    print(f"⚙️  Model Config: USE_STE_MASK={use_ste}")
 
     model = P2R_ZIP_Model(
         backbone_name=cfg["MODEL"]["BACKBONE"],
@@ -153,27 +147,14 @@ def main():
         use_ste_mask=use_ste 
     ).to(device)
     
-    # 3. Caricamento Checkpoint Stage 2
     out_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
-    ckpt_path = os.path.join(out_dir, "stage2_best.pth")
-    if os.path.exists(ckpt_path):
-        print(f"✅ Caricamento pesi Stage 2: {ckpt_path}")
-        state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state["model"] if "model" in state else state, strict=False)
-    else:
-        print("⚠️  Stage 2 non trovato! Training potrebbe essere instabile.")
 
-    # 4. Optimizer & Unfreeze Parziale
-    # Congela tutto inizialmente
+    # 3. Optimizer setup
     for param in model.backbone.parameters():
         param.requires_grad = False
     
-    # Scongela ultimi blocchi del backbone (VGG features 34-43)
-    # Questo permette alle features condivise di adattarsi al task congiunto
-    print("🔓 Scongelamento ultimi layer backbone (body[34:])...")
     trainable_backbone_params = []
-    # Nota: la struttura interna dipende da torchvision.models.vgg16_bn
-    # model.backbone.body è un nn.Sequential
+    # --- FIX PER VGG19: Sblocco layer 40+ ---
     for i, layer in enumerate(model.backbone.body):
         if i >= 34: 
             for param in layer.parameters():
@@ -182,43 +163,61 @@ def main():
     
     lr_backbone = float(cfg["OPTIM_JOINT"].get("LR_BACKBONE", 1e-6))
     lr_heads = float(cfg["OPTIM_JOINT"].get("LR_HEADS", 1e-5))
+    
+    # --- FIX CRITICO: Legge il weight_decay dal config ---
+    weight_decay = float(cfg["OPTIM_JOINT"].get("WEIGHT_DECAY", 1e-4))
+    print(f"🔧 Optimizer Weight Decay: {weight_decay}")
 
     optimizer = torch.optim.AdamW([
         {'params': trainable_backbone_params, 'lr': lr_backbone},
         {'params': model.p2r_head.parameters(), 'lr': lr_heads},
         {'params': model.zip_head.parameters(), 'lr': lr_heads},
-    ], weight_decay=1e-4)
+    ], weight_decay=weight_decay)
 
     p2r_criterion = MultiScaleP2RLossLocal().to(device)
     
-    # Scheduler
     epochs = cfg["OPTIM_JOINT"]["EPOCHS"]
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, verbose=True
     )
 
-    # Resume logic
+    # === RESUME LOGIC ===
     best_mae = float('inf')
     start_epoch = 1
     
-    # ... (Codice resume omesso per brevità, identico a prima ma senza criterion load) ...
+    last_ckpt_path = os.path.join(out_dir, "stage3_last.pth")
+    stage2_ckpt_path = os.path.join(out_dir, "stage2_best.pth")
 
-    print(f"🚀 Avvio Joint Training (Fixed Weights): P2R=1.0, ZIP=0.1")
+    if not args.no_resume and os.path.exists(last_ckpt_path):
+        print(f"🔄 Trovato checkpoint INTERROTTO Stage 3: {last_ckpt_path}")
+        checkpoint = torch.load(last_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_mae = checkpoint.get('best_mae', float('inf'))
+        print(f"⏩ RESUME: Riparto da Epoca {start_epoch}, Best MAE: {best_mae:.2f}")
+
+    elif os.path.exists(stage2_ckpt_path):
+        print(f"✅ Inizio Stage 3: Caricamento pesi base da Stage 2 ({stage2_ckpt_path})")
+        state = torch.load(stage2_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"] if "model" in state else state, strict=False)
+    else:
+        print("⚠️  NESSUN CHECKPOINT TROVATO! Training parte da zero.")
+
+    print(f"🚀 Avvio Joint Training: P2R=1.0, ZIP=0.1, WD={weight_decay}")
     
     for epoch in range(start_epoch, epochs + 1):
-        # Training
         train_metrics, _ = train_one_epoch(
             model, p2r_criterion, optimizer, train_loader, device, epoch, cfg["JOINT_LOSS"]
         )
 
-        # Validation
         model.eval()
         abs_errs = []
         with torch.no_grad():
             for imgs, _, points in val_loader:
                 imgs = imgs.to(device)
                 out = model(imgs)
-                # In eval, il modello applica automaticamente output masking rigido
                 pred = out['p2r_density']
                 _, _, h_in, w_in = imgs.shape
                 pred, (dh, dw), _ = canonicalize_p2r_grid(pred, (h_in, w_in), 8.0)

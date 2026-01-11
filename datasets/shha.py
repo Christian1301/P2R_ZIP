@@ -1,61 +1,82 @@
 # P2R_ZIP/datasets/shha.py
-import os, glob, numpy as np, scipy.io as sio
+import os
+import glob
+import numpy as np
 from .base_dataset import BaseCrowdDataset
 
 class SHHA(BaseCrowdDataset):
     def get_image_list(self, split):
         """
-        Gestisce i path del dataset per:
-        - Dataset originale (.mat)
-        - Versione ZIP o P2R (.npy)
+        Gestisce i path per la tua struttura specifica:
+        ROOT/train/scene01/*.jpg
+        ROOT/test/scene01/*.jpg (o simile)
         """
+        # Mappa i nomi standard (train_data) ai tuoi nomi reali (train)
         if split in ["train", "train_data"]:
-            split_dir = "train_data"
+            actual_dir = "train"
         elif split in ["val", "test", "test_data"]:
-            split_dir = "test_data"
+            actual_dir = "test"
         else:
-            split_dir = split
+            actual_dir = split
 
-        candidates = [
-            os.path.join(self.root, split_dir, "images"),
-            os.path.join(self.root, split_dir, "img"),
-            os.path.join(self.root, split_dir, "train", "images"),
-        ]
-        for d in candidates:
-            imgs = sorted(glob.glob(os.path.join(d, "*.jpg")))
-            if len(imgs) > 0:
-                return imgs
-        raise FileNotFoundError(f"Nessuna immagine trovata in {candidates}")
+        # TENTATIVO 1: Cerca dentro la sottocartella 'scene01' (come nel tuo caso)
+        path_scene01 = os.path.join(self.root, actual_dir, "scene01", "*.jpg")
+        imgs = sorted(glob.glob(path_scene01))
+
+        # TENTATIVO 2: Se non trova nulla, cerca direttamente nella cartella train/test
+        if len(imgs) == 0:
+            path_direct = os.path.join(self.root, actual_dir, "*.jpg")
+            imgs = sorted(glob.glob(path_direct))
+
+        # Check finale
+        if len(imgs) == 0:
+            raise FileNotFoundError(
+                f"Nessuna immagine trovata per lo split '{split}'.\n"
+                f"Ho cercato in: {path_scene01}\n"
+                f"E in: {path_direct}"
+            )
+        
+        print(f"Dataset {split}: Trovate {len(imgs)} immagini.")
+        return imgs
 
     def load_points(self, img_path):
         """
-        Carica i punti associati a un'immagine.
-        Supporta .mat (ShanghaiTech originale), .npy (ZIP, P2R).
+        Carica i punti dai file .txt situati ACCANTO all'immagine.
+        Formato atteso: "X Y" (es. 533 583)
         """
-        base_dir = os.path.dirname(os.path.dirname(img_path))
-        img_name = os.path.basename(img_path)
-        base_name = os.path.splitext(img_name)[0]
+        # Sostituisce l'estensione .jpg con .txt
+        # Es: .../scene01/IMG_100.jpg -> .../scene01/IMG_100.txt
+        txt_path = img_path.replace('.jpg', '.txt')
+        
+        # Fallback per estensioni maiuscole (a volte capita su Linux)
+        if not os.path.exists(txt_path):
+             txt_path = img_path.replace('.jpg', '.TXT')
 
-        mat_path = os.path.join(base_dir, "ground_truth", f"GT_{base_name}.mat")
-        mat_path2 = os.path.join(base_dir, "ground-truth", f"GT_{base_name}.mat")
-        npy_path_zip = os.path.join(base_dir, "labels", f"{base_name}.npy")
-        npy_path_p2r = os.path.join(base_dir, "new-anno", f"GT_{base_name}.npy")
-
-        if os.path.isfile(mat_path) or os.path.isfile(mat_path2):
-            mpath = mat_path if os.path.isfile(mat_path) else mat_path2
-            mat = sio.loadmat(mpath)
-            pts = mat["image_info"][0, 0][0, 0][0]
-            return np.array(pts, dtype=np.float32)
-
-        elif os.path.isfile(npy_path_zip):
-            pts = np.load(npy_path_zip)
-            return np.array(pts[:, :2], dtype=np.float32)
-        elif os.path.isfile(npy_path_p2r):
-            pts = np.load(npy_path_p2r)
-            return np.array(pts[:, :2], dtype=np.float32)
+        points = []
+        
+        if os.path.isfile(txt_path):
+            with open(txt_path, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # Divide la riga in parti basandosi sugli spazi
+                    parts = line.split()
+                    
+                    # Ci aspettiamo almeno 2 numeri (x, y)
+                    if len(parts) >= 2:
+                        try:
+                            x = float(parts[0])
+                            y = float(parts[1])
+                            points.append([x, y])
+                        except ValueError:
+                            # Se la riga non contiene numeri validi, la salta
+                            continue
+            
+            # Restituisce un array numpy di float32
+            return np.array(points, dtype=np.float32)
 
         else:
-            raise FileNotFoundError(
-                f"Nessun file ground truth trovato per {img_path}\n"
-                f"Controllati:\n  {mat_path}\n  {mat_path2}\n  {npy_path_zip}\n  {npy_path_p2r}"
-            )
+            # Se il file txt non esiste, solleva un errore (così te ne accorgi subito)
+            raise FileNotFoundError(f"File di annotazione non trovato: {txt_path}")

@@ -1,18 +1,18 @@
-RUN_NAME: "shha_p2rzip_vgg19bn"
+RUN_NAME: "shha_p2rzip_vgg16bn"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
 DATASET: "shha"
 DATA:
-  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
+  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train_data"
-  VAL_SPLIT: "val_data"
+  TRAIN_SPLIT: "train"
+  VAL_SPLIT: "test"
   
   CROP_SIZE: 384
   CROP_SCALE: [0.4, 1.0]
@@ -33,7 +33,7 @@ DATA:
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg19_bn"
+  BACKBONE: "vgg16_bn"
   ZIP_PI_THRESH: 0.2
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
@@ -108,7 +108,7 @@ P2R_LOSS:
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
-  LOG_SCALE_INIT: 2.5     # Coerente con il codice python
+  LOG_SCALE_INIT: 2.5     
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
@@ -119,15 +119,16 @@ P2R_LOSS:
 OPTIM_JOINT:
   BATCH_SIZE: 4   
   NUM_WORKERS: 4
-  EPOCHS: 500       # Epoche ridotte per fine-tuning delicato
-  LR_BACKBONE: 1.0e-6  # LR bassissimo per non rompere le feature
-  LR_HEADS: 1.0e-5     # LR basso per raffinamento
+  EPOCHS: 500       
+  LR_BACKBONE: 1.0e-6 
+  LR_HEADS: 1.0e-5    
+  WEIGHT_DECAY: 1.0e-4  
 
 JOINT_LOSS:
   # Pesi fissi per stabilità
-  FIXED_ZIP_WEIGHT: 0.1     # Mantiene la struttura senza dominare
-  FIXED_P2R_WEIGHT: 1.0     # Priorità al conteggio MAE
-  USE_SOFT_WEIGHTING: false # Disabilita uncertainty weighting automatico
+  FIXED_ZIP_WEIGHT: 0.1     
+  FIXED_P2R_WEIGHT: 1.0     
+  USE_SOFT_WEIGHTING: false 
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

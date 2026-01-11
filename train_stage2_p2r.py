@@ -16,8 +16,9 @@ MODIFICHE DA V7:
 FIX V8.1:
 - Device mismatch in EnhancedTransformsV8 (mean/std su CPU vs image su CUDA)
 - Checkpoint path: cerca best_model.pth invece di stage1_best.pth
+- Weights_only=False aggiunto ovunque per compatibilità PyTorch 2.6
 
-OBIETTIVO: MAE 68.97 → 63-66
+OBIETTIVO: MAE 68.97 -> 63-66
 """
 
 import os
@@ -444,6 +445,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--no-resume', action='store_true', help='Disabilita resume automatico')
+    parser.add_argument('--resume', action='store_true', help='Flag compatibilità')
     args = parser.parse_args()
     
     # Carica config
@@ -562,10 +564,6 @@ def main():
     # =========================================================================
     # FIX V8.1: Carica Stage 1 checkpoint con priorità corretta
     # =========================================================================
-    # Cerca checkpoint in ordine di priorità:
-    # 1. best_model.pth (output di Stage 1)
-    # 2. stage1_best.pth (nome alternativo)
-    # 3. Prova anche nella cartella V7 se non trovato
     
     stage1_loaded = False
     stage1_candidates = [
@@ -584,7 +582,8 @@ def main():
     for stage1_path in stage1_candidates:
         if os.path.isfile(stage1_path):
             try:
-                state = torch.load(stage1_path, map_location=device)
+                # FIX: Aggiunto weights_only=False
+                state = torch.load(stage1_path, map_location=device, weights_only=False)
                 if "model" in state:
                     state = state["model"]
                 model.load_state_dict(state, strict=False)
@@ -667,7 +666,8 @@ def main():
     checkpoint_path = os.path.join(output_dir, "stage2_last.pth")
     if not args.no_resume and os.path.isfile(checkpoint_path):
         print(f"🔄 Trovato checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        # FIX: Aggiunto weights_only=False
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])

@@ -1,11 +1,11 @@
-# train_utils_fixed.py
+# train_utils.py
 """
-Train utilities con correzioni per padding consistente.
+Train utilities con correzioni per padding consistente e gestione Tuple/Dict.
 
 Modifiche:
-1. collate_fn con padding a multipli di 16 (come backbone VGG)
-2. Calibrazione per-batch invece che globale
-3. Funzioni di debug migliorate
+1. collate_fn supporta Tuple (img, den, pts) dal nuovo BaseDataset
+2. Padding a multipli di 16 (per VGG backbone)
+3. Calibrazione per-batch robusta
 """
 
 import os
@@ -91,47 +91,81 @@ def _round_to_multiple(x: int, multiple: int = 16) -> int:
 
 def collate_fn(batch):
     """
-    Collate function UNIFICATA con padding a multipli di 16.
-    
-    IMPORTANTE: Questa funzione deve essere usata in TUTTI gli stage
-    per mantenere consistenza nelle dimensioni.
+    Collate function ROBUSTA per Tuple e Dict.
+    Gestisce il padding a multipli di 16 per VGG.
     """
+    if len(batch) == 0:
+        raise ValueError("Batch vuoto in collate_fn")
+        
     item = batch[0]
 
-    if 'density' in item and isinstance(item['points'], torch.Tensor):
-        # Trova dimensioni massime
-        max_h = max(b['image'].shape[1] for b in batch)
-        max_w = max(b['image'].shape[2] for b in batch)
+    # === CASO 1: TUPLA (Nuovo BaseDataset) ===
+    # Formato atteso: (image, density, points)
+    if isinstance(item, tuple):
+        # Calcola dimensioni massime per il padding
+        # batch[i][0] è l'immagine
+        max_h = max(b[0].shape[1] for b in batch)
+        max_w = max(b[0].shape[2] for b in batch)
         
-        # CORREZIONE: Arrotonda a multipli di 16 per VGG backbone
+        # Arrotonda a 16 per VGG (evita errori di dimensione dopo pooling)
         max_h = _round_to_multiple(max_h, 16)
         max_w = _round_to_multiple(max_w, 16)
 
-        padded_images, padded_densities, points_list = [], [], []
+        padded_images = []
+        padded_densities = []
+        points_list = []
 
         for b in batch:
-            img, den, pts = b['image'], b['density'], b['points']
+            img, den, pts = b
             h, w = img.shape[1], img.shape[2]
             
-            # Padding (right, bottom)
+            # Padding (left, right, top, bottom)
             pad_w = max_w - w
             pad_h = max_h - h
-            pad = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+            pad = (0, pad_w, 0, pad_h)
             
+            # Pad immagine
             padded_images.append(F.pad(img, pad, mode='constant', value=0))
-            padded_densities.append(F.pad(den, pad, mode='constant', value=0))
+            
+            # Pad density (se esiste, altrimenti placeholder)
+            if den is not None and den.numel() > 0:
+                padded_densities.append(F.pad(den, pad, mode='constant', value=0))
+            else:
+                # Se density è mancante o vuota, crea zeri
+                padded_densities.append(torch.zeros((1, max_h, max_w), device=img.device))
+                
             points_list.append(pts)
 
         return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
 
-    elif 'zip_blocks' in item:
-        warnings.warn("collate_fn: formato 'zip_blocks' deprecato")
-        imgs = torch.stack([b["image"] for b in batch], 0)
-        blocks = torch.stack([b["zip_blocks"] for b in batch], 0)
-        points = [b["points"] for b in batch]
-        return imgs, blocks, points
+    # === CASO 2: DIZIONARIO (Legacy / Altri Dataset) ===
+    elif isinstance(item, dict):
+        if 'density' in item:
+            # Trova dimensioni massime
+            max_h = max(b['image'].shape[1] for b in batch)
+            max_w = max(b['image'].shape[2] for b in batch)
+            
+            max_h = _round_to_multiple(max_h, 16)
+            max_w = _round_to_multiple(max_w, 16)
 
-    raise TypeError(f"Formato batch non riconosciuto: {item.keys()}")
+            padded_images, padded_densities, points_list = [], [], []
+
+            for b in batch:
+                img, den, pts = b['image'], b['density'], b['points']
+                h, w = img.shape[1], img.shape[2]
+                
+                pad_w = max_w - w
+                pad_h = max_h - h
+                pad = (0, pad_w, 0, pad_h)
+                
+                padded_images.append(F.pad(img, pad, value=0))
+                padded_densities.append(F.pad(den, pad, value=0))
+                points_list.append(pts)
+
+            return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
+
+    # Caso non gestito
+    raise TypeError(f"Formato batch non riconosciuto. Atteso Tuple o Dict, ricevuto: {type(item)}")
 
 
 def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, warn_tol=0.15):
@@ -175,14 +209,11 @@ def calibrate_density_scale_v2(
     max_batches=None,
     clamp_range=None,
     max_adjust=2.0,
-    bias_eps=0.05,  # AUMENTATO da 1e-3
+    bias_eps=0.05,
     verbose=True,
 ):
     """
-    Calibrazione MIGLIORATA con:
-    1. Threshold più alto per considerare calibrato (5% invece di 0.1%)
-    2. Analisi per-immagine per detectare outlier
-    3. Report dettagliato delle statistiche
+    Calibrazione scala per P2R.
     """
     if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
         return None
@@ -192,9 +223,17 @@ def calibrate_density_scale_v2(
     gt_counts = []
     ratios = []
 
-    for batch_idx, (images, _, points) in enumerate(loader, start=1):
+    for batch_idx, batch_data in enumerate(loader, start=1):
         if max_batches is not None and batch_idx > max_batches:
             break
+        
+        # Unpack flessibile (gestisce sia (img, den, pts) che (img, pts) se den manca)
+        if len(batch_data) == 3:
+            images, _, points = batch_data
+        else:
+            # Fallback se collate cambia
+            images = batch_data[0]
+            points = batch_data[-1]
 
         images = images.to(device)
         points_list = [p.to(device) for p in points]
@@ -228,25 +267,12 @@ def calibrate_density_scale_v2(
 
     # Statistiche dettagliate
     ratios_np = np.array(ratios)
-    pred_np = np.array(pred_counts)
-    gt_np = np.array(gt_counts)
     
-    bias_global = sum(pred_counts) / sum(gt_counts)
     bias_median = np.median(ratios_np)
-    bias_std = np.std(ratios_np)
     
     if verbose:
         print(f"\n📊 Statistiche Calibrazione:")
-        print(f"   Bias globale (sum): {bias_global:.3f}")
         print(f"   Bias mediano: {bias_median:.3f}")
-        print(f"   Std ratio: {bias_std:.3f}")
-        print(f"   Range ratio: [{ratios_np.min():.3f}, {ratios_np.max():.3f}]")
-        
-        # Identifica outlier
-        outliers_high = np.sum(ratios_np > 1.5)
-        outliers_low = np.sum(ratios_np < 0.67)
-        print(f"   Outlier (>1.5x): {outliers_high}/{len(ratios_np)}")
-        print(f"   Outlier (<0.67x): {outliers_low}/{len(ratios_np)}")
 
     # Usa il bias mediano per robustezza agli outlier
     bias = bias_median
@@ -312,21 +338,3 @@ def save_checkpoint(model, optimizer, epoch, val_metric, best_metric, exp_dir, i
     if is_best:
         torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
     print(f"💾 Checkpoint: epoch={epoch}, best={best_metric:.2f} ({'best' if is_best else 'last'})")
-
-
-def debug_batch_predictions(pred_counts, gt_counts, prefix=""):
-    """Stampa statistiche dettagliate per debugging."""
-    if len(pred_counts) == 0:
-        return
-    
-    pred_np = np.array([p.item() if torch.is_tensor(p) else p for p in pred_counts])
-    gt_np = np.array([g.item() if torch.is_tensor(g) else g for g in gt_counts])
-    
-    errors = np.abs(pred_np - gt_np)
-    ratios = pred_np / np.maximum(gt_np, 1)
-    
-    print(f"\n{prefix}📈 Batch Statistics:")
-    print(f"   MAE: {errors.mean():.2f}")
-    print(f"   Ratio (pred/gt): mean={ratios.mean():.3f}, std={ratios.std():.3f}")
-    print(f"   Worst underestimate: gt={gt_np[ratios.argmin()]:.0f}, pred={pred_np[ratios.argmin()]:.0f}")
-    print(f"   Worst overestimate: gt={gt_np[ratios.argmax()]:.0f}, pred={pred_np[ratios.argmax()]:.0f}")

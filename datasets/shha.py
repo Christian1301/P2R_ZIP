@@ -1,16 +1,17 @@
-# P2R_ZIP/datasets/shha.py
 import os
 import glob
 import numpy as np
-from .base_dataset import BaseCrowdDataset
+from .base_dataset import BaseDataset  # <--- Eredita dalla classe che abbiamo appena corretto
 
-class SHHA(BaseCrowdDataset):
-    def get_image_list(self, split):
+class SHHA(BaseDataset):
+    def load_data(self):
         """
         Gestisce i path per la tua struttura specifica:
         ROOT/train/scene01/*.jpg
         ROOT/test/scene01/*.jpg (o simile)
+        Carica i percorsi delle immagini in self.img_paths.
         """
+        split = self.split
         # Mappa i nomi standard (train_data) ai tuoi nomi reali (train)
         if split in ["train", "train_data"]:
             actual_dir = "train"
@@ -37,7 +38,7 @@ class SHHA(BaseCrowdDataset):
             )
         
         print(f"Dataset {split}: Trovate {len(imgs)} immagini.")
-        return imgs
+        self.img_paths = imgs  # <--- Importante: salva qui i percorsi per BaseDataset
 
     def load_points(self, img_path):
         """

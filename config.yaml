@@ -1,11 +1,11 @@
-RUN_NAME: "shha_p2rzip_vgg16bn"
+RUN_NAME: "shhb_p2rzip_vgg16bn_v8"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
 DATASET: "shha"
 DATA:
-  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
+  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-B"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8
   IMG_EXTS: [".jpg", ".png"]
@@ -14,30 +14,39 @@ DATA:
   TRAIN_SPLIT: "train"
   VAL_SPLIT: "test"
   
-  CROP_SIZE: 384
-  CROP_SCALE: [0.4, 1.0]
+  CROP_SIZE: 384  # 384 è OK se usi Scale Augmentation qui sotto
   
-  COLOR_JITTER:
-    ENABLED: true
-    BRIGHTNESS: 0.2
-    CONTRAST: 0.2
-    SATURATION: 0.2
-    HUE: 0.1
-  
-  HORIZONTAL_FLIP: true
-  RANDOM_GRAY_PROB: 0.1
-  GAUSSIAN_BLUR:
-    ENABLED: true
-    PROB: 0.1
-    KERNEL_SIZE: [3, 5]
+  # === NUOVA SEZIONE AUGMENTATION (Stile ZIP Paper) ===
+  AUGMENTATION:
+    RandomResizedCrop:
+      ENABLED: true
+      SCALE: [0.75, 2.0]   # Scale aggressiva: zoom-in (0.75) e zoom-out (2.0)
+      RATIO: [0.75, 1.33]
+    
+    HorizontalFlip:
+      ENABLED: true
+      PROB: 0.5
+      
+    # I vecchi parametri legacy (mantenuti per retrocompatibilità se lo script li cerca ancora)
+    # ma il nuovo transforms.py userà quelli sopra
+    COLOR_JITTER:
+      ENABLED: true
+      BRIGHTNESS: 0.2
+      CONTRAST: 0.2
+      SATURATION: 0.2
+      HUE: 0.1
+    RANDOM_GRAY_PROB: 0.1
+    GAUSSIAN_BLUR:
+      ENABLED: true
+      PROB: 0.1
+      KERNEL_SIZE: [3, 5]
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
+  BACKBONE: "vgg16_bn"  # VGG16 è il gold standard
   ZIP_PI_THRESH: 0.2
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  # IMPORTANTE: Disabilita STE per abilitare il Soft Gating in training nello stage 3
   USE_STE_MASK: false
 
 # === ZIP HEAD ===
@@ -54,7 +63,7 @@ OPTIM_ZIP:
   BATCH_SIZE: 6
   NUM_WORKERS: 4
   EPOCHS: 2000
-  WEIGHT_DECAY: 3.0e-5
+  WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
@@ -89,7 +98,7 @@ OPTIM_P2R:
   EPOCHS: 4000
   LR: 5.0e-5
   LR_BACKBONE: 1.0e-6
-  WEIGHT_DECAY: 1.0e-4
+  WEIGHT_DECAY: 1.0e-4  # 1e-4 è corretto per VGG16 (non 5e-4)
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
@@ -108,13 +117,13 @@ P2R_LOSS:
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
-  LOG_SCALE_INIT: 2.5     
+  LOG_SCALE_INIT: 2.5
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - JOINT TRAINING (COMBINED LOSS)
+# STAGE 3 - JOINT TRAINING
 # =================================================================
 OPTIM_JOINT:
   BATCH_SIZE: 4   
@@ -122,10 +131,9 @@ OPTIM_JOINT:
   EPOCHS: 500       
   LR_BACKBONE: 1.0e-6 
   LR_HEADS: 1.0e-5    
-  WEIGHT_DECAY: 1.0e-4  
+  WEIGHT_DECAY: 1.0e-4
 
 JOINT_LOSS:
-  # Pesi fissi per stabilità
   FIXED_ZIP_WEIGHT: 0.1     
   FIXED_P2R_WEIGHT: 1.0     
   USE_SOFT_WEIGHTING: false 

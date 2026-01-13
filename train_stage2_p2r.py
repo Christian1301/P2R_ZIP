@@ -236,9 +236,10 @@ class EnhancedTransformsV8:
     
     def __init__(self, cfg):
         data_cfg = cfg.get('DATA', {})
+        aug_cfg = data_cfg.get('AUGMENTATION', {})  # ← AGGIUNTO: cerca in AUGMENTATION
         
-        # Color jitter
-        cj_cfg = data_cfg.get('COLOR_JITTER', {})
+        # Color jitter - cerca in entrambi i posti (DATA > AUGMENTATION)
+        cj_cfg = data_cfg.get('COLOR_JITTER', aug_cfg.get('COLOR_JITTER', {}))
         self.use_color_jitter = cj_cfg.get('ENABLED', False) if isinstance(cj_cfg, dict) else False
         if self.use_color_jitter:
             self.color_jitter = T.ColorJitter(
@@ -248,16 +249,17 @@ class EnhancedTransformsV8:
                 hue=cj_cfg.get('HUE', 0.1),
             )
         
-        # Random grayscale
-        self.gray_prob = data_cfg.get('RANDOM_GRAY_PROB', 0.0)
+        # Random grayscale - cerca in entrambi i posti
+        self.gray_prob = data_cfg.get('RANDOM_GRAY_PROB', 
+                                       aug_cfg.get('RANDOM_GRAY_PROB', 0.0))
         
-        # Gaussian blur
-        blur_cfg = data_cfg.get('GAUSSIAN_BLUR', {})
+        # Gaussian blur - cerca in entrambi i posti
+        blur_cfg = data_cfg.get('GAUSSIAN_BLUR', aug_cfg.get('GAUSSIAN_BLUR', {}))
         self.use_blur = blur_cfg.get('ENABLED', False) if isinstance(blur_cfg, dict) else False
         self.blur_prob = blur_cfg.get('PROB', 0.1) if isinstance(blur_cfg, dict) else 0.1
         self.blur_kernels = blur_cfg.get('KERNEL_SIZE', [3, 5]) if isinstance(blur_cfg, dict) else [3, 5]
         
-        # Pre-registra mean/std come tensori base (verranno spostati su device al primo uso)
+        # Pre-registra mean/std come tensori base
         self._mean_base = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self._std_base = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         self._device_cache = None
@@ -551,6 +553,7 @@ def main():
         pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
         gate=cfg["MODEL"]["GATE"],
         upsample_to_input=False,
+        use_ste_mask=cfg["MODEL"].get("USE_STE_MASK", True),
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
         zip_head_kwargs={

@@ -1,43 +1,53 @@
-# =================================================================
-# CONFIGURAZIONE SHANGHAITECH PART B
-# =================================================================
-# 
-# Dataset: ShanghaiTech Part B
-# - 400 train, 316 test
-# - Densità media: ~125 persone/immagine
-# - Scene: strade, più sparse rispetto a Part A
-#
-# NOTA: Usa dataset loader "shha" perché struttura identica a Part A
-# =================================================================
-
-RUN_NAME: "shb_p2rzip_v1"
+RUN_NAME: "shhb_p2rzip_vgg16bn_v8"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
-# IMPORTANTE: usa "shha" come tipo perché la struttura è identica
 DATASET: "shha"
 DATA:
-  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_B"
+  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-B"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train_data"
-  VAL_SPLIT: "test_data"
+  TRAIN_SPLIT: "train"
+  VAL_SPLIT: "test"
   
-  # Data Augmentation
-  CROP_SIZE: 384
-  CROP_SCALE: [0.5, 1.0]
+  CROP_SIZE: 384  # 384 è OK se usi Scale Augmentation qui sotto
+  
+  # === NUOVA SEZIONE AUGMENTATION (Stile ZIP Paper) ===
+  AUGMENTATION:
+    RandomResizedCrop:
+      ENABLED: true
+      SCALE: [0.75, 2.0]   # Scale aggressiva: zoom-in (0.75) e zoom-out (2.0)
+      RATIO: [0.75, 1.33]
+    
+    HorizontalFlip:
+      ENABLED: true
+      PROB: 0.5
+      
+    # I vecchi parametri legacy (mantenuti per retrocompatibilità se lo script li cerca ancora)
+    # ma il nuovo transforms.py userà quelli sopra
+    COLOR_JITTER:
+      ENABLED: true
+      BRIGHTNESS: 0.2
+      CONTRAST: 0.2
+      SATURATION: 0.2
+      HUE: 0.1
+    RANDOM_GRAY_PROB: 0.1
+    GAUSSIAN_BLUR:
+      ENABLED: true
+      PROB: 0.1
+      KERNEL_SIZE: [3, 5]
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.5
+  BACKBONE: "vgg16_bn"  # VGG16 è il gold standard
+  ZIP_PI_THRESH: 0.2
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: true
+  USE_STE_MASK: false
 
 # === ZIP HEAD ===
 ZIP_HEAD:
@@ -50,18 +60,18 @@ ZIP_HEAD:
 # STAGE 1 - ZIP PRE-TRAINING
 # =================================================================
 OPTIM_ZIP:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 6
   NUM_WORKERS: 4
   EPOCHS: 2000
-  WEIGHT_DECAY: 3.0e-5
+  WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
   BASE_LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
-  WARMUP_EPOCHS: 80
-  EARLY_STOPPING_PATIENCE: 500
+  WARMUP_EPOCHS: 100
+  EARLY_STOPPING_PATIENCE: 1000
 
 ZIP_LOSS:
   POS_WEIGHT_BCE: 5.0
@@ -85,72 +95,48 @@ ZIP_REG:
 OPTIM_P2R:
   BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 3000
+  EPOCHS: 4000
   LR: 5.0e-5
   LR_BACKBONE: 1.0e-6
-  WEIGHT_DECAY: 1.0e-4
+  WEIGHT_DECAY: 1.0e-4  # 1e-4 è corretto per VGG16 (non 5e-4)
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
   WARMUP_EPOCHS: 50
-  EARLY_STOPPING_PATIENCE: 120
+  EARLY_STOPPING_PATIENCE: 1200
   GRAD_CLIP: 1.0
 
 P2R_LOSS:
+  USE_MULTI_SCALE: true
+  SCALES: [1, 2, 4]
+  SCALE_WEIGHTS: [1.0, 0.5, 0.25]
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
   SPATIAL_WEIGHT: 0.15
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
-  LOG_SCALE_INIT: 4.0
+  LOG_SCALE_INIT: 2.5
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
   CALIBRATE_BATCHES: 10
 
 # =================================================================
-# STAGE 3 - JOINT TRAINING (SOFT WEIGHTING)
+# STAGE 3 - JOINT TRAINING
 # =================================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 4   
   NUM_WORKERS: 4
-  EPOCHS: 600
-  LR_BACKBONE: 0.0
-  LR_HEADS: 5.0e-5
+  EPOCHS: 500       
+  LR_BACKBONE: 1.0e-6 
+  LR_HEADS: 1.0e-5    
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 5
-  LR_MIN_FACTOR: 0.01
-  VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 200
 
 JOINT_LOSS:
-  PI_POS_WEIGHT: 8.0
-  OCCUPANCY_THRESHOLD: 0.5
-  PI_THRESHOLD: 0.5
-  SOFT_WEIGHT_ALPHA: 0.3
-  USE_SOFT_WEIGHTING: true
-
-# =================================================================
-# STAGE 4 - BIAS CORRECTION
-# =================================================================
-OPTIM_STAGE4:
-  BATCH_SIZE: 4
-  NUM_WORKERS: 4
-  EPOCHS: 150
-  LR_P2R: 1.0e-6
-  LR_LOG_SCALE: 1.0e-5
-  LR_PI: 1.0e-4
-  WEIGHT_DECAY: 1.0e-4
-  VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 40
-
-STAGE4_LOSS:
-  OVERESTIMATE_WEIGHT: 2.0
-  COUNT_WEIGHT: 1.0
-  PI_WEIGHT: 0.3
+  FIXED_ZIP_WEIGHT: 0.1     
+  FIXED_P2R_WEIGHT: 1.0     
+  USE_SOFT_WEIGHTING: false 
 
 # === BIN CONFIGURATION ===
 BINS_CONFIG:

@@ -25,26 +25,20 @@ set -e
 
 # ATTENZIONE: Se riprendi il lavoro (RESUME), lascia commentato 'rm -rf logs'
 # rm -rf logs     
-mkdir -p logs
+mkdir -p logsb
 
 echo "🚀 Avvio Stage 1 (ZIP)..."
 # Se hai già finito lo stage 1, commenta la riga sotto:
-python train_stage1_zip.py --config config.yaml > logs/stage1.log 2>&1
+python train_stage1_zip.py --config config_shhb.yaml > logsb/stage1.log 2>&1
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
 # Resume attivo per sicurezza
-python train_stage2_p2r.py --config config.yaml > logs/stage2.log 2>&1
+python train_stage2_p2r.py --config config_shhb.yaml > logsb/stage2.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python train_stage3_joint.py --config config.yaml > logs/stage3.log 2>&1
+python train_stage3_joint.py --config config_shhb.yaml > logsb/stage3.log 2>&1
 echo "✅ Stage 3 completato!"
-
-echo "🚀 Avvio Valutazioni..."
-python evaluate_stage1.py > logs/ev_stage1.log 2>&1
-python evaluate_stage2.py > logs/ev_stage2.log 2>&1
-python evaluate_stage3.py > logs/ev_stage3.log 2>&1
-python visualize_gating.py > logs/visualize_gating.log 2>&1
 
 echo "🏆 TUTTO FINITO CON SUCCESSO!"

@@ -21,7 +21,7 @@ from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
 
-def compute_zip_metrics(pred_logits, gt_density, block_size, occupancy_threshold=0.5):
+def compute_zip_metrics(pred_logits, gt_density, block_size, occupancy_threshold=0.3):
     """
     Calcola metriche di classificazione per la maschera ZIP.
     """
@@ -61,7 +61,7 @@ def evaluate_model(model, dataloader, device, config):
     stats = {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "gt_pos": 0, "total_pixels": 0}
     
     block_size = config['DATA']['ZIP_BLOCK_SIZE']
-    thresh = config.get("ZIP_LOSS", {}).get("OCCUPANCY_THRESHOLD", 0.5)
+    thresh = config.get("ZIP_LOSS", {}).get("OCCUPANCY_THRESHOLD", 0.3)
     
     print(f"⚙️  Parametri Valutazione: Block={block_size}, Threshold={thresh}")
     

@@ -1,11 +1,11 @@
-RUN_NAME: "shhb_p2rzip_vgg16bn_v8"
+RUN_NAME: "shha_p2rzip_vgg16bn_v8"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
 DATASET: "shha"
 DATA:
-  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-B"
+  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8
   IMG_EXTS: [".jpg", ".png"]
@@ -44,10 +44,10 @@ DATA:
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn"  # VGG16 è il gold standard
-  ZIP_PI_THRESH: 0.2
+  ZIP_PI_THRESH: 0.3
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: false
+  USE_STE_MASK: true
 
 # === ZIP HEAD ===
 ZIP_HEAD:

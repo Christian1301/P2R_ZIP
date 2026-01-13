@@ -18,6 +18,8 @@ DEVICE: "cuda"
 # IMPORTANTE: usa "shha" come tipo perché la struttura è identica
 DATASET: "shha"
 DATA:
+  # IMPORTANTE: Personalizza questo path per il tuo sistema
+  # Opzioni: path assoluto, relativo, o variabile d'ambiente ${DATASET_ROOT}/ShanghaiTech/part_B
   ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_B"
   ZIP_BLOCK_SIZE: 16
   P2R_DOWNSAMPLE: 8

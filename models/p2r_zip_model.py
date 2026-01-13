@@ -25,9 +25,9 @@ class STEMask(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output):
-        soft_mask, = ctx.saved_tensors
-        grad_input = grad_output * soft_mask * (1 - soft_mask + 0.1)
-        return grad_input, None
+        # STE puro: passa gradiente inalterato (no attenuazione)
+        # Questo permette convergenza più rapida eliminando il dampening factor
+        return grad_output, None
 
 
 def ste_mask(soft_mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:

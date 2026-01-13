@@ -94,8 +94,7 @@ def evaluate_with_threshold(
             pi_probs = F.interpolate(
                 pi_probs,
                 size=pred_density.shape[-2:],
-                mode='bilinear',
-                align_corners=False
+                mode='nearest',  # nearest preserva valori binari, bilinear li ammorbidisce
             )
         
         down_h, down_w = down_tuple

@@ -32,3 +32,6 @@ Thumbs.db
 
 # Immagini generate
 visualizations/
+
+# Tutti i file che cominciano con "master_"
+master_*

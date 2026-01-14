@@ -4,16 +4,13 @@
 Evaluate Stage 1 con MULTI-THRESHOLD
 Testa diversi valori di threshold per trovare il miglior trade-off Recall/Precision.
 """
-
+import os
+import argparse
+import yaml
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
-import os
-import numpy as np
-import argparse
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -80,8 +77,8 @@ def evaluate_model_multi_thresh(model, dataloader, device, config, pred_threshol
         )
         
         for thresh in pred_thresholds:
-            for k in all_stats[thresh]:
-                all_stats[thresh][k] += batch_results[thresh][k]
+            for key in all_stats[thresh]:
+                all_stats[thresh][key] += batch_results[thresh][key]
     
     # Calcolo metriche finali per ogni threshold
     final_results = {}
@@ -113,13 +110,15 @@ def main():
     parser.add_argument("--ckpt", type=str, default=None, help="Path specifico al checkpoint")
     parser.add_argument("--thresholds", type=str, default="0.1,0.2,0.3,0.4,0.5,0.6,0.7",
                         help="Threshold da testare (comma-separated)")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="Nome del file di configurazione da usare")
     args = parser.parse_args()
 
-    if not os.path.exists("config.yaml"):
-        print("❌ config.yaml non trovato.")
+    if not os.path.exists(args.config):
+        print(f"❌ {args.config} non trovato.")
         return
         
-    with open("config.yaml", 'r') as f:
+    with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
     device = torch.device(config['DEVICE'])
@@ -167,13 +166,14 @@ def main():
         
         if not os.path.exists(ckpt_path):
             ckpt_path = os.path.join(out_dir, "stage1_best_acc.pth")
-            ckpt_name = "Best Acc"
+
 
     if not os.path.exists(ckpt_path):
         print(f"❌ Checkpoint non trovato: {ckpt_path}")
         return
 
     print(f"\n📊 Valutazione Multi-Threshold")
+    print(f"   Config: {args.config}")
     print(f"   Checkpoint: {ckpt_name} ({ckpt_path})\n")
     
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -196,14 +196,14 @@ def main():
         r = results[thresh]
         note = ""
         if thresh == best_f1_thresh:
-            note = "← Best F1"
+            note = "⭐ Best F1"
         elif thresh == best_recall_thresh and thresh != best_f1_thresh:
-            note = "← Best Recall"
+            note = "📈 Best Recall"
         
         # Evidenzia recall > 90%
         recall_str = f"{r['Recall']:>7.2f}%"
         if r['Recall'] >= 90:
-            recall_str = f"✓{r['Recall']:>6.2f}%"
+            recall_str = f"{r['Recall']:>7.2f}%"
         
         print(f"{thresh:>7.2f} | {r['Accuracy']:>7.2f}% | {r['Precision']:>8.2f}% | {recall_str} | {r['F1']:>6.2f}% | {r['Pred Area']:>8.2f}% | {note}")
     

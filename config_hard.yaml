@@ -1,4 +1,4 @@
-RUN_NAME: "shha_p2rzip_vgg16bn_v8_antioverfit"
+RUN_NAME: "shha_p2rzip_vgg16bn_v8_hard"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -14,36 +14,36 @@ DATA:
   TRAIN_SPLIT: "train"
   VAL_SPLIT: "test"
   
-  CROP_SIZE: 384
+  CROP_SIZE: 384  # 384 è OK se usi Scale Augmentation qui sotto
   
-  # === AUGMENTATION POTENZIATA (Anti-Overfitting) ===
+  # === NUOVA SEZIONE AUGMENTATION (Stile ZIP Paper) ===
   AUGMENTATION:
     RandomResizedCrop:
       ENABLED: true
-      SCALE: [0.5, 2.5]      # Più aggressivo: era [0.75, 2.0]
-      RATIO: [0.6, 1.67]     # Più variazione aspect ratio
+      SCALE: [0.75, 2.0]   # Scale aggressiva: zoom-in (0.75) e zoom-out (2.0)
+      RATIO: [0.75, 1.33]
     
     HorizontalFlip:
       ENABLED: true
       PROB: 0.5
       
+    # I vecchi parametri legacy (mantenuti per retrocompatibilità se lo script li cerca ancora)
+    # ma il nuovo transforms.py userà quelli sopra
     COLOR_JITTER:
       ENABLED: true
-      BRIGHTNESS: 0.4        # Aumentato da 0.2
-      CONTRAST: 0.4          # Aumentato da 0.2
-      SATURATION: 0.3        # Aumentato da 0.2
-      HUE: 0.15              # Aumentato da 0.1
-    
-    RANDOM_GRAY_PROB: 0.2    # Aumentato da 0.1
-    
+      BRIGHTNESS: 0.2
+      CONTRAST: 0.2
+      SATURATION: 0.2
+      HUE: 0.1
+    RANDOM_GRAY_PROB: 0.1
     GAUSSIAN_BLUR:
       ENABLED: true
-      PROB: 0.3              # Aumentato da 0.1
-      KERNEL_SIZE: [3, 5, 7] # Aggiunto kernel 7
+      PROB: 0.1
+      KERNEL_SIZE: [3, 5]
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"
+  BACKBONE: "vgg16_bn"  # VGG16 è il gold standard
   ZIP_PI_THRESH: 0.3
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
@@ -57,7 +57,7 @@ ZIP_HEAD:
   LAMBDA_NOISE_STD: 0.0
 
 # =================================================================
-# STAGE 1 - ZIP PRE-TRAINING (invariato)
+# STAGE 1 - ZIP PRE-TRAINING
 # =================================================================
 OPTIM_ZIP:
   BATCH_SIZE: 6
@@ -90,32 +90,22 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (ANTI-OVERFITTING)
-# =================================================================
-# 
-# MODIFICHE CHIAVE:
-# 1. LR ridotto: 5e-5 → 1.5e-5 (convergenza più lenta, meno memorizzazione)
-# 2. LR_BACKBONE: 0 (FREEZE completo - riduce parametri trainabili)
-# 3. WEIGHT_DECAY: 1e-4 → 8e-4 (regolarizzazione 8x più forte)
-# 4. EARLY_STOPPING: 1200 → 200 (stop prima dell'overfitting)
-# 5. EPOCHS: 4000 → 800 (non serve di più)
-# 6. BATCH_SIZE: 8 → 12 (più stabile, meno variance)
-#
+# STAGE 2 - P2R TRAINING
 # =================================================================
 OPTIM_P2R:
-  BATCH_SIZE: 12             # Aumentato da 8
+  BATCH_SIZE: 8
   NUM_WORKERS: 4
-  EPOCHS: 800                # Ridotto da 4000
-  LR: 1.5e-5                 # Ridotto da 5.0e-5
-  LR_BACKBONE: 0             # FREEZE completo (era 1.0e-6)
-  WEIGHT_DECAY: 8.0e-4       # Aumentato da 1.0e-4
+  EPOCHS: 4000
+  LR: 5.0e-5
+  LR_BACKBONE: 1.0e-6
+  WEIGHT_DECAY: 1.0e-4  # 1e-4 è corretto per VGG16 (non 5e-4)
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
-  WARMUP_EPOCHS: 30          # Ridotto da 50
-  EARLY_STOPPING_PATIENCE: 200  # Ridotto da 1200
-  GRAD_CLIP: 0.5             # Più aggressivo (era 1.0)
+  WARMUP_EPOCHS: 50
+  EARLY_STOPPING_PATIENCE: 1200
+  GRAD_CLIP: 1.0
 
 P2R_LOSS:
   USE_MULTI_SCALE: true
@@ -123,7 +113,7 @@ P2R_LOSS:
   SCALE_WEIGHTS: [1.0, 0.5, 0.25]
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
-  SPATIAL_WEIGHT: 0.1        # Ridotto da 0.15 (meno overfitting spaziale)
+  SPATIAL_WEIGHT: 0.15
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -146,7 +136,7 @@ OPTIM_JOINT:
   EARLY_STOPPING_PATIENCE: 100
   GRAD_CLIP: 0.5
   WARMUP_EPOCHS: 10
-  
+
 JOINT_LOSS:
   FIXED_ZIP_WEIGHT: 0.1     
   FIXED_P2R_WEIGHT: 1.0     

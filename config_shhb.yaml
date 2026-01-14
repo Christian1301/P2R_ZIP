@@ -1,9 +1,9 @@
-RUN_NAME: "shhb_p2rzip_vgg16bn_v8"
+RUN_NAME: "shhb_p2rzip_v8_focal_v2"
 SEED: 2025
 DEVICE: "cuda"
 
 # === DATASET ===
-DATASET: "shha"
+DATASET: "shhb"  
 DATA:
   ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-B"
   ZIP_BLOCK_SIZE: 16
@@ -13,41 +13,41 @@ DATA:
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train"
   VAL_SPLIT: "test"
-  
-  CROP_SIZE: 384  # 384 è OK se usi Scale Augmentation qui sotto
-  
-  # === NUOVA SEZIONE AUGMENTATION (Stile ZIP Paper) ===
+  CROP_SIZE: 384
+
+  # === AUGMENTATION MOLTO AGGRESSIVA (SHHB ha più overfitting) ===
+  # SHHB ha ~400 immagini con scene simili → serve forte augmentation
   AUGMENTATION:
     RandomResizedCrop:
       ENABLED: true
-      SCALE: [0.75, 2.0]   # Scale aggressiva: zoom-in (0.75) e zoom-out (2.0)
-      RATIO: [0.75, 1.33]
+      SCALE: [0.4, 3.0]      # Molto aggressivo
+      RATIO: [0.5, 2.0]      # Ampia variazione
     
     HorizontalFlip:
       ENABLED: true
       PROB: 0.5
-      
-    # I vecchi parametri legacy (mantenuti per retrocompatibilità se lo script li cerca ancora)
-    # ma il nuovo transforms.py userà quelli sopra
+    
     COLOR_JITTER:
       ENABLED: true
-      BRIGHTNESS: 0.2
-      CONTRAST: 0.2
-      SATURATION: 0.2
-      HUE: 0.1
-    RANDOM_GRAY_PROB: 0.1
+      BRIGHTNESS: 0.5        # Molto forte
+      CONTRAST: 0.5
+      SATURATION: 0.4
+      HUE: 0.2
+    
+    RANDOM_GRAY_PROB: 0.25   # 25% grayscale
+    
     GAUSSIAN_BLUR:
       ENABLED: true
-      PROB: 0.1
-      KERNEL_SIZE: [3, 5]
+      PROB: 0.4              # 40% blur
+      KERNEL_SIZE: [3, 5, 7]
 
 # === MODELLO ===
 MODEL:
-  BACKBONE: "vgg16_bn"  # VGG16 è il gold standard
-  ZIP_PI_THRESH: 0.2
+  BACKBONE: "vgg16_bn"
+  ZIP_PI_THRESH: 0.3
   GATE: "multiply"
   UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: false
+  USE_STE_MASK: true
 
 # === ZIP HEAD ===
 ZIP_HEAD:
@@ -74,14 +74,11 @@ OPTIM_ZIP:
   EARLY_STOPPING_PATIENCE: 1000
 
 ZIP_LOSS:
-  POS_WEIGHT_BCE: 5.0
-  COUNT_WEIGHT: 0.65
+  POS_WEIGHT_BCE: 1.5
+  POLARIZATION_WEIGHT: 1.5
+  COUNT_WEIGHT: 0.2
   LAMBDA_REG_WEIGHT: 0.01
   OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_CE: 1.5
-  WEIGHT_NLL: 1.0
-  WEIGHT_COUNT: 0.8
-  WEIGHT_ALIGN: 0.4
 
 ZIP_REG:
   PI_TARGET: 0.15
@@ -90,22 +87,36 @@ ZIP_REG:
   LAMBDA_WEIGHT: 1.0e-4
 
 # =================================================================
-# STAGE 2 - P2R TRAINING
+# STAGE 2 - P2R TRAINING (ANTI-OVERFITTING AGGRESSIVO)
+# =================================================================
+# 
+# SHHB overfitta più di SHHA perché:
+# 1. Scene più uniformi (strade simili)
+# 2. Folla sparsa → meno segnale per pixel
+# 3. 400 immagini non bastano
+#
+# STRATEGIA:
+# - LR molto basso
+# - Backbone completamente freezato
+# - Weight decay molto alto
+# - Early stopping aggressivo
+# - Batch size grande
+#
 # =================================================================
 OPTIM_P2R:
-  BATCH_SIZE: 8
+  BATCH_SIZE: 16             # Grande per stabilità
   NUM_WORKERS: 4
-  EPOCHS: 4000
-  LR: 5.0e-5
-  LR_BACKBONE: 1.0e-6
-  WEIGHT_DECAY: 1.0e-4  # 1e-4 è corretto per VGG16 (non 5e-4)
+  EPOCHS: 500                # Ridotto drasticamente da 4000
+  LR: 1.0e-5                 # Molto basso (era 5.0e-5)
+  LR_BACKBONE: 0             # FREEZE TOTALE
+  WEIGHT_DECAY: 1.0e-3       # 10x più forte (era 1.0e-4)
   SCHEDULER: "cosine"
   VAL_INTERVAL: 5
   RESUME_LAST: true
   SAVE_BEST: true
-  WARMUP_EPOCHS: 50
-  EARLY_STOPPING_PATIENCE: 1200
-  GRAD_CLIP: 1.0
+  WARMUP_EPOCHS: 20          # Corto
+  EARLY_STOPPING_PATIENCE: 150  # Molto aggressivo (era 1200)
+  GRAD_CLIP: 0.3             # Molto stretto
 
 P2R_LOSS:
   USE_MULTI_SCALE: true
@@ -113,7 +124,7 @@ P2R_LOSS:
   SCALE_WEIGHTS: [1.0, 0.5, 0.25]
   COUNT_WEIGHT: 2.0
   SCALE_WEIGHT: 0.5
-  SPATIAL_WEIGHT: 0.15
+  SPATIAL_WEIGHT: 0.05       # Molto ridotto (era 0.15)
   MIN_RADIUS: 8.0
   MAX_RADIUS: 64.0
   CHUNK_SIZE: 2048
@@ -126,19 +137,24 @@ P2R_LOSS:
 # STAGE 3 - JOINT TRAINING
 # =================================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 4   
+  OPTIM_JOINT:
+  BATCH_SIZE: 6   
   NUM_WORKERS: 4
-  EPOCHS: 500       
-  LR_BACKBONE: 1.0e-6 
-  LR_HEADS: 1.0e-5    
-  WEIGHT_DECAY: 1.0e-4
+  EPOCHS: 300
+  LR_BACKBONE: 0             # 0 = freeze, >0 = unfreeze layer 34+
+  LR_HEADS: 5.0e-6
+  WEIGHT_DECAY: 5.0e-4
+  VAL_INTERVAL: 5
+  EARLY_STOPPING_PATIENCE: 100
+  GRAD_CLIP: 0.5
+  WARMUP_EPOCHS: 10
 
 JOINT_LOSS:
-  FIXED_ZIP_WEIGHT: 0.1     
+  FIXED_ZIP_WEIGHT: 0.3      # ZIP più importante per scene sparse
   FIXED_P2R_WEIGHT: 1.0     
   USE_SOFT_WEIGHTING: false 
 
-# === BIN CONFIGURATION ===
+# === BINS CONFIG ===
 BINS_CONFIG:
   shha:
     bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]

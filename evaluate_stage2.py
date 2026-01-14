@@ -1,3 +1,4 @@
+# evaluate_stage2.py
 # -*- coding: utf-8 -*-
 import os
 import yaml
@@ -33,8 +34,10 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
     for images, _, points in tqdm(loader, desc="[Validating Stage 2]"):
         images = images.to(device)
         points_list = [p.to(device) for p in points]
+        
         out = model(images)
         pred_density = out.get("p2r_density", out.get("density"))
+        
         if pred_density is None:
             raise KeyError("Output 'p2r_density' o 'density' non trovato nel modello.")
 
@@ -63,6 +66,7 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
             pred_count = torch.sum(pred_density, dim=(1, 2, 3)) / cell_area
 
         gt_count = torch.tensor([len(p) for p in points_list], dtype=torch.float32, device=device)
+        
         if not hasattr(evaluate_p2r, "_debug_done"):
             print("===== DEBUG STAGE 2 =====")
             print(f"Input size: {H_in}x{W_in}")
@@ -84,6 +88,7 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
     avg_loss = total_loss / len(loader)
     mae = mae_errors / n
     rmse = np.sqrt(mse_errors / n)
+    
     print("\n===== RISULTATI FINALI STAGE 2 =====")
     print(f"Validation Loss: {avg_loss:.4f}")
     print(f"MAE: {mae:.2f}")
@@ -97,15 +102,22 @@ def evaluate_p2r(model, loader, loss_fn, device, cfg):
 
 
 def main():
+    if not os.path.exists("config.yaml"):
+        print("❌ Config non trovato!")
+        return
+
     with open("config.yaml", "r") as f:
         cfg = yaml.safe_load(f)
+        
     device = torch.device(cfg["DEVICE"])
     init_seeds(cfg["SEED"])
     print(f"✅ Avvio valutazione Stage 2 su {device}")
 
+    # Dataset & Dataloader
     DatasetClass = get_dataset(cfg["DATASET"])
     data_cfg = cfg["DATA"]
     transforms = build_transforms(data_cfg, is_train=False)
+    
     val_ds = DatasetClass(
         root=data_cfg["ROOT"],
         split=data_cfg["VAL_SPLIT"],
@@ -120,8 +132,15 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True
     )
+    
+    # Configurazione Modello
     dataset_name = cfg["DATASET"]
     bin_config = cfg["BINS_CONFIG"][dataset_name]
+    
+    # 1. Recupera use_ste dal config
+    use_ste = cfg["MODEL"].get("USE_STE_MASK", True)
+    print(f"🔧 Modello caricato con USE_STE_MASK = {use_ste}")
+
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
     zip_head_kwargs = {
         "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
@@ -138,21 +157,30 @@ def main():
         bins=bin_config["bins"],
         bin_centers=bin_config["bin_centers"],
         zip_head_kwargs=zip_head_kwargs,
+        use_ste_mask=use_ste,  # <--- AGGIUNTO QUI
     ).to(device)
+
+    # Caricamento Checkpoint
     ckpt_dir = os.path.join(cfg["EXP"]["OUT_DIR"], cfg["RUN_NAME"])
     ckpt_path = os.path.join(ckpt_dir, "stage2_best.pth")
+    
+    # Fallback se non trova stage2_best
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
+        
     if not os.path.exists(ckpt_path):
         print("❌ Nessun checkpoint Stage 2 trovato.")
         return
 
     print(f"✅ Checkpoint caricato correttamente da: {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location=device)
+    state_dict = torch.load(ckpt_path, map_location=device, weights_only=False)
+    
     if "model" in state_dict:
         model.load_state_dict(state_dict["model"], strict=False)
     else:
         model.load_state_dict(state_dict, strict=False)
+
+    # Loss Configuration
     loss_cfg = cfg.get("P2R_LOSS", {})
     loss_kwargs = {}
     if "SCALE_WEIGHT" in loss_cfg:
@@ -165,19 +193,26 @@ def main():
         loss_kwargs["min_radius"] = float(loss_cfg["MIN_RADIUS"])
     if "MAX_RADIUS" in loss_cfg:
         loss_kwargs["max_radius"] = float(loss_cfg["MAX_RADIUS"])
+        
     loss_fn = P2RLossFixed(**loss_kwargs).to(device)
     default_down = data_cfg.get("P2R_DOWNSAMPLE", 8)
+    
+    # Calibrazione Scale (se necessaria)
     clamp_cfg = loss_cfg.get("LOG_SCALE_CLAMP")
     max_adjust = loss_cfg.get("LOG_SCALE_CALIBRATION_MAX_DELTA")
-    calibrate_density_scale(
-        model,
-        val_loader,
-        device,
-        default_down,
-        max_batches=None,
-        clamp_range=clamp_cfg,
-        max_adjust=max_adjust,
-    )
+    
+    #print("⚖️ Calibrazione density scale...")
+    #calibrate_density_scale(
+    #    model,
+    #    val_loader,
+    #    device,
+    #    default_down,
+    #    max_batches=None,
+    #    clamp_range=clamp_cfg,
+    #    max_adjust=max_adjust,
+    #)
+    
+    # Valutazione
     evaluate_p2r(model, val_loader, loss_fn, device, cfg)
 
 if __name__ == "__main__":

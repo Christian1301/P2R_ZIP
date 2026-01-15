@@ -10,7 +10,7 @@ EXPERIMENT_DIR: "exp"
 # DATASET
 # ============================================================
 DATASET:
-  NAME: "ShanghaiTechA"
+  NAME: "shha"
   ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
@@ -111,6 +111,16 @@ OPTIM_JOINT:
   # Ripartiamo da un modello già caldo, niente warmup
   WARMUP_EPOCHS: 0        
   VAL_INTERVAL: 2         # Validazione più frequente per monitorare
+
+STAGE3_FUSION:
+  ALPHA_START: 0.0
+  ALPHA_END: 0.3
+  ALPHA_WARMUP: 50
+  LR_P2R: 1.0e-5
+  LR_SCALE: 1.0e-3
+  SPATIAL_WEIGHT: 0.05
+  EPOCHS: 300
+  PATIENCE: 80
 
 JOINT_LOSS:
   COUNT_WEIGHT: 1.0

@@ -1,177 +1,154 @@
-# =================================================================
-# CONFIGURAZIONE JHU-CROWD++
-# =================================================================
-# 
-# Dataset: JHU-CROWD++ (Johns Hopkins University)
-# - 2272 train, 500 val, 1600 test
-# - Densità media: ~346 persone/immagine
-# - Caratteristiche: diverse condizioni meteo, illuminazione
-#
-# NOTA: Usa dataset loader "jhu" (jhu.py)
-# Struttura attesa: ROOT/train/images/*.jpg, ROOT/val/images/*.jpg
-#                   ROOT/train/gt/*.txt, ROOT/val/gt/*.txt
-# =================================================================
+# ============================================================
+# CONFIG JHU-CROWD++ - FUSION MODE
+# Obiettivo: Joint Training su JHU (Dataset Complesso e Vario)
+# ============================================================
 
-RUN_NAME: "jhu_p2rzip_v1"
-SEED: 2025
-DEVICE: "cuda"
+RUN_NAME: "jhu"
+EXPERIMENT_DIR: "exp"
 
-# === DATASET ===
-DATASET: "jhu"
-DATA:
+# ============================================================
+# DATASET
+# ============================================================
+DATASET:
+  NAME: "jhu"
   ROOT: "/mnt/localstorage/cromano/Datasets/jhu_crowd_v2"
-  ZIP_BLOCK_SIZE: 16
-  P2R_DOWNSAMPLE: 8
-  IMG_EXTS: [".jpg", ".png"]
-  NORM_MEAN: [0.485, 0.456, 0.406]
-  NORM_STD:  [0.229, 0.224, 0.225]
-  TRAIN_SPLIT: "train"
-  VAL_SPLIT: "val"
-  
-  # Data Augmentation
-  CROP_SIZE: 384
-  CROP_SCALE: [0.4, 1.0]
+  BLOCK_SIZE: 16
+  NUM_WORKERS: 4
 
-# === MODELLO ===
+# ============================================================
+# MODEL
+# ============================================================
 MODEL:
   BACKBONE: "vgg16_bn"
-  ZIP_PI_THRESH: 0.5
-  GATE: "multiply"
-  UPSAMPLE_TO_INPUT: false
-  USE_STE_MASK: true
+  BACKBONE_PRETRAINED: true
+  
+  # Stage 3 Fusion sblocca tutto
+  FREEZE_BACKBONE_STAGE1: false
+  FREEZE_BACKBONE_STAGE2: false
+  FREEZE_BACKBONE_STAGE3: false
+  
+  ZIP_HIDDEN_DIM: 256
+  ZIP_PI_THRESH: 0.2
+  
+  P2R_FEA_CHANNEL: 256
+  P2R_OUT_STRIDE: 16
 
-# === ZIP HEAD ===
 ZIP_HEAD:
   LAMBDA_SCALE: 1.2
   LAMBDA_MAX: 8.0
   USE_SOFTPLUS: true
-  LAMBDA_NOISE_STD: 0.0
 
-# =================================================================
-# STAGE 1 - ZIP PRE-TRAINING
-# =================================================================
+# ============================================================
+# STAGE 1 & 2 (Standard per compatibilità)
+# ============================================================
 OPTIM_ZIP:
-  BATCH_SIZE: 6
-  NUM_WORKERS: 4
   EPOCHS: 2000
-  WEIGHT_DECAY: 3.0e-5
-  SCHEDULER: "cosine"
-  VAL_INTERVAL: 5
-  RESUME_LAST: true
-  SAVE_BEST: true
-  BASE_LR: 8.0e-5
+  BATCH_SIZE: 6
+  LR: 8.0e-5
   LR_BACKBONE: 4.0e-5
+  HEAD_LR: 8.0e-5
+  WEIGHT_DECAY: 3.0e-5
   WARMUP_EPOCHS: 100
   EARLY_STOPPING_PATIENCE: 500
-
-ZIP_LOSS:
-  POS_WEIGHT_BCE: 5.0
-  COUNT_WEIGHT: 0.65
-  LAMBDA_REG_WEIGHT: 0.01
-  OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_CE: 1.5
-  WEIGHT_NLL: 1.0
-  WEIGHT_COUNT: 0.8
-  WEIGHT_ALIGN: 0.4
-
-ZIP_REG:
-  PI_TARGET: 0.15
-  PI_WEIGHT: 5.0e-4
-  LAMBDA_TARGET: 5.0
-  LAMBDA_WEIGHT: 1.0e-4
-
-# =================================================================
-# STAGE 2 - P2R TRAINING
-# =================================================================
-OPTIM_P2R:
-  BATCH_SIZE: 6
+  GRAD_CLIP: 1.0
+  VAL_INTERVAL: 5
   NUM_WORKERS: 4
+
+ZIP_LOSS_V4:
+  WEIGHT_NLL: 1.0
+  WEIGHT_LAMBDA_REG: 0.01
+  WEIGHT_PI_ENTROPY: 0.0
+  LAMBDA_MAX_TARGET: 8.0
+  OCCUPANCY_THRESHOLD: 0.5
+  PI_THRESHOLD: 0.5
+
+OPTIM_P2R:
   EPOCHS: 3500
+  BATCH_SIZE: 6
   LR: 5.0e-5
   LR_BACKBONE: 1.0e-6
   WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  VAL_INTERVAL: 5
-  RESUME_LAST: true
-  SAVE_BEST: true
   WARMUP_EPOCHS: 60
   EARLY_STOPPING_PATIENCE: 180
   GRAD_CLIP: 1.0
+  SCHEDULER: "cosine"
+  MIN_LR: 1.0e-7
+  DROPOUT: 0.3
+  FINAL_DROPOUT: 0.5
+  USE_AGGRESSIVE_AUG: true
+  AUG_SCALE_RANGE: [0.8, 1.2]
+  AUG_ROTATION: 15
+  AUG_ERASING_PROB: 0.3
 
 P2R_LOSS:
+  USE_MULTI_SCALE: true
+  SCALES: [1, 2, 4]
+  SCALE_WEIGHTS: [1.0, 0.5, 0.25]
   COUNT_WEIGHT: 2.0
-  SCALE_WEIGHT: 0.5
   SPATIAL_WEIGHT: 0.15
-  MIN_RADIUS: 8.0
-  MAX_RADIUS: 64.0
-  CHUNK_SIZE: 2048
+  SCALE_WEIGHT: 0.5
   LOG_SCALE_INIT: 4.0
   LOG_SCALE_CLAMP: [-2.0, 10.0]
-  LOG_SCALE_CALIBRATION_MAX_DELTA: 3.0
-  CALIBRATE_BATCHES: 10
+  LOG_SCALE_LR_MULT: 0.1
 
-# =================================================================
-# STAGE 3 - JOINT TRAINING (SOFT WEIGHTING)
-# =================================================================
+# ============================================================
+# STAGE 3 FUSION CONFIGURATION
+# ============================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 6
-  NUM_WORKERS: 4
-  EPOCHS: 600
-  LR_BACKBONE: 0.0
-  LR_HEADS: 5.0e-5
-  WEIGHT_DECAY: 1.0e-4
-  SCHEDULER: "cosine"
-  SCHEDULER_STEP: "epoch"
-  WARMUP_EPOCHS: 5
-  LR_MIN_FACTOR: 0.01
-  VAL_INTERVAL: 5
-  EARLY_STOPPING_PATIENCE: 200
+  BATCH_SIZE: 6  # Se OOM, riduci a 4
+  
+# Parametri specifici per lo script Fusion
+STAGE3_FUSION:
+  ALPHA_START: 0.0
+  ALPHA_END: 0.3
+  ALPHA_WARMUP: 50
+  LR_P2R: 1.0e-5
+  LR_SCALE: 1.0e-3
+  SPATIAL_WEIGHT: 0.05
+  EPOCHS: 300
+  PATIENCE: 80
 
-JOINT_LOSS:
-  PI_POS_WEIGHT: 8.0
-  OCCUPANCY_THRESHOLD: 0.5
-  PI_THRESHOLD: 0.5
-  SOFT_WEIGHT_ALPHA: 0.3
-  USE_SOFT_WEIGHTING: true
-
-# =================================================================
-# STAGE 4 - BIAS CORRECTION
-# =================================================================
-OPTIM_STAGE4:
-  BATCH_SIZE: 4
-  NUM_WORKERS: 4
-  EPOCHS: 150
-  LR_P2R: 1.0e-6
-  LR_LOG_SCALE: 1.0e-5
-  LR_PI: 1.0e-4
-  WEIGHT_DECAY: 1.0e-4
-  VAL_INTERVAL: 3
-  EARLY_STOPPING_PATIENCE: 40
-
-STAGE4_LOSS:
-  OVERESTIMATE_WEIGHT: 2.0
-  COUNT_WEIGHT: 1.0
-  PI_WEIGHT: 0.3
-
-# === BIN CONFIGURATION ===
+# ============================================================
+# BIN CONFIGURATION (Specifica per JHU)
+# ============================================================
 BINS_CONFIG:
-  shha:
-    bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
-    bin_centers: [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0]
-  shhb:
-    bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
-    bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  qnrf:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
   jhu:
     bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
     bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-  nwpu:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
+
+# ============================================================
+# AUGMENTATION
+# ============================================================
+AUGMENTATION:
+  TRAIN:
+    RANDOM_CROP: true
+    CROP_SIZE: [384, 384]
+    HORIZONTAL_FLIP: true
+    FLIP_PROB: 0.5
+    COLOR_JITTER: true
+    JITTER_BRIGHTNESS: 0.2
+    JITTER_CONTRAST: 0.2
+    JITTER_SATURATION: 0.1
+    JITTER_HUE: 0.05
+    RANDOM_GRAYSCALE: true
+    GRAYSCALE_PROB: 0.1
+    GAUSSIAN_BLUR: true
+    BLUR_PROB: 0.1
+    BLUR_KERNEL: [3, 7]
+  VAL:
+    RESIZE: false
+
+# ============================================================
+# Logging
+# ============================================================
+LOGGING:
+  LOG_INTERVAL: 50
+  VAL_INTERVAL: 1
+  SAVE_BEST_ONLY: true
+  TENSORBOARD: true
 
 EXP:
   OUT_DIR: "exp"
-  SAVE_BEST: true
-  SAVE_WORST_CASES: true
+
+DEVICE: "cuda"
+SEED: 2025

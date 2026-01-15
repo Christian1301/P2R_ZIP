@@ -48,7 +48,7 @@ echo "✅ Valutazione 2 completata!"
 python3 tune_alpha.py > logs/tune_alpha.log 2>&1
 echo "✅ Tuning alpha completato!"
 
-python3 evaluate_stage3.py > logs/ev_stage3.log 2>&1
+python evaluate_stage3.py --config config.yaml --tta --tta-flip-only > logs/ev_stage3.log 2>&1
 echo "✅ Valutazione 3 completata!"
 
 python3 visualize_gating.py > logs/visualize_gating.log 2>&1

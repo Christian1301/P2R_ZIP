@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 3 V2 - JOINT TRAINING con Soft Weighting
+Stage 3 FUSION - Joint Training con Soft Weighting FUNZIONANTE
 
-CAMBIAMENTO CHIAVE:
-Invece di hard masking (density × mask), usa soft weighting:
-  count = sum(density × (1 - α + α × π))
+PROBLEMA RISOLTO:
+- Stage 2 produce density calibrata per raw sum
+- Soft weighting riduce la density → sottostima
+- Soluzione: α warmup + scale compensation + loss appropriata
 
-Dove:
-- α = 0.0: ignora completamente π (usa raw density) 
-- α = 1.0: hard masking con π
-- α = 0.2-0.3: combina 70-80% raw + 20-30% π-weighted
+STRATEGIA:
+1. α WARMUP: Parte da 0 (raw) e sale gradualmente a target (es. 0.3)
+2. SCALE COMPENSATION: Fattore learnable che compensa la riduzione
+3. LOSS IBRIDA: Count sulla weighted + spatial alignment bonus
+4. LR DIFFERENZIATI: P2R può adattarsi, ZIP quasi frozen
 
-VANTAGGI:
-1. Non perde informazione anche se π-head è imperfetto
-2. Gradiente più stabile (no discontinuità)
-3. Permette al modello di imparare quando fidarsi di π
-
-FORMULA LOSS:
-L_total = (1-α_loss)·L_ZIP + α_loss·L_P2R + β·L_consistency
-
-Dove L_consistency penalizza discrepanze tra π alto e density bassa.
+FORMULA FINALE:
+  count = Σ(density × scale_factor × soft_weight) / cell_area
+  dove soft_weight = (1 - α) + α × π
 """
 
 import os
@@ -31,28 +27,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+import math
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
-from train_utils import (
-    init_seeds, 
-    collate_fn,
-    canonicalize_p2r_grid,
-)
+from train_utils import init_seeds, collate_fn, canonicalize_p2r_grid
 
 
 ALIAS_DATASETS = {
-    'shha': 'shha',
-    'shanghaitecha': 'shha',
-    'shanghaitechparta': 'shha',
-    'shanghaitechaparta': 'shha',
-    'shhb': 'shhb',
-    'shanghaitechpartb': 'shhb',
-    'ucf': 'ucf',
-    'ucfqnrf': 'ucf',
-    'nwpu': 'nwpu',
-    'jhu': 'jhu'
+    'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
+    'shhb': 'shhb', 'shanghaitechpartb': 'shhb',
+    'ucf': 'ucf', 'ucfqnrf': 'ucf',
+    'nwpu': 'nwpu', 'jhu': 'jhu'
 }
 
 DEFAULT_BINS_CONFIG = {
@@ -80,426 +67,360 @@ DEFAULT_BINS_CONFIG = {
 
 
 # =============================================================================
-# SOFT WEIGHTING UTILITIES
+# ALPHA SCHEDULER - Warmup graduale
 # =============================================================================
 
-def apply_soft_weighting(density, pi_probs, alpha=0.2):
+class AlphaScheduler:
     """
-    Applica soft weighting alla density map.
+    Scheduler per α che parte da 0 e sale gradualmente.
     
-    Formula: density_weighted = density × (1 - α + α × π)
-    
-    Args:
-        density: [B, 1, H, W] raw density
-        pi_probs: [B, 1, H', W'] probabilità π (verrà ridimensionata se necessario)
-        alpha: peso del soft weighting (0=ignora π, 1=hard masking)
-    
-    Returns:
-        density_weighted: [B, 1, H, W]
-    """
-    # Ridimensiona π se necessario
-    if pi_probs.shape[-2:] != density.shape[-2:]:
-        pi_probs = F.interpolate(
-            pi_probs,
-            size=density.shape[-2:],
-            mode='bilinear',
-            align_corners=False
-        )
-    
-    # Soft weighting: preserva (1-α) della density anche dove π=0
-    weights = (1 - alpha) + alpha * pi_probs
-    
-    return density * weights
-
-
-def compute_count_with_soft_weighting(density, pi_probs, cell_area, alpha=0.2):
-    """
-    Calcola count usando soft weighting.
-    
-    Returns:
-        count: scalar tensor
-        coverage: % di π > 0.5
-    """
-    weighted_density = apply_soft_weighting(density, pi_probs, alpha)
-    count = weighted_density.sum() / cell_area
-    
-    # Coverage (per monitoring)
-    if pi_probs.shape[-2:] != density.shape[-2:]:
-        pi_probs = F.interpolate(
-            pi_probs, size=density.shape[-2:], mode='bilinear', align_corners=False
-        )
-    coverage = (pi_probs > 0.5).float().mean().item() * 100
-    
-    return count, coverage
-
-
-# =============================================================================
-# LOSS COMPONENTS
-# =============================================================================
-
-class PiHeadLoss(nn.Module):
-    """BCE Loss per π-head."""
-    def __init__(self, pos_weight: float = 3.0, block_size: int = 16, threshold: float = 0.5):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.block_size = block_size
-        self.threshold = threshold
-        self.bce = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight]),
-            reduction='mean'
-        )
-    
-    def forward(self, logit_pi, gt_density):
-        logit_pieno = logit_pi[:, 1:2, :, :]
-        
-        gt_counts = F.avg_pool2d(
-            gt_density, kernel_size=self.block_size, stride=self.block_size
-        ) * (self.block_size ** 2)
-        gt_occupancy = (gt_counts > self.threshold).float()
-        
-        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
-            gt_occupancy = F.interpolate(gt_occupancy, size=logit_pieno.shape[-2:], mode='nearest')
-        
-        if self.bce.pos_weight.device != logit_pieno.device:
-            self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
-        
-        return self.bce(logit_pieno, gt_occupancy)
-
-
-class P2RCountLoss(nn.Module):
-    """Count + Spatial loss per P2R."""
-    def __init__(self, count_weight: float = 2.5, spatial_weight: float = 0.1):
-        super().__init__()
-        self.count_weight = count_weight
-        self.spatial_weight = spatial_weight
-    
-    def forward(self, pred_density, points_list, cell_area):
-        B, _, H, W = pred_density.shape
-        device = pred_density.device
-        
-        total_count_loss = torch.tensor(0.0, device=device)
-        total_spatial_loss = torch.tensor(0.0, device=device)
-        
-        for i, pts in enumerate(points_list):
-            gt = len(pts) if pts is not None else 0
-            pred_count = pred_density[i].sum() / cell_area
-            
-            total_count_loss += torch.abs(pred_count - gt)
-            
-            if gt > 0 and self.spatial_weight > 0:
-                target = torch.zeros(H, W, device=device)
-                for pt in pts:
-                    x = int(pt[0].clamp(0, W-1).item())
-                    y = int(pt[1].clamp(0, H-1).item())
-                    for dy in range(-1, 2):
-                        for dx in range(-1, 2):
-                            ny, nx = y + dy, x + dx
-                            if 0 <= ny < H and 0 <= nx < W:
-                                target[ny, nx] += 1.0
-                
-                if target.sum() > 0:
-                    target = target / target.sum()
-                    pred_norm = pred_density[i, 0] / (pred_density[i, 0].sum() + 1e-8)
-                    total_spatial_loss += F.mse_loss(pred_norm, target)
-        
-        return self.count_weight * total_count_loss / B + self.spatial_weight * total_spatial_loss / B
-
-
-class ConsistencyLoss(nn.Module):
-    """
-    Loss di consistenza tra π e density.
-    
-    Penalizza i casi dove:
-    - π è alto ma density è bassa
-    - π è basso ma density è alta
-    
-    Questo forza coerenza tra i due head.
-    """
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-    
-    def forward(self, pi_probs, density, cell_area):
-        """
-        Args:
-            pi_probs: [B, 1, H_pi, W_pi] probabilità π
-            density: [B, 1, H_d, W_d] density map
-            cell_area: scaling factor
-        """
-        if self.weight == 0:
-            return torch.tensor(0.0, device=density.device)
-        
-        # Allinea dimensioni
-        if pi_probs.shape[-2:] != density.shape[-2:]:
-            pi_probs = F.interpolate(
-                pi_probs, size=density.shape[-2:], mode='bilinear', align_corners=False
-            )
-        
-        # Normalizza density per confronto
-        density_norm = density / (density.max() + 1e-8)
-        
-        # Penalizza discrepanze: |π - density_norm|² pesato
-        # Ma solo dove almeno uno dei due è significativo
-        mask = (pi_probs > 0.3) | (density_norm > 0.3)
-        
-        if mask.sum() > 0:
-            diff = (pi_probs - density_norm) ** 2
-            loss = (diff * mask.float()).sum() / mask.sum()
-        else:
-            loss = torch.tensor(0.0, device=density.device)
-        
-        return self.weight * loss
-
-
-# =============================================================================
-# JOINT LOSS V2 - Con Soft Weighting
-# =============================================================================
-
-class JointLossV2(nn.Module):
-    """
-    Joint Loss con soft weighting.
-    
-    Formula: L_total = (1-α)·L_ZIP + α·L_P2R + β·L_consistency
-    
-    Il count viene calcolato con soft weighting:
-      count = sum(density × (1 - sw_α + sw_α × π))
+    Questo permette al modello di adattarsi progressivamente
+    al soft weighting invece di subire uno shock iniziale.
     """
     def __init__(
         self,
-        alpha: float = 0.7,           # Peso P2R vs ZIP
-        soft_weight_alpha: float = 0.2,  # Alpha per soft weighting
-        pi_pos_weight: float = 3.0,
-        block_size: int = 16,
-        count_weight: float = 2.5,
+        alpha_start: float = 0.0,
+        alpha_end: float = 0.3,
+        warmup_epochs: int = 50,
+        schedule: str = 'linear'  # 'linear', 'cosine', 'exp'
+    ):
+        self.alpha_start = alpha_start
+        self.alpha_end = alpha_end
+        self.warmup_epochs = warmup_epochs
+        self.schedule = schedule
+        self.current_alpha = alpha_start
+    
+    def step(self, epoch: int) -> float:
+        """Calcola α per l'epoca corrente."""
+        if epoch >= self.warmup_epochs:
+            self.current_alpha = self.alpha_end
+        else:
+            progress = epoch / self.warmup_epochs
+            
+            if self.schedule == 'linear':
+                self.current_alpha = self.alpha_start + progress * (self.alpha_end - self.alpha_start)
+            elif self.schedule == 'cosine':
+                # Cosine annealing (più lento all'inizio)
+                self.current_alpha = self.alpha_start + (1 - math.cos(progress * math.pi / 2)) * (self.alpha_end - self.alpha_start)
+            elif self.schedule == 'exp':
+                # Esponenziale (più veloce all'inizio)
+                self.current_alpha = self.alpha_start + (1 - math.exp(-3 * progress)) * (self.alpha_end - self.alpha_start)
+        
+        return self.current_alpha
+    
+    def get_alpha(self) -> float:
+        return self.current_alpha
+
+
+# =============================================================================
+# SCALE COMPENSATION MODULE
+# =============================================================================
+
+class ScaleCompensation(nn.Module):
+    """
+    Modulo che compensa automaticamente la riduzione causata dal soft weighting.
+    
+    Impara un fattore di scala che bilancia la riduzione media.
+    Inizializzato a 1.0, può crescere per compensare.
+    """
+    def __init__(self, init_scale: float = 1.0, learnable: bool = True):
+        super().__init__()
+        self.log_scale = nn.Parameter(
+            torch.tensor(math.log(init_scale)),
+            requires_grad=learnable
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = torch.exp(self.log_scale.clamp(-2, 2))  # Range [0.13, 7.4]
+        return x * scale
+    
+    def get_scale(self) -> float:
+        with torch.no_grad():
+            return torch.exp(self.log_scale.clamp(-2, 2)).item()
+
+
+# =============================================================================
+# FUSION LOSS - Loss per Joint Training
+# =============================================================================
+
+class FusionLoss(nn.Module):
+    """
+    Loss per Stage 3 Fusion che supporta soft weighting progressivo.
+    
+    Componenti:
+    1. COUNT LOSS: L1 sul count finale (dopo weighting)
+    2. SPATIAL BONUS: Premia allineamento tra π alto e density alta
+    3. REGULARIZATION: Penalizza scale compensation troppo estremo
+    
+    Formula count:
+      weighted_density = density × scale × ((1-α) + α×π)
+      pred_count = Σ weighted_density / cell_area
+    """
+    
+    def __init__(
+        self,
+        count_weight: float = 1.0,
         spatial_weight: float = 0.1,
-        consistency_weight: float = 0.1,
+        scale_reg_weight: float = 0.01,
     ):
         super().__init__()
-        self.alpha = alpha
-        self.soft_weight_alpha = soft_weight_alpha
-        
-        self.zip_loss = PiHeadLoss(
-            pos_weight=pi_pos_weight,
-            block_size=block_size,
-        )
-        
-        self.p2r_loss = P2RCountLoss(
-            count_weight=count_weight,
-            spatial_weight=spatial_weight,
-        )
-        
-        self.consistency_loss = ConsistencyLoss(weight=consistency_weight)
+        self.count_weight = count_weight
+        self.spatial_weight = spatial_weight
+        self.scale_reg_weight = scale_reg_weight
     
-    def forward(self, outputs, gt_density, points_list, cell_area):
+    def forward(
+        self,
+        raw_density: torch.Tensor,
+        pi_probs: torch.Tensor,
+        points_list: list,
+        cell_area: float,
+        alpha: float,
+        scale_factor: float = 1.0,
+    ) -> dict:
         """
         Args:
-            outputs: dict con 'logit_pi_maps', 'p2r_density', 'pi_probs'
-            gt_density: [B, 1, H, W]
-            points_list: lista tensori [N_i, 2]
-            cell_area: float
+            raw_density: [B, 1, H, W] density da P2R
+            pi_probs: [B, 1, H', W'] probabilità π da ZIP
+            points_list: Lista di tensori [N_i, 2]
+            cell_area: Area per normalizzazione
+            alpha: Peso corrente del soft weighting (da scheduler)
+            scale_factor: Fattore di compensazione scala
         """
-        pi_probs = outputs['pi_probs']
-        raw_density = outputs['p2r_density']
+        B = raw_density.shape[0]
+        device = raw_density.device
         
-        # Applica soft weighting per il count
-        weighted_density = apply_soft_weighting(
-            raw_density, pi_probs, alpha=self.soft_weight_alpha
+        # Allinea π alla dimensione della density
+        if pi_probs.shape[-2:] != raw_density.shape[-2:]:
+            pi_aligned = F.interpolate(
+                pi_probs,
+                size=raw_density.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        else:
+            pi_aligned = pi_probs
+        
+        # Calcola soft weights: (1 - α) + α × π
+        soft_weights = (1 - alpha) + alpha * pi_aligned
+        
+        # Weighted density con scale compensation
+        weighted_density = raw_density * scale_factor * soft_weights
+        
+        # =====================================================================
+        # 1. COUNT LOSS (principale)
+        # =====================================================================
+        count_losses = []
+        pred_counts = []
+        gt_counts = []
+        
+        for i, pts in enumerate(points_list):
+            gt = len(pts) if pts is not None else 0
+            pred_count = weighted_density[i].sum() / cell_area
+            
+            gt_counts.append(gt)
+            pred_counts.append(pred_count.item())
+            
+            count_losses.append(torch.abs(pred_count - gt))
+        
+        count_loss = torch.stack(count_losses).mean()
+        
+        # =====================================================================
+        # 2. SPATIAL ALIGNMENT BONUS
+        # Premia quando density alta corrisponde a π alto
+        # =====================================================================
+        if self.spatial_weight > 0 and alpha > 0:
+            # Normalizza entrambe per confronto forma
+            density_norm = raw_density / (raw_density.sum(dim=[2,3], keepdim=True) + 1e-8)
+            pi_norm = pi_aligned / (pi_aligned.sum(dim=[2,3], keepdim=True) + 1e-8)
+            
+            # Correlation loss: penalizza differenze nella distribuzione
+            spatial_loss = F.mse_loss(density_norm, pi_norm)
+        else:
+            spatial_loss = torch.tensor(0.0, device=device)
+        
+        # =====================================================================
+        # 3. SCALE REGULARIZATION
+        # Penalizza scale troppo lontano da 1
+        # =====================================================================
+        scale_reg = self.scale_reg_weight * (scale_factor - 1.0) ** 2
+        
+        # =====================================================================
+        # TOTAL LOSS
+        # =====================================================================
+        total_loss = (
+            self.count_weight * count_loss +
+            self.spatial_weight * spatial_loss +
+            scale_reg
         )
         
-        # L_ZIP
-        l_zip = self.zip_loss(outputs['logit_pi_maps'], gt_density)
-        
-        # L_P2R (sulla density pesata)
-        l_p2r = self.p2r_loss(weighted_density, points_list, cell_area)
-        
-        # L_consistency
-        l_cons = self.consistency_loss(pi_probs, raw_density, cell_area)
-        
-        # Total
-        total_loss = (1 - self.alpha) * l_zip + self.alpha * l_p2r + l_cons
-        
         # Metriche
-        with torch.no_grad():
-            B = raw_density.shape[0]
-            
-            # Count con soft weighting
-            pred_counts_sw = []
-            pred_counts_raw = []
-            gt_counts = []
-            
-            for i, pts in enumerate(points_list):
-                gt = len(pts)
-                gt_counts.append(gt)
-                
-                # Raw count
-                raw_count = (raw_density[i].sum() / cell_area).item()
-                pred_counts_raw.append(raw_count)
-                
-                # Soft weighted count
-                sw_count = (weighted_density[i].sum() / cell_area).item()
-                pred_counts_sw.append(sw_count)
-            
-            mae_raw = np.mean([abs(p - g) for p, g in zip(pred_counts_raw, gt_counts)])
-            mae_sw = np.mean([abs(p - g) for p, g in zip(pred_counts_sw, gt_counts)])
-            
-            # Coverage
-            if pi_probs.shape[-2:] != raw_density.shape[-2:]:
-                pi_for_cov = F.interpolate(pi_probs, size=raw_density.shape[-2:], mode='bilinear', align_corners=False)
-            else:
-                pi_for_cov = pi_probs
-            coverage = (pi_for_cov > 0.5).float().mean().item() * 100
+        mae = np.mean([abs(p - g) for p, g in zip(pred_counts, gt_counts)])
+        bias = sum(pred_counts) / sum(gt_counts) if sum(gt_counts) > 0 else 0
         
-        metrics = {
-            'total': total_loss.item(),
-            'zip': l_zip.item(),
-            'p2r': l_p2r.item(),
-            'consistency': l_cons.item() if isinstance(l_cons, torch.Tensor) else l_cons,
+        # Anche raw MAE per confronto
+        raw_pred_counts = [(raw_density[i].sum() / cell_area).item() for i in range(B)]
+        mae_raw = np.mean([abs(p - g) for p, g in zip(raw_pred_counts, gt_counts)])
+        
+        return {
+            'total_loss': total_loss,
+            'count_loss': count_loss,
+            'spatial_loss': spatial_loss if isinstance(spatial_loss, float) else spatial_loss.item(),
+            'scale_reg': scale_reg if isinstance(scale_reg, float) else scale_reg.item(),
+            'mae_weighted': mae,
             'mae_raw': mae_raw,
-            'mae_soft_weighted': mae_sw,
-            'coverage': coverage,
+            'bias': bias,
+            'alpha': alpha,
+            'scale': scale_factor,
+            'avg_weight': soft_weights.mean().item(),
         }
-        
-        return total_loss, metrics
 
 
 # =============================================================================
-# FORWARD PASS HELPER
-# =============================================================================
-
-def forward_pass(model, images):
-    """Forward pass standard."""
-    return model(images)
-
-
-# =============================================================================
-# TRAINING & VALIDATION
+# TRAINING
 # =============================================================================
 
 def train_one_epoch(
-    model, criterion, dataloader, optimizer, scheduler,
-    device, default_down, epoch, config
+    model,
+    scale_comp,
+    criterion,
+    dataloader,
+    optimizer,
+    device,
+    default_down,
+    epoch,
+    alpha_scheduler,
 ):
-    """Training con soft weighting."""
+    """Training con α progressivo."""
     model.train()
+    scale_comp.train()
     
-    if config.get('FREEZE_BN', True):
-        model.backbone.eval()
+    # Congela BN del backbone
+    model.backbone.eval()
+    for m in model.backbone.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+    
+    # α per questa epoca
+    alpha = alpha_scheduler.step(epoch)
     
     total_loss = 0.0
-    metrics_accum = {}
+    metrics_sum = {}
     
-    pbar = tqdm(dataloader, desc=f"Stage3 V2 [Ep {epoch}]")
+    pbar = tqdm(dataloader, desc=f"Stage3 Fusion [Ep {epoch}] α={alpha:.3f}")
     
     for images, gt_density, points in pbar:
         images = images.to(device)
-        gt_density = gt_density.to(device)
         points_list = [p.to(device) for p in points]
         
         optimizer.zero_grad()
         
-        outputs = forward_pass(model, images)
+        # Forward
+        outputs = model(images)
+        raw_density = outputs['p2r_density']
+        pi_probs = outputs['pi_probs']
         
         # Canonicalize
-        pred_density = outputs['p2r_density']
-        _, _, h_in, w_in = images.shape
-        pred_density, down_tuple, _ = canonicalize_p2r_grid(pred_density, (h_in, w_in), default_down)
-        outputs['p2r_density'] = pred_density
+        _, _, H_in, W_in = images.shape
+        raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
+        cell_area = down_tuple[0] * down_tuple[1]
         
-        down_h, down_w = down_tuple
-        cell_area = down_h * down_w
+        # Scale compensation - applica PRIMA della loss come tensore
+        scaled_density = scale_comp(raw_density)
         
-        # Loss
-        loss, metrics = criterion(outputs, gt_density, points_list, cell_area)
+        # Loss - usa scaled_density invece di raw_density
+        loss_dict = criterion(
+            scaled_density, pi_probs, points_list, cell_area,
+            alpha=alpha, scale_factor=1.0  # scale già applicato
+        )
+        loss = loss_dict['total_loss']
+        
+        # Aggiungi scale alle metriche
+        loss_dict['scale'] = scale_comp.get_scale()
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(scale_comp.parameters(), max_norm=0.5)
         optimizer.step()
         
         total_loss += loss.item()
-        for k, v in metrics.items():
-            metrics_accum[k] = metrics_accum.get(k, 0.0) + v
+        for k, v in loss_dict.items():
+            if isinstance(v, (int, float)):
+                metrics_sum[k] = metrics_sum.get(k, 0) + v
         
         pbar.set_postfix({
             'L': f"{loss.item():.3f}",
-            'MAE_sw': f"{metrics['mae_soft_weighted']:.1f}",
-            'MAE_raw': f"{metrics['mae_raw']:.1f}",
-            'cov': f"{metrics['coverage']:.1f}%",
+            'MAE_w': f"{loss_dict['mae_weighted']:.1f}",
+            'MAE_r': f"{loss_dict['mae_raw']:.1f}",
+            'scale': f"{loss_dict['scale']:.3f}",
         })
     
-    if scheduler:
-        scheduler.step()
-    
     n = len(dataloader)
-    for k in metrics_accum:
-        metrics_accum[k] /= n
+    avg_metrics = {k: v / n for k, v in metrics_sum.items()}
+    avg_metrics['loss'] = total_loss / n
     
-    return total_loss / n, metrics_accum
+    return avg_metrics
 
 
 @torch.no_grad()
-def validate(model, dataloader, device, default_down, soft_weight_alpha=0.2):
-    """
-    Validazione con entrambe le metriche: raw e soft-weighted.
-    """
+def validate(model, scale_comp, dataloader, device, default_down, alpha):
+    """Validazione con soft weighting."""
     model.eval()
+    scale_comp.eval()
     
-    results_raw = {'mae': [], 'mse': [], 'pred': 0, 'gt': 0}
-    results_sw = {'mae': [], 'mse': [], 'pred': 0, 'gt': 0}
-    coverages = []
+    results = {
+        'raw': {'mae': [], 'pred': 0, 'gt': 0},
+        'weighted': {'mae': [], 'pred': 0, 'gt': 0},
+    }
     
-    for images, densities, points in tqdm(dataloader, desc="Validate", leave=False):
+    scale = scale_comp.get_scale()
+    
+    for images, _, points in tqdm(dataloader, desc="Validate", leave=False):
         images = images.to(device)
         points_list = [p.to(device) for p in points]
         
-        outputs = forward_pass(model, images)
+        outputs = model(images)
         raw_density = outputs['p2r_density']
         pi_probs = outputs['pi_probs']
         
         _, _, H_in, W_in = images.shape
         raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
+        cell_area = down_tuple[0] * down_tuple[1]
         
-        down_h, down_w = down_tuple
-        cell_area = down_h * down_w
+        # Applica scale
+        scaled_density = raw_density * scale
         
-        # Soft weighted
-        weighted_density = apply_soft_weighting(raw_density, pi_probs, alpha=soft_weight_alpha)
-        
-        # Coverage
-        if pi_probs.shape[-2:] != raw_density.shape[-2:]:
-            pi_resized = F.interpolate(pi_probs, size=raw_density.shape[-2:], mode='bilinear', align_corners=False)
+        # Align π
+        if pi_probs.shape[-2:] != scaled_density.shape[-2:]:
+            pi_aligned = F.interpolate(pi_probs, size=scaled_density.shape[-2:], mode='bilinear', align_corners=False)
         else:
-            pi_resized = pi_probs
-        coverages.append((pi_resized > 0.5).float().mean().item() * 100)
+            pi_aligned = pi_probs
+        
+        # Soft weights
+        soft_weights = (1 - alpha) + alpha * pi_aligned
+        weighted_density = scaled_density * soft_weights
         
         for i, pts in enumerate(points_list):
             gt = len(pts)
             
-            # Raw
-            pred_raw = (raw_density[i].sum() / cell_area).item()
-            results_raw['mae'].append(abs(pred_raw - gt))
-            results_raw['mse'].append((pred_raw - gt) ** 2)
-            results_raw['pred'] += pred_raw
-            results_raw['gt'] += gt
+            # Raw (con scale applicato)
+            pred_raw = (scaled_density[i].sum() / cell_area).item()
+            results['raw']['mae'].append(abs(pred_raw - gt))
+            results['raw']['pred'] += pred_raw
+            results['raw']['gt'] += gt
             
-            # Soft weighted
-            pred_sw = (weighted_density[i].sum() / cell_area).item()
-            results_sw['mae'].append(abs(pred_sw - gt))
-            results_sw['mse'].append((pred_sw - gt) ** 2)
-            results_sw['pred'] += pred_sw
-            results_sw['gt'] += gt
+            # Weighted (con scale applicato)
+            pred_w = (weighted_density[i].sum() / cell_area).item()
+            results['weighted']['mae'].append(abs(pred_w - gt))
+            results['weighted']['pred'] += pred_w
+            results['weighted']['gt'] += gt
     
     return {
-        'raw': {
-            'mae': np.mean(results_raw['mae']),
-            'rmse': np.sqrt(np.mean(results_raw['mse'])),
-            'bias': results_raw['pred'] / results_raw['gt'] if results_raw['gt'] > 0 else 0,
-        },
-        'soft_weighted': {
-            'mae': np.mean(results_sw['mae']),
-            'rmse': np.sqrt(np.mean(results_sw['mse'])),
-            'bias': results_sw['pred'] / results_sw['gt'] if results_sw['gt'] > 0 else 0,
-        },
-        'coverage': np.mean(coverages),
+        'mae_raw': np.mean(results['raw']['mae']),
+        'mae_weighted': np.mean(results['weighted']['mae']),
+        'bias_raw': results['raw']['pred'] / results['raw']['gt'] if results['raw']['gt'] > 0 else 0,
+        'bias_weighted': results['weighted']['pred'] / results['weighted']['gt'] if results['weighted']['gt'] > 0 else 0,
+        'scale': scale,
+        'alpha': alpha,
     }
 
 
@@ -507,28 +428,29 @@ def validate(model, dataloader, device, default_down, soft_weight_alpha=0.2):
 # CHECKPOINT
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, results, best_mae, output_dir, is_best=False):
+def save_checkpoint(model, scale_comp, optimizer, scheduler, epoch, results, best_mae, output_dir, is_best=False):
     os.makedirs(output_dir, exist_ok=True)
     
     checkpoint = {
         'epoch': epoch,
         'model': model.state_dict(),
+        'scale_comp': scale_comp.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict() if scheduler else None,
         'results': results,
         'best_mae': best_mae,
     }
     
-    torch.save(checkpoint, os.path.join(output_dir, 'stage3_latest.pth'))
+    torch.save(checkpoint, os.path.join(output_dir, 'stage3_fusion_last.pth'))
     
     if is_best:
-        torch.save(checkpoint, os.path.join(output_dir, 'stage3_best.pth'))
-        print(f"💾 Best: MAE_raw={results['raw']['mae']:.2f}, MAE_sw={results['soft_weighted']['mae']:.2f}")
+        torch.save(checkpoint, os.path.join(output_dir, 'stage3_fusion_best.pth'))
+        print(f"💾 Best: MAE_w={results['mae_weighted']:.2f}, MAE_r={results['mae_raw']:.2f}, scale={results['scale']:.3f}")
 
 
 def load_stage2_checkpoint(model, output_dir, device):
     """Carica Stage 2."""
-    for name in ['stage2_bypass_best.pth', 'best_model.pth']:
+    for name in ['stage2_bypass_best.pth', 'stage2_best.pth', 'best_model.pth']:
         path = os.path.join(output_dir, name)
         if os.path.isfile(path):
             print(f"✅ Caricamento Stage 2: {path}")
@@ -547,9 +469,24 @@ def load_stage2_checkpoint(model, output_dir, device):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Train Stage 3 Joint')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                        help='Path al file di configurazione YAML')
+    parser = argparse.ArgumentParser(description='Stage 3 FUSION - Joint Training con Soft Weighting')
+    parser.add_argument('--config', type=str, default='config.yaml')
+    parser.add_argument('--alpha-start', type=float, default=0.0,
+                        help='α iniziale (default: 0.0 = raw density)')
+    parser.add_argument('--alpha-end', type=float, default=0.3,
+                        help='α finale (default: 0.3)')
+    parser.add_argument('--alpha-warmup', type=int, default=50,
+                        help='Epoche per warmup di α (default: 50)')
+    parser.add_argument('--epochs', type=int, default=300,
+                        help='Numero totale epoche (default: 300)')
+    parser.add_argument('--lr-p2r', type=float, default=1e-5,
+                        help='LR per P2R head (default: 1e-5)')
+    parser.add_argument('--lr-scale', type=float, default=1e-3,
+                        help='LR per scale compensation (default: 1e-3)')
+    parser.add_argument('--patience', type=int, default=80,
+                        help='Early stopping patience (default: 80)')
+    parser.add_argument('--spatial-weight', type=float, default=0.05,
+                        help='Peso spatial alignment loss (default: 0.05)')
     args = parser.parse_args()
     
     with open(args.config) as f:
@@ -558,10 +495,15 @@ def main():
     device = torch.device(config.get('DEVICE', 'cuda'))
     init_seeds(config.get('SEED', 42))
     
-    print("="*60)
-    print("🚀 Stage 3 V2 - JOINT TRAINING con Soft Weighting")
-    print("="*60)
+    print("="*70)
+    print("🚀 STAGE 3 FUSION - Joint Training con Soft Weighting")
+    print("="*70)
+    print(f"   α warmup: {args.alpha_start} → {args.alpha_end} in {args.alpha_warmup} epoche")
+    print(f"   LR P2R: {args.lr_p2r}, LR scale: {args.lr_scale}")
+    print(f"   Spatial weight: {args.spatial_weight}")
+    print("="*70)
     
+    # Dataset config
     dataset_section = config.get('DATASET', 'shha')
     data_section = config.get('DATA')
     if isinstance(dataset_section, dict):
@@ -577,66 +519,31 @@ def main():
     normalized = ''.join(ch for ch in str(dataset_name_raw).lower() if ch.isalnum())
     dataset_name = ALIAS_DATASETS.get(normalized, str(dataset_name_raw).lower())
 
-    if not data_cfg:
-        raise KeyError("DATA or DATASET configuration missing for Stage 3.")
     if 'ROOT' not in data_cfg:
-        raise KeyError("Dataset ROOT path missing in configuration.")
+        raise KeyError("Dataset ROOT path missing.")
     if 'NORM_MEAN' not in data_cfg:
         data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
     if 'NORM_STD' not in data_cfg:
         data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
 
-    optim_cfg = config.get('OPTIM_JOINT', {})
-    joint_cfg = config.get('JOINT_LOSS', {})
-    
-    alpha = float(joint_cfg.get('ALPHA', 0.7))
-    soft_weight_alpha = float(joint_cfg.get('SOFT_WEIGHT_ALPHA', 0.2))
-    epochs = optim_cfg.get('EPOCHS', 1000)
-    patience = optim_cfg.get('EARLY_STOPPING_PATIENCE', 200)
     default_down = data_cfg.get('P2R_DOWNSAMPLE', 8)
     block_size = data_cfg.get('ZIP_BLOCK_SIZE', 16)
-    
-    print(f"Device: {device}")
-    print(f"Loss α: {alpha} (ZIP weight: {1-alpha:.2f}, P2R weight: {alpha:.2f})")
-    print(f"Soft Weighting α: {soft_weight_alpha}")
-    print(f"   → {(1-soft_weight_alpha)*100:.0f}% raw + {soft_weight_alpha*100:.0f}% π-weighted")
-    print("="*60)
     
     # Dataset
     train_tf = build_transforms(data_cfg, is_train=True)
     val_tf = build_transforms(data_cfg, is_train=False)
     
     DatasetClass = get_dataset(dataset_name)
-    train_ds = DatasetClass(
-        root=data_cfg['ROOT'],
-        split=data_cfg.get('TRAIN_SPLIT', 'train'),
-        block_size=block_size,
-        transforms=train_tf
-    )
-    val_ds = DatasetClass(
-        root=data_cfg['ROOT'],
-        split=data_cfg.get('VAL_SPLIT', 'val'),
-        block_size=block_size,
-        transforms=val_tf
-    )
+    train_ds = DatasetClass(root=data_cfg['ROOT'], split=data_cfg.get('TRAIN_SPLIT', 'train'),
+                            block_size=block_size, transforms=train_tf)
+    val_ds = DatasetClass(root=data_cfg['ROOT'], split=data_cfg.get('VAL_SPLIT', 'val'),
+                          block_size=block_size, transforms=val_tf)
     
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=optim_cfg.get('BATCH_SIZE', 6),
-        shuffle=True,
-        num_workers=optim_cfg.get('NUM_WORKERS', 4),
-        drop_last=True,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=optim_cfg.get('VAL_NUM_WORKERS', optim_cfg.get('NUM_WORKERS', 4)),
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    batch_size = config.get('OPTIM_JOINT', {}).get('BATCH_SIZE', 8)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4,
+                              drop_last=True, collate_fn=collate_fn, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=4,
+                            collate_fn=collate_fn, pin_memory=True)
     
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     
@@ -647,7 +554,8 @@ def main():
     elif dataset_name in DEFAULT_BINS_CONFIG:
         bin_config = DEFAULT_BINS_CONFIG[dataset_name]
     else:
-        raise KeyError(f"BINS_CONFIG missing definition for dataset '{dataset_name}' and no default is available.")
+        raise KeyError(f"BINS_CONFIG missing for '{dataset_name}'")
+    
     zip_head_cfg = config.get('ZIP_HEAD', {})
     model_cfg = config.get('MODEL', {})
     
@@ -658,7 +566,6 @@ def main():
         upsample_to_input=model_cfg.get('UPSAMPLE_TO_INPUT', False),
         bins=bin_config['bins'],
         bin_centers=bin_config['bin_centers'],
-        use_ste_mask=model_cfg.get('USE_STE_MASK', False),
         zip_head_kwargs={
             'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
             'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
@@ -666,8 +573,11 @@ def main():
         },
     ).to(device)
     
+    # Scale compensation module
+    scale_comp = ScaleCompensation(init_scale=1.0, learnable=True).to(device)
+    
     # Output dir
-    run_name = config.get('RUN_NAME', 'shha_v11')
+    run_name = config.get('RUN_NAME', 'shha_v15')
     exp_cfg = config.get('EXP', {})
     output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), run_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -675,144 +585,143 @@ def main():
     # Carica Stage 2
     load_stage2_checkpoint(model, output_dir, device)
     
-    # Optimizer con LR differenziati
-    param_groups = []
+    # =========================================================================
+    # FREEZE STRATEGY
+    # =========================================================================
     
-    # Backbone (quasi frozen)
-    lr_backbone = float(optim_cfg.get('LR_BACKBONE', 5e-7))
-    if lr_backbone > 0:
-        param_groups.append({
-            'params': model.backbone.parameters(),
-            'lr': lr_backbone,
-        })
-        print(f"Backbone LR: {lr_backbone}")
-    else:
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-        print("Backbone: FROZEN")
+    # Backbone: FROZEN
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    print("❄️ Backbone: FROZEN")
     
-    # ZIP head
-    lr_zip = float(optim_cfg.get('LR_ZIP_HEAD', 2e-5))
-    param_groups.append({
-        'params': model.zip_head.parameters(),
-        'lr': lr_zip,
-    })
-    print(f"ZIP head LR: {lr_zip}")
+    # ZIP head: quasi frozen (LR molto basso opzionale)
+    for param in model.zip_head.parameters():
+        param.requires_grad = False  # Completamente frozen per ora
+    print("❄️ ZIP head: FROZEN")
     
-    # P2R head
-    lr_p2r = float(optim_cfg.get('LR_P2R_HEAD', 3e-5))
-    p2r_params = [p for n, p in model.named_parameters() if 'p2r_head' in n]
-    param_groups.append({
-        'params': p2r_params,
-        'lr': lr_p2r,
-    })
-    print(f"P2R head LR: {lr_p2r}")
+    # P2R head: trainabile
+    p2r_params = list(model.p2r_head.parameters())
+    print(f"🔥 P2R head: {sum(p.numel() for p in p2r_params):,} parametri")
     
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        weight_decay=float(optim_cfg.get('WEIGHT_DECAY', 1e-4))
-    )
+    # Scale compensation: trainabile
+    print(f"🔥 Scale comp: {sum(p.numel() for p in scale_comp.parameters()):,} parametri")
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW([
+        {'params': p2r_params, 'lr': args.lr_p2r},
+        {'params': scale_comp.parameters(), 'lr': args.lr_scale},
+    ], weight_decay=1e-4)
     
     # Scheduler
-    warmup_epochs = optim_cfg.get('WARMUP_EPOCHS', 20)
+    epochs = args.epochs
     
     def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
+        warmup = 10
+        if epoch < warmup:
+            return (epoch + 1) / warmup
         else:
-            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+            progress = (epoch - warmup) / max(1, epochs - warmup)
+            return 0.5 * (1 + math.cos(math.pi * progress))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
+    # Alpha scheduler
+    alpha_scheduler = AlphaScheduler(
+        alpha_start=args.alpha_start,
+        alpha_end=args.alpha_end,
+        warmup_epochs=args.alpha_warmup,
+        schedule='cosine'
+    )
+    
     # Loss
-    criterion = JointLossV2(
-        alpha=alpha,
-        soft_weight_alpha=soft_weight_alpha,
-        pi_pos_weight=float(joint_cfg.get('PI_POS_WEIGHT', 3.0)),
-        block_size=block_size,
-        count_weight=float(joint_cfg.get('COUNT_WEIGHT', 2.5)),
-        spatial_weight=float(joint_cfg.get('SPATIAL_WEIGHT', 0.1)),
-        consistency_weight=float(joint_cfg.get('CONSISTENCY_WEIGHT', 0.1)),
-    ).to(device)
+    criterion = FusionLoss(
+        count_weight=1.0,
+        spatial_weight=args.spatial_weight,
+        scale_reg_weight=0.01,
+    )
     
-    # Resume
-    start_epoch = 1
-    best_mae = float('inf')
+    # =========================================================================
+    # VALIDAZIONE INIZIALE
+    # =========================================================================
+    
+    print("\n📋 Validazione iniziale (α=0, raw density):")
+    val_results = validate(model, scale_comp, val_loader, device, default_down, alpha=0.0)
+    initial_mae = val_results['mae_raw']
+    print(f"   MAE raw: {initial_mae:.2f}")
+    print(f"   Bias: {val_results['bias_raw']:.3f}")
+    
+    # =========================================================================
+    # TRAINING
+    # =========================================================================
+    
+    print(f"\n🚀 Training: 1 → {epochs}")
+    print(f"   α warmup: 0 → {args.alpha_end} in {args.alpha_warmup} epoche")
+    
+    best_mae = initial_mae
     no_improve = 0
+    val_interval = 5
     
-    resume_path = os.path.join(output_dir, 'stage3_latest.pth')
-    if os.path.isfile(resume_path):
-        print(f"\n🔄 Resuming from {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        if ckpt.get('scheduler'):
-            scheduler.load_state_dict(ckpt['scheduler'])
-        start_epoch = ckpt['epoch'] + 1
-        best_mae = ckpt.get('best_mae', float('inf'))
-        print(f"   Epoch {ckpt['epoch']}, Best MAE: {best_mae:.2f}")
-    
-    # Validazione iniziale
-    print("\n📋 Validazione iniziale:")
-    val_results = validate(model, val_loader, device, default_down, soft_weight_alpha)
-    print(f"   RAW:  MAE={val_results['raw']['mae']:.2f}, Bias={val_results['raw']['bias']:.3f}")
-    print(f"   SW:   MAE={val_results['soft_weighted']['mae']:.2f}, Bias={val_results['soft_weighted']['bias']:.3f}")
-    print(f"   Coverage: {val_results['coverage']:.1f}%")
-    
-    # Training
-    print(f"\n🚀 Training: {start_epoch} → {epochs}")
-    val_interval = optim_cfg.get('VAL_INTERVAL', 5)
-    
-    for epoch in range(start_epoch, epochs + 1):
+    for epoch in range(1, epochs + 1):
         # Train
-        train_loss, train_metrics = train_one_epoch(
-            model, criterion, train_loader, optimizer, scheduler,
-            device, default_down, epoch, optim_cfg
+        train_metrics = train_one_epoch(
+            model, scale_comp, criterion, train_loader, optimizer,
+            device, default_down, epoch, alpha_scheduler
         )
+        
+        scheduler.step()
         
         # Validate
         if epoch % val_interval == 0:
-            val_results = validate(model, val_loader, device, default_down, soft_weight_alpha)
+            current_alpha = alpha_scheduler.get_alpha()
+            val_results = validate(model, scale_comp, val_loader, device, default_down, alpha=current_alpha)
             
-            # Usa MAE soft-weighted come metrica principale
-            mae_raw = val_results['raw']['mae']
-            mae_sw = val_results['soft_weighted']['mae']
+            # Usa MAE weighted come metrica quando α > 0.1, altrimenti raw
+            if current_alpha > 0.1:
+                mae_metric = val_results['mae_weighted']
+                metric_name = "weighted"
+            else:
+                mae_metric = val_results['mae_raw']
+                metric_name = "raw"
             
-            improved = mae_sw < best_mae
+            improved = mae_metric < best_mae
             
             print(f"\nEpoch {epoch}:")
-            print(f"   RAW:  MAE={mae_raw:.2f}, Bias={val_results['raw']['bias']:.3f}")
-            print(f"   SW:   MAE={mae_sw:.2f}, Bias={val_results['soft_weighted']['bias']:.3f}")
-            print(f"   Coverage: {val_results['coverage']:.1f}%")
-            print(f"   Best SW: {best_mae:.2f} {'✅ NEW!' if improved else ''}")
+            print(f"   α = {current_alpha:.3f}, scale = {val_results['scale']:.3f}")
+            print(f"   MAE raw: {val_results['mae_raw']:.2f}, MAE weighted: {val_results['mae_weighted']:.2f}")
+            print(f"   Bias raw: {val_results['bias_raw']:.3f}, Bias weighted: {val_results['bias_weighted']:.3f}")
+            print(f"   Best ({metric_name}): {best_mae:.2f} {'✅ NEW!' if improved else ''}")
             
             if improved:
-                best_mae = mae_sw
+                best_mae = mae_metric
                 no_improve = 0
-                save_checkpoint(model, optimizer, scheduler, epoch, val_results, best_mae, output_dir, is_best=True)
+                save_checkpoint(model, scale_comp, optimizer, scheduler, epoch, val_results, best_mae, output_dir, is_best=True)
             else:
                 no_improve += val_interval
-                save_checkpoint(model, optimizer, scheduler, epoch, val_results, best_mae, output_dir, is_best=False)
+                save_checkpoint(model, scale_comp, optimizer, scheduler, epoch, val_results, best_mae, output_dir, is_best=False)
             
-            # Early stopping
-            if no_improve >= patience:
+            if no_improve >= args.patience:
                 print(f"\n⛔ Early stopping @ epoch {epoch}")
                 break
     
-    # Risultati finali
-    print("\n" + "="*60)
-    print("🏁 STAGE 3 V2 COMPLETATO")
-    print("="*60)
-    print(f"   Best MAE (SW): {best_mae:.2f}")
-    print(f"   Checkpoint: {output_dir}/stage3_best.pth")
+    # =========================================================================
+    # RISULTATI FINALI
+    # =========================================================================
     
-    if best_mae < 70:
-        print("   🎯 TARGET RAGGIUNTO! MAE < 70")
-    elif best_mae < 75:
-        print("   ✅ Buon risultato, vicino al target")
+    print("\n" + "="*70)
+    print("🏁 STAGE 3 FUSION COMPLETATO")
+    print("="*70)
+    print(f"   MAE iniziale (raw): {initial_mae:.2f}")
+    print(f"   MAE finale:         {best_mae:.2f}")
+    print(f"   α finale:           {alpha_scheduler.get_alpha():.3f}")
+    print(f"   Scale finale:       {scale_comp.get_scale():.3f}")
+    print(f"   Miglioramento:      {initial_mae - best_mae:+.2f}")
     
-    print("="*60)
+    if best_mae < initial_mae:
+        print(f"\n   ✅ FUSION RIUSCITA!")
+    else:
+        print(f"\n   ⚠️ Nessun miglioramento con fusion")
+    
+    print("="*70)
 
 
 if __name__ == '__main__':

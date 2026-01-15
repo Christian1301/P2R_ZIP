@@ -532,7 +532,7 @@ def load_stage2_checkpoint(model, output_dir, device):
         path = os.path.join(output_dir, name)
         if os.path.isfile(path):
             print(f"✅ Caricamento Stage 2: {path}")
-            state = torch.load(path, map_location=device)
+            state = torch.load(path, map_location=device, weights_only=False)
             if 'model' in state:
                 state = state['model']
             model.load_state_dict(state, strict=False)
@@ -738,7 +738,7 @@ def main():
     resume_path = os.path.join(output_dir, 'stage3_latest.pth')
     if os.path.isfile(resume_path):
         print(f"\n🔄 Resuming from {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if ckpt.get('scheduler'):

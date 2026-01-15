@@ -312,7 +312,7 @@ class P2R_ZIP_Model(nn.Module):
         Returns:
             dict con info sul caricamento
         """
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Estrai state dict
         if 'model' in checkpoint:

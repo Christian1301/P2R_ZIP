@@ -952,7 +952,7 @@ def main():
     resume_path = os.path.join(output_dir, 'stage2_bypass_last.pth')
     if os.path.isfile(resume_path):
         print(f"\n🔄 Resume: {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if ckpt.get('scheduler'):

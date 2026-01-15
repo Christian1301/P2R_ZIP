@@ -554,7 +554,7 @@ def main():
     resume_path = os.path.join(output_dir, 'last.pth')
     if os.path.exists(resume_path):
         print(f"\n🔄 Resume: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         if checkpoint.get('scheduler'):
@@ -609,7 +609,7 @@ def main():
     
     best_path = os.path.join(output_dir, 'best_model.pth')
     if os.path.exists(best_path):
-        best_state = torch.load(best_path)
+        best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state['model'])
     
     thresh_results = find_optimal_threshold(

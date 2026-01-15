@@ -1,284 +1,315 @@
-# models/p2r_zip_model.py
-# VERSIONE V5 - Fix Train/Eval Consistency
-#
-# MODIFICHE V5:
-# - FIX CRITICO: Comportamento CONSISTENTE tra train e eval
-# - Quando use_ste_mask=False: SEMPRE soft mask (sia train che eval)
-# - Quando use_ste_mask=True: STE in train, hard mask in eval
-# - Output masking applicato SOLO con use_ste_mask=True in eval
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+P2R-ZIP Model V2 - Con P2R Head Binario
+
+Questa versione usa il P2R head binario come nel paper originale:
+- Output: logits binari (persona sì/no per cella)
+- Conteggio: (logits > 0).sum()
+- Loss: BCE con matching point-to-region
+
+Il modello mantiene la struttura ZIP per Stage 1, ma Stage 2/3 usano
+l'output binario per il counting.
+"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional
+from torchvision import models
 
-from .backbone import BackboneWrapper
-from .zip_head import ZIPHead
-from .p2r_head import P2RHead
+# Import heads
+from models.p2r_head_binary import P2RHeadBinary
 
 
-class STEMask(torch.autograd.Function):
+class VGG16BNBackbone(nn.Module):
     """
-    Straight-Through Estimator per il masking.
-    Forward: hard threshold (0 o 1)
-    Backward: gradiente passa inalterato
+    Backbone VGG16-BN con estrazione features multi-scala.
     """
-    @staticmethod
-    def forward(ctx, soft_mask, threshold):
-        hard_mask = (soft_mask > threshold).float()
-        ctx.save_for_backward(soft_mask)
-        return hard_mask
     
-    @staticmethod
-    def backward(ctx, grad_output):
-        # STE puro: gradiente passa inalterato
-        return grad_output, None
+    def __init__(self, pretrained=True):
+        super().__init__()
+        
+        vgg = models.vgg16_bn(pretrained=pretrained)
+        features = list(vgg.features.children())
+        
+        # Split in stage (come nel paper P2R)
+        # Stage indices per VGG16-BN: 0-32 (conv1-4), 33-42 (conv5)
+        self.stage1 = nn.Sequential(*features[:33])  # Fino a pool4
+        self.stage2 = nn.Sequential(*features[33:43])  # Conv5
+        
+        self.out_channels = [512, 512]  # Canali output di ogni stage
+    
+    def forward(self, x):
+        """
+        Returns:
+            features_list: lista di tensori multi-scala
+        """
+        f1 = self.stage1(x)
+        f2 = self.stage2(f1)
+        return [f1, f2]
 
 
-def ste_mask(soft_mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-    """Applica STE mask."""
-    return STEMask.apply(soft_mask, threshold)
-
-
-class P2R_ZIP_Model(nn.Module):
+class FusionLayer(nn.Module):
     """
-    Modello P2R-ZIP con comportamento CONSISTENTE train/eval.
+    Layer di fusione multi-scala (come UpSample_P2P nel paper).
+    """
     
-    Modalità di masking:
-    - use_ste_mask=True:  Hard mask via STE (train) / Hard threshold (eval)
-    - use_ste_mask=False: Soft mask (probabilità) sia in train che eval
+    def __init__(self, in_channels_list, out_channels, use_bn=False):
+        super().__init__()
+        
+        self.align_layers = nn.ModuleList([
+            nn.Conv2d(in_ch, out_channels, kernel_size=1, bias=not use_bn)
+            for in_ch in in_channels_list
+        ])
+        
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=not use_bn),
+            nn.BatchNorm2d(out_channels) if use_bn else nn.Identity(),
+            # Paper non usa ReLU dopo fusion
+        )
+        
+        # Init
+        for layer in self.align_layers:
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0.)
     
-    Questo garantisce che il modello veda lo STESSO comportamento
-    durante training e validation, eliminando il mismatch.
+    def forward(self, features_list):
+        target_size = features_list[0].shape[-2:]
+        
+        aligned = []
+        for feat, align in zip(features_list, self.align_layers):
+            x = align(feat)
+            if x.shape[-2:] != target_size:
+                x = F.interpolate(x, target_size, mode='bilinear', align_corners=False)
+            aligned.append(x)
+        
+        fused = sum(aligned)
+        return self.fuse(fused)
+
+
+class ZIPHead(nn.Module):
+    """
+    ZIP Head per Stage 1 (invariato).
     """
     
     def __init__(
         self,
-        bins: List[Tuple[float, float]],
-        bin_centers: List[float],
-        backbone_name: str = "vgg16_bn",
-        pi_thresh: float = 0.5,
-        gate: str = "multiply",
-        upsample_to_input: bool = False,
-        debug: bool = False,
-        use_ste_mask: bool = True,
-        mask_residual: float = 0.0,
-        zip_head_kwargs: Optional[dict] = None,
-        p2r_head_kwargs: Optional[dict] = None,
+        in_channels=256,
+        hidden_channels=128,
+        num_classes=2,
+        lambda_scale=1.2,
+        lambda_max=8.0,
+        use_softplus=True,
+        lambda_noise_std=0.0
     ):
         super().__init__()
         
-        self.bins = bins
-        self.register_buffer(
-            "bin_centers",
-            torch.tensor(bin_centers, dtype=torch.float32).view(1, -1, 1, 1)
+        self.lambda_scale = lambda_scale
+        self.lambda_max = lambda_max
+        self.use_softplus = use_softplus
+        self.lambda_noise_std = lambda_noise_std
+        
+        # Pi head (classificazione occupato/vuoto)
+        self.pi_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, num_classes, 1)
         )
+        
+        # Lambda head (conteggio atteso)
+        self.lambda_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, 1)
+        )
+    
+    def forward(self, features):
+        logit_pi = self.pi_head(features)
+        
+        raw_lambda = self.lambda_head(features)
+        
+        if self.use_softplus:
+            lam = F.softplus(raw_lambda) * self.lambda_scale
+        else:
+            lam = torch.exp(raw_lambda.clamp(max=3.0)) * self.lambda_scale
+        
+        lam = lam.clamp(max=self.lambda_max)
+        
+        if self.training and self.lambda_noise_std > 0:
+            noise = torch.randn_like(lam) * self.lambda_noise_std
+            lam = (lam + noise).clamp(min=0.01)
+        
+        return {
+            'logit_pi': logit_pi,
+            'lambda': lam
+        }
 
+
+class P2R_ZIP_Model_V2(nn.Module):
+    """
+    Modello P2R-ZIP V2 con P2R head binario.
+    
+    Architettura:
+    - Backbone: VGG16-BN
+    - Fusion: Multi-scale feature fusion
+    - ZIP Head: Per Stage 1 (classificazione blocchi)
+    - P2R Head: Output binario per Stage 2/3
+    
+    Args:
+        backbone_name: nome backbone (solo 'vgg16_bn' supportato)
+        fusion_channels: canali dopo fusion (default 256)
+        pi_thresh: soglia per maschera ZIP (default 0.3)
+        use_ste_mask: usa Straight-Through Estimator per maschera
+        zip_head_kwargs: kwargs per ZIP head
+    """
+    
+    def __init__(
+        self,
+        backbone_name='vgg16_bn',
+        fusion_channels=256,
+        pi_thresh=0.3,
+        use_ste_mask=True,
+        zip_head_kwargs=None
+    ):
+        super().__init__()
+        
+        self.pi_thresh = pi_thresh
+        self.use_ste_mask = use_ste_mask
+        
         # Backbone
-        self.backbone = BackboneWrapper(backbone_name)
+        self.backbone = VGG16BNBackbone(pretrained=True)
+        
+        # Fusion
+        self.fusion = FusionLayer(
+            in_channels_list=self.backbone.out_channels,
+            out_channels=fusion_channels,
+            use_bn=False
+        )
         
         # ZIP Head
-        zip_head_kwargs = zip_head_kwargs or {}
+        zip_kwargs = zip_head_kwargs or {}
         self.zip_head = ZIPHead(
-            self.backbone.out_channels, 
-            bins=self.bins, 
-            **zip_head_kwargs
+            in_channels=fusion_channels,
+            **zip_kwargs
         )
         
-        # P2R Head
-        p2r_head_kwargs = p2r_head_kwargs or {}
-        if "in_channel" not in p2r_head_kwargs:
-            p2r_head_kwargs["in_channel"] = 512
-        if "fea_channel" not in p2r_head_kwargs:
-            p2r_head_kwargs["fea_channel"] = 64
-        if "up_scale" not in p2r_head_kwargs:
-            p2r_head_kwargs["up_scale"] = 2
-        self.p2r_head = P2RHead(**p2r_head_kwargs)
-
-        # Configurazione
-        self.pi_thresh = pi_thresh
-        self.gate = gate
-        self.upsample_to_input = upsample_to_input
-        self.debug = debug
-        self.use_ste_mask = use_ste_mask
-        self.mask_residual = mask_residual
-
-    def _compute_mask(self, pi_not_zero: torch.Tensor) -> torch.Tensor:
+        # P2R Head BINARIO
+        self.p2r_head = P2RHeadBinary(
+            in_channels=fusion_channels,
+            hidden_channels=64,
+            upscale_factor=2,
+            use_bn=False
+        )
+        
+        # Downsampling factor totale
+        # VGG16: /32, fusion mantiene, P2R upscale x2 → /16
+        self.down_factor = 16
+    
+    def forward(self, x, return_all=True):
         """
-        Calcola la maschera ZIP con comportamento CONSISTENTE train/eval.
+        Forward pass.
         
         Args:
-            pi_not_zero: Probabilità che il blocco contenga persone [B, 1, H, W]
-        
-        Returns:
-            mask: Maschera da applicare alle feature
+            x: [B, 3, H, W] input images
+            return_all: se True, restituisce tutti gli output
             
-        Comportamento:
-            - use_ste_mask=True:  Hard mask (STE in train, threshold in eval)
-            - use_ste_mask=False: Soft mask (probabilità) SEMPRE
-        """
-        if self.use_ste_mask:
-            # Modalità HARD: usa threshold
-            if self.training:
-                # In training: STE per permettere backprop
-                mask = ste_mask(pi_not_zero, self.pi_thresh)
-            else:
-                # In eval: semplice threshold
-                mask = (pi_not_zero > self.pi_thresh).float()
-        else:
-            # Modalità SOFT: usa probabilità direttamente
-            # SEMPRE, sia in train che eval - questo garantisce consistenza
-            mask = pi_not_zero
-        
-        # Opzionale: aggiungi residual per non azzerare completamente
-        if self.mask_residual > 0:
-            mask = mask + self.mask_residual * (1 - mask)
-        
-        return mask
-
-    def _resize_mask(self, mask: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
-        """Ridimensiona la maschera alla dimensione target."""
-        if mask.shape[-2:] != target_size:
-            return F.interpolate(mask, size=target_size, mode="nearest")
-        return mask
-
-    def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> dict:
-        """
-        Forward pass del modello P2R-ZIP.
-        
-        Args:
-            x: Input tensor [B, 3, H, W]
-            return_intermediates: Se True, include output raw per debug
-        
         Returns:
             dict con:
-                - p2r_density: Mappa di densità finale
-                - mask: Maschera applicata
-                - pi_probs: Probabilità ZIP
-                - logit_pi_maps, lambda_maps: Output ZIP head
-                - (opzionale) p2r_density_raw: Densità senza masking
+                - 'p2r_logits': [B, 1, H/16, W/16] logits binari
+                - 'logit_pi_maps': [B, 2, H/32, W/32] logits ZIP pi
+                - 'lambda_maps': [B, 1, H/32, W/32] lambda ZIP
+                - 'zip_mask': [B, 1, H/16, W/16] maschera soft/hard
         """
-        B, C, H, W = x.shape
+        # Backbone
+        features_list = self.backbone(x)
         
-        # =====================================================================
-        # 1. BACKBONE - Estrazione feature
-        # =====================================================================
-        feat = self.backbone(x)
+        # Fusion
+        fused = self.fusion(features_list)
         
-        # =====================================================================
-        # 2. ZIP HEAD - Classificazione blocchi
-        # =====================================================================
-        zip_outputs = self.zip_head(feat, self.bin_centers)
-        logit_pi_maps = zip_outputs["logit_pi_maps"]
-        lambda_maps = zip_outputs["lambda_maps"]
+        # ZIP head
+        zip_out = self.zip_head(fused)
+        logit_pi = zip_out['logit_pi']
+        lam = zip_out['lambda']
         
-        # Probabilità che il blocco contenga persone (canale 1)
-        pi_softmax = logit_pi_maps.softmax(dim=1)
-        pi_not_zero = pi_softmax[:, 1:]  # [B, 1, Hb, Wb]
+        # P2R head (binario)
+        p2r_out = self.p2r_head(fused)
+        p2r_logits = p2r_out['logits']
         
-        # =====================================================================
-        # 3. MASCHERA - Comportamento consistente train/eval
-        # =====================================================================
-        mask = self._compute_mask(pi_not_zero)
+        # Calcola maschera ZIP
+        pi_prob = torch.softmax(logit_pi, dim=1)[:, 1:2]  # Prob "occupato"
         
-        # Ridimensiona maschera per feature gating
-        mask_feat = self._resize_mask(mask, feat.shape[-2:])
-        
-        # =====================================================================
-        # 4. FEATURE GATING - Applica maschera alle feature
-        # =====================================================================
-        if self.gate == "multiply":
-            gated = feat * mask_feat
-        elif self.gate == "concat":
-            gated = torch.cat([feat, mask_feat.expand(-1, feat.shape[1], -1, -1)], dim=1)
+        if self.use_ste_mask:
+            # Hard mask con STE
+            hard_mask = (pi_prob > self.pi_thresh).float()
+            zip_mask = hard_mask - pi_prob.detach() + pi_prob
         else:
-            raise ValueError(f"Gate type '{self.gate}' non supportato. Usa 'multiply' o 'concat'.")
+            # Soft mask
+            zip_mask = pi_prob
         
-        # =====================================================================
-        # 5. P2R HEAD - Regressione densità
-        # =====================================================================
-        dens = self.p2r_head(gated)
-        
-        # =====================================================================
-        # 6. CALCOLO RAW (opzionale, per debug/visualizzazione)
-        # =====================================================================
-        dens_raw = None
-        if return_intermediates or self.debug:
-            with torch.no_grad():
-                dens_raw = self.p2r_head(feat)
-                if self.upsample_to_input:
-                    dens_raw = F.interpolate(
-                        dens_raw, size=(H, W), 
-                        mode="bilinear", align_corners=False
-                    )
-
-        # =====================================================================
-        # 7. UPSAMPLE (opzionale)
-        # =====================================================================
-        if self.upsample_to_input:
-            dens = F.interpolate(
-                dens, size=(H, W), 
-                mode="bilinear", align_corners=False
+        # Upsample mask per matchare P2R output
+        if zip_mask.shape[-2:] != p2r_logits.shape[-2:]:
+            zip_mask = F.interpolate(
+                zip_mask, 
+                size=p2r_logits.shape[-2:], 
+                mode='nearest'
             )
         
-        # =====================================================================
-        # 8. OUTPUT MASKING
-        # =====================================================================
-        # Applica output masking SOLO con use_ste_mask=True in eval
-        # Questo mantiene consistenza: 
-        #   - soft mask mode: NO output masking (feature gating basta)
-        #   - hard mask mode: output masking in eval per "pulizia"
-        
-        if self.use_ste_mask and not self.training:
-            mask_output = self._resize_mask(mask, dens.shape[-2:])
-            dens = dens * mask_output
-
-        # =====================================================================
-        # 9. OUTPUT
-        # =====================================================================
-        # Densità ZIP (per riferimento/confronto)
-        pred_density_zip = pi_not_zero * lambda_maps
-        
         outputs = {
-            # Output principali
-            "p2r_density": dens,
-            "mask": mask,
-            "pi_probs": pi_not_zero,
-            
-            # ZIP head outputs
-            "logit_pi_maps": logit_pi_maps,
-            "logit_bin_maps": zip_outputs["logit_bin_maps"],
-            "lambda_maps": lambda_maps,
-            "pred_density_zip": pred_density_zip,
+            'p2r_logits': p2r_logits,
+            'logit_pi_maps': logit_pi,
+            'lambda_maps': lam,
+            'zip_mask': zip_mask,
         }
         
-        # Aggiungi raw se richiesto
-        if dens_raw is not None:
-            outputs["p2r_density_raw"] = dens_raw
+        # Output mascherato opzionale
+        outputs['p2r_logits_masked'] = p2r_logits * zip_mask
         
         return outputs
     
-    def get_count_from_density(self, density: torch.Tensor, cell_area: float = 1.0) -> torch.Tensor:
+    def count(self, x, use_mask=False, threshold=0.0):
         """
-        Calcola il conteggio dalla mappa di densità.
+        Conta persone in un'immagine.
         
         Args:
-            density: Mappa di densità [B, 1, H, W]
-            cell_area: Area di ogni cella per normalizzazione
-        
+            x: [B, 3, H, W] input
+            use_mask: applica maschera ZIP
+            threshold: soglia per logits (default 0 = prob > 0.5)
+            
         Returns:
-            count: Conteggio per ogni immagine nel batch [B]
+            counts: [B] tensor con conteggi
         """
-        return torch.sum(density, dim=(1, 2, 3)) / cell_area
-    
-    def get_trainable_params_info(self) -> dict:
-        """Ritorna informazioni sui parametri trainabili."""
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        outputs = self.forward(x)
         
-        return {
-            "total": total,
-            "trainable": trainable,
-            "frozen": total - trainable,
-            "percent_trainable": 100 * trainable / total if total > 0 else 0
+        if use_mask:
+            logits = outputs['p2r_logits_masked']
+        else:
+            logits = outputs['p2r_logits']
+        
+        counts = (logits > threshold).float().sum(dim=(1, 2, 3))
+        return counts
+
+
+# =============================================================================
+# Factory function
+# =============================================================================
+
+def create_p2r_zip_model_v2(config):
+    """
+    Crea modello P2R-ZIP V2 da config.
+    """
+    model_cfg = config.get('MODEL', {})
+    zip_head_cfg = config.get('ZIP_HEAD', {})
+    
+    return P2R_ZIP_Model_V2(
+        backbone_name=model_cfg.get('BACKBONE', 'vgg16_bn'),
+        fusion_channels=256,
+        pi_thresh=model_cfg.get('ZIP_PI_THRESH', 0.3),
+        use_ste_mask=model_cfg.get('USE_STE_MASK', True),
+        zip_head_kwargs={
+            'lambda_scale': zip_head_cfg.get('LAMBDA_SCALE', 1.2),
+            'lambda_max': zip_head_cfg.get('LAMBDA_MAX', 8.0),
+            'use_softplus': zip_head_cfg.get('USE_SOFTPLUS', True),
+            'lambda_noise_std': zip_head_cfg.get('LAMBDA_NOISE_STD', 0.0),
         }
+    )
+P2R_ZIP_Model = P2R_ZIP_Model_V2

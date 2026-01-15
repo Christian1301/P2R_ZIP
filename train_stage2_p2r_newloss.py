@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 2 V3 - Training P2R con Loss ORIGINALE dal paper
+Stage 2 V4 - Training P2R con Output BINARIO (come paper originale)
 
-DIFFERENZE CHIAVE dalla versione precedente:
-1. Usa P2RLoss originale con matching point-to-region
-2. Conteggio basato su pixel > 0 (non integrazione density)
-3. Iperparametri allineati al paper originale
-4. Vincoli spaziali che prevengono overfitting
+Questo script usa:
+1. P2R head con output binario (2 canali → differenza)
+2. P2RLoss originale con matching point-to-region
+3. Conteggio basato su (logits > 0).count()
 
-La P2RLoss originale funziona così:
-- Per ogni punto GT, trova la cella più vicina
-- Assegna target binario (1 = persona presente)
-- Calcola BCE con weight dinamici
-- Il modello deve predire DOVE sono le persone, non solo QUANTE
+È l'implementazione fedele al paper P2R.
 """
 
 import os
@@ -26,13 +21,10 @@ import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Import del modello e dataset
-from models.p2r_zip_model import P2R_ZIP_Model
+from models.p2r_zip_model_v2 import P2R_ZIP_Model_V2
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
-
-# Import P2RLoss originale
 from losses.p2rloss_original import P2RLossOriginal
 
 
@@ -41,7 +33,6 @@ from losses.p2rloss_original import P2RLossOriginal
 # =============================================================================
 
 class AverageMeter:
-    """Calcola e memorizza media e valore corrente."""
     def __init__(self):
         self.reset()
     
@@ -59,51 +50,23 @@ class AverageMeter:
 
 
 def save_checkpoint(state, filepath, description="checkpoint"):
-    """Salva checkpoint con verifica."""
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         torch.save(state, filepath)
         if os.path.exists(filepath):
             size = os.path.getsize(filepath)
-            print(f"💾 {description} salvato: {filepath} ({size/1024/1024:.1f} MB)")
+            print(f"💾 {description}: {filepath} ({size/1024/1024:.1f} MB)")
             sys.stdout.flush()
             return True
-        else:
-            print(f"❌ ERRORE: {description} non trovato dopo salvataggio!")
-            return False
+        return False
     except Exception as e:
-        print(f"❌ ERRORE salvataggio {description}: {e}")
+        print(f"❌ Errore salvataggio: {e}")
         return False
 
 
 def get_lr(optimizer):
-    """Ottieni LR corrente."""
-    for param_group in optimizer.param_groups:
-        return param_group['lr']
-
-
-def convert_points_format(points, source_format='xy', target_format='yx'):
-    """
-    Converte il formato delle coordinate dei punti.
-    
-    Args:
-        points: tensor [N, 2+] o [N, 3+]
-        source_format: 'xy' o 'yx'
-        target_format: 'xy' o 'yx'
-    
-    Returns:
-        points convertiti
-    """
-    if source_format == target_format:
-        return points
-    
-    if points.numel() == 0:
-        return points
-    
-    points_out = points.clone()
-    # Scambia colonne 0 e 1
-    points_out[:, 0], points_out[:, 1] = points[:, 1].clone(), points[:, 0].clone()
-    return points_out
+    for pg in optimizer.param_groups:
+        return pg['lr']
 
 
 # =============================================================================
@@ -111,73 +74,45 @@ def convert_points_format(points, source_format='xy', target_format='yx'):
 # =============================================================================
 
 @torch.no_grad()
-def validate(model, val_loader, device, down_rate):
+def validate(model, val_loader, device):
     """
-    Validazione con conteggio basato su pixel > 0 (come paper originale).
+    Validazione con conteggio binario (logits > 0).
     """
     model.eval()
     
     all_mae = []
     all_mse = []
+    total_pred = 0
+    total_gt = 0
     
     for images, gt_density, points in tqdm(val_loader, desc="Validate", leave=False):
         images = images.to(device)
         
         outputs = model(images)
-        pred_density = outputs['p2r_density']  # [B, 1, H, W]
+        logits = outputs['p2r_logits']  # [B, 1, H, W]
         
         for i, pts in enumerate(points):
             gt_count = len(pts)
-            
-            # Conteggio P2R originale: conta pixel con valore > 0 (dopo sigmoid)
-            # Il modello outputta logits, quindi applichiamo sigmoid
-            pred_prob = torch.sigmoid(pred_density[i])
-            pred_count = (pred_prob > 0.5).sum().item()
-            
-            # Alternativa: conta pixel con logit > 0 (equivalente a prob > 0.5)
-            # pred_count = (pred_density[i] > 0).sum().item()
+            # Conteggio P2R: celle con logit > 0
+            pred_count = (logits[i] > 0).sum().item()
             
             all_mae.append(abs(pred_count - gt_count))
             all_mse.append((pred_count - gt_count) ** 2)
+            
+            total_pred += pred_count
+            total_gt += gt_count
     
     mae = np.mean(all_mae)
     rmse = np.sqrt(np.mean(all_mse))
+    ratio = total_pred / max(total_gt, 1)
     
-    return {'mae': mae, 'rmse': rmse}
-
-
-@torch.no_grad()
-def validate_integration(model, val_loader, device, down_rate):
-    """
-    Validazione alternativa con integrazione density (per confronto).
-    """
-    model.eval()
-    
-    all_mae = []
-    all_mse = []
-    
-    cell_area = down_rate * down_rate
-    
-    for images, gt_density, points in tqdm(val_loader, desc="Validate (int)", leave=False):
-        images = images.to(device)
-        
-        outputs = model(images)
-        pred_density = outputs['p2r_density']
-        
-        for i, pts in enumerate(points):
-            gt_count = len(pts)
-            
-            # Integrazione density
-            pred_prob = torch.sigmoid(pred_density[i])
-            pred_count = pred_prob.sum().item() / cell_area
-            
-            all_mae.append(abs(pred_count - gt_count))
-            all_mse.append((pred_count - gt_count) ** 2)
-    
-    mae = np.mean(all_mae)
-    rmse = np.sqrt(np.mean(all_mse))
-    
-    return {'mae': mae, 'rmse': rmse}
+    return {
+        'mae': mae, 
+        'rmse': rmse,
+        'ratio': ratio,
+        'total_pred': total_pred,
+        'total_gt': total_gt
+    }
 
 
 # =============================================================================
@@ -191,38 +126,45 @@ def train_one_epoch(
     loader, 
     device, 
     epoch,
-    down_rate,
-    grad_clip=5.0,
-    points_format='yx'  # Formato punti nel tuo dataset
+    grad_clip=5.0
 ):
-    """
-    Training di una epoca con P2RLoss originale.
-    """
+    """Training con P2RLoss originale."""
     model.train()
     
     loss_meter = AverageMeter()
     mae_meter = AverageMeter()
     
-    pbar = tqdm(loader, desc=f"Stage2 P2R [Ep {epoch}]")
+    pbar = tqdm(loader, desc=f"Stage2 [Ep {epoch}]")
     
     for images, gt_density, points in pbar:
         images = images.to(device)
         points_list = [p.to(device) for p in points]
         
-        # Converti formato punti se necessario
-        # P2RLoss originale usa (y, x)
-        if points_format == 'xy':
-            points_list = [convert_points_format(p, 'xy', 'yx') for p in points_list]
-        
         # Forward
         outputs = model(images)
-        pred_density = outputs['p2r_density']  # [B, 1, H, W]
+        logits = outputs['p2r_logits']  # [B, 1, H, W]
         
-        # Rimuovi dimensione canale per P2RLoss
-        pred_density_squeezed = pred_density.squeeze(1)  # [B, H, W]
+        # P2RLoss vuole [B, H, W] e coordinate (y, x)
+        logits_squeezed = logits.squeeze(1)
         
-        # Calcola loss
-        loss = criterion(pred_density_squeezed, points_list, down_rate)
+        # Il downsampling del P2R head
+        _, _, H_in, W_in = images.shape
+        _, H_out, W_out = logits_squeezed.shape
+        down_rate = H_in // H_out
+        
+        # Converti punti da (x, y) a (y, x) per P2RLoss
+        points_yx = []
+        for pts in points_list:
+            if pts.numel() > 0:
+                pts_yx = pts[:, [1, 0]]  # Swap x,y → y,x
+                if pts.shape[1] > 2:
+                    pts_yx = torch.cat([pts_yx, pts[:, 2:]], dim=1)
+                points_yx.append(pts_yx)
+            else:
+                points_yx.append(pts)
+        
+        # Loss
+        loss = criterion(logits_squeezed, points_yx, down_rate)
         
         # Backward
         optimizer.zero_grad()
@@ -233,12 +175,12 @@ def train_one_epoch(
         
         optimizer.step()
         
-        # Metriche
+        # Metriche training
         with torch.no_grad():
             mae_batch = 0
             for i, pts in enumerate(points_list):
                 gt = len(pts)
-                pred = (pred_density[i] > 0).sum().item()
+                pred = (logits[i] > 0).sum().item()
                 mae_batch += abs(pred - gt)
             mae_batch /= len(points_list)
         
@@ -264,13 +206,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml')
-    parser.add_argument('--no-resume', action='store_true', help='Disabilita resume automatico')
-    parser.add_argument('--stage1-ckpt', type=str, default=None, help='Path specifico Stage 1 checkpoint')
-    parser.add_argument('--points-format', type=str, default='yx', choices=['xy', 'yx'],
-                        help='Formato coordinate punti nel dataset (default: yx)')
+    parser.add_argument('--no-resume', action='store_true')
+    parser.add_argument('--stage1-ckpt', type=str, default=None)
     args = parser.parse_args()
 
-    # Carica config
     if not os.path.exists(args.config):
         print(f"❌ Config non trovato: {args.config}")
         return
@@ -281,49 +220,33 @@ def main():
     device = torch.device(cfg.get("DEVICE", "cuda"))
     init_seeds(cfg.get("SEED", 2025))
     
-    # Parametri
+    # Parametri (allineati al paper P2R)
     data_cfg = cfg['DATA']
     p2r_cfg = cfg.get('OPTIM_P2R', {})
     loss_cfg = cfg.get('P2R_LOSS', {})
     
-    # Iperparametri (allineati al paper P2R originale)
     epochs = p2r_cfg.get('EPOCHS', 1500)
     batch_size = p2r_cfg.get('BATCH_SIZE', 16)
     lr = float(p2r_cfg.get('LR', 5e-5))
     lr_backbone = float(p2r_cfg.get('LR_BACKBONE', 1e-5))
     weight_decay = float(p2r_cfg.get('WEIGHT_DECAY', 1e-4))
-    grad_clip = float(p2r_cfg.get('GRAD_CLIP', 5.0))  # Paper usa 5.0!
+    grad_clip = float(p2r_cfg.get('GRAD_CLIP', 5.0))
     val_interval = p2r_cfg.get('VAL_INTERVAL', 5)
     patience = p2r_cfg.get('EARLY_STOPPING_PATIENCE', 300)
-    warmup_epochs = p2r_cfg.get('WARMUP_EPOCHS', 0)
     
-    down_rate = data_cfg.get('P2R_DOWNSAMPLE', 8)
-    
-    # P2RLoss parameters
-    min_radius = loss_cfg.get('MIN_RADIUS', 8)
-    max_radius = loss_cfg.get('MAX_RADIUS', 96)
-    cost_class = loss_cfg.get('COST_CLASS', 1)
-    cost_point = loss_cfg.get('COST_POINT', 8)
-    
-    run_name = cfg.get('RUN_NAME', 'p2r_zip')
+    run_name = cfg.get('RUN_NAME', 'p2r_zip_v2')
     output_dir = os.path.join(cfg["EXP"]["OUT_DIR"], run_name)
     os.makedirs(output_dir, exist_ok=True)
     
     print("=" * 60)
-    print("🚀 Stage 2 V3 - P2R Training con Loss ORIGINALE")
+    print("🚀 Stage 2 V4 - P2R BINARIO (come paper originale)")
     print("=" * 60)
     print(f"Config: {args.config}")
     print(f"Device: {device}")
     print(f"Epochs: {epochs}")
-    print(f"Batch size: {batch_size}")
+    print(f"Batch: {batch_size}")
     print(f"LR: {lr}, LR backbone: {lr_backbone}")
-    print(f"Weight decay: {weight_decay}")
     print(f"Grad clip: {grad_clip}")
-    print(f"Patience: {patience}")
-    print(f"Val interval: {val_interval}")
-    print(f"Down rate: {down_rate}")
-    print(f"P2R Loss: min_r={min_radius}, max_r={max_radius}, cost_cls={cost_class}, cost_pt={cost_point}")
-    print(f"Points format: {args.points_format}")
     print(f"Output: {output_dir}")
     print("=" * 60)
     sys.stdout.flush()
@@ -367,23 +290,18 @@ def main():
         pin_memory=True
     )
     
-    print(f"Dataset train: {len(train_ds)} immagini")
-    print(f"Dataset val: {len(val_ds)} immagini")
+    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     
     # =========================================================================
-    # MODELLO
+    # MODELLO V2 (con P2R head binario)
     # =========================================================================
-    bin_config = cfg["BINS_CONFIG"][cfg["DATASET"]]
     zip_head_cfg = cfg.get("ZIP_HEAD", {})
     
-    model = P2R_ZIP_Model(
-        backbone_name=cfg["MODEL"]["BACKBONE"],
-        pi_thresh=cfg["MODEL"]["ZIP_PI_THRESH"],
-        gate=cfg["MODEL"].get("GATE", "multiply"),
-        upsample_to_input=False,
+    model = P2R_ZIP_Model_V2(
+        backbone_name=cfg["MODEL"].get("BACKBONE", "vgg16_bn"),
+        fusion_channels=256,
+        pi_thresh=cfg["MODEL"].get("ZIP_PI_THRESH", 0.3),
         use_ste_mask=cfg["MODEL"].get("USE_STE_MASK", True),
-        bins=bin_config["bins"],
-        bin_centers=bin_config["bin_centers"],
         zip_head_kwargs={
             "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 1.2),
             "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
@@ -392,10 +310,11 @@ def main():
         },
     ).to(device)
     
-    print(f"🔧 Modello creato con USE_STE_MASK = {cfg['MODEL'].get('USE_STE_MASK', True)}")
+    print(f"🔧 Modello V2 creato (P2R head binario)")
+    print(f"   Down factor: {model.down_factor}")
     
     # =========================================================================
-    # CARICA STAGE 1 CHECKPOINT
+    # CARICA STAGE 1 (solo backbone e ZIP head)
     # =========================================================================
     stage1_loaded = False
     
@@ -405,86 +324,78 @@ def main():
         stage1_candidates = [
             os.path.join(output_dir, "stage1_best_acc.pth"),
             os.path.join(output_dir, "stage1_best.pth"),
-            os.path.join(output_dir, "stage1_last.pth"),
         ]
+        # Cerca anche nella cartella vecchia
+        old_dir = output_dir.replace('_v2', '').replace('_binary', '')
+        stage1_candidates.extend([
+            os.path.join(old_dir, "stage1_best_acc.pth"),
+            os.path.join(old_dir, "stage1_best.pth"),
+        ])
     
     print(f"\n🔍 Cercando Stage 1 checkpoint...")
     for ckpt_path in stage1_candidates:
         if os.path.isfile(ckpt_path):
             try:
                 state = torch.load(ckpt_path, map_location=device, weights_only=False)
-                if "model" in state:
-                    model.load_state_dict(state["model"], strict=False)
-                    info = f"epoch {state.get('epoch', '?')}"
-                    if "accuracy" in state:
-                        info += f", acc {state['accuracy']:.1f}%"
-                    print(f"✅ Caricato Stage 1 da: {ckpt_path} ({info})")
-                else:
-                    model.load_state_dict(state, strict=False)
-                    print(f"✅ Caricato Stage 1 da: {ckpt_path}")
+                state_dict = state.get("model", state)
+                
+                # Carica solo backbone e ZIP head (P2R head è nuovo)
+                filtered = {}
+                for k, v in state_dict.items():
+                    if 'backbone' in k or 'zip_head' in k or 'fusion' in k:
+                        filtered[k] = v
+                
+                missing, unexpected = model.load_state_dict(filtered, strict=False)
+                print(f"✅ Stage 1 caricato da: {ckpt_path}")
+                print(f"   Missing (atteso - nuovo P2R head): {len(missing)}")
                 stage1_loaded = True
                 break
             except Exception as e:
-                print(f"⚠️ Errore caricamento {ckpt_path}: {e}")
-                continue
+                print(f"⚠️ Errore: {e}")
     
     if not stage1_loaded:
-        print("⚠️ Stage 1 checkpoint NON TROVATO - training da zero")
+        print("⚠️ Stage 1 NON trovato - training P2R da zero")
     
     # =========================================================================
-    # SETUP OPTIMIZER (stile paper originale)
+    # OPTIMIZER (stile paper P2R)
     # =========================================================================
-    print("\n🔧 Setup parametri:")
+    print("\n🔧 Setup optimizer:")
     
-    # Parametri backbone vs head (come nel paper)
-    backbone_params = []
-    head_params = []
-    
-    for name, param in model.named_parameters():
-        if 'backbone' in name or 'encoder' in name:
-            backbone_params.append(param)
-        else:
-            head_params.append(param)
-    
-    # Freeze ZIP head (già addestrato in Stage 1)
+    # Congela ZIP head (già addestrato)
     for param in model.zip_head.parameters():
         param.requires_grad = False
+    print("   ZIP head: FROZEN")
     
-    print(f"   Backbone params: {sum(p.numel() for p in backbone_params):,}")
-    print(f"   Head params: {sum(p.numel() for p in head_params):,}")
-    print(f"   ZIP head: FROZEN")
+    # Param groups con LR differenziate
+    backbone_params = list(model.backbone.parameters())
+    head_params = list(model.p2r_head.parameters()) + list(model.fusion.parameters())
     
-    # Optimizer con LR differenziate (come paper)
     param_groups = [
-        {'params': [p for p in head_params if p.requires_grad], 'lr': lr},
-        {'params': backbone_params, 'lr': lr_backbone},
+        {'params': head_params, 'lr': lr, 'name': 'head'},
+        {'params': backbone_params, 'lr': lr_backbone, 'name': 'backbone'},
     ]
     
     optimizer = torch.optim.Adam(param_groups, weight_decay=weight_decay)
     
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
-    print(f"\n   Trainabili: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.1f}%)")
+    print(f"   Trainabili: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.1f}%)")
     
-    # Scheduler (Step LR come nel paper)
+    # Scheduler (Step LR come paper)
     decay_epochs = p2r_cfg.get('LR_DECAY_EPOCHS', 3500)
     decay_rate = p2r_cfg.get('LR_DECAY_RATE', 0.9)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, 
-        step_size=decay_epochs, 
-        gamma=decay_rate
-    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=decay_epochs, gamma=decay_rate)
     
     # P2RLoss originale
     criterion = P2RLossOriginal(
         factor=1,
-        min_radius=min_radius,
-        max_radius=max_radius,
-        cost_class=cost_class,
-        cost_point=cost_point
+        min_radius=loss_cfg.get('MIN_RADIUS', 8),
+        max_radius=loss_cfg.get('MAX_RADIUS', 96),
+        cost_class=loss_cfg.get('COST_CLASS', 1),
+        cost_point=loss_cfg.get('COST_POINT', 8)
     ).to(device)
     
-    print(f"\n📊 P2RLoss: min_r={min_radius}, max_r={max_radius}")
+    print(f"\n📊 P2RLoss: min_r={loss_cfg.get('MIN_RADIUS', 8)}, max_r={loss_cfg.get('MAX_RADIUS', 96)}")
     
     # =========================================================================
     # RESUME
@@ -493,15 +404,13 @@ def main():
     best_mae = float('inf')
     no_improve_count = 0
     
-    stage2_last_path = os.path.join(output_dir, "stage2_last.pth")
-    if not args.no_resume and os.path.isfile(stage2_last_path):
-        print(f"\n🔄 Trovato checkpoint Stage 2: {stage2_last_path}")
+    stage2_last = os.path.join(output_dir, "stage2_binary_last.pth")
+    if not args.no_resume and os.path.isfile(stage2_last):
         try:
-            ckpt = torch.load(stage2_last_path, map_location=device, weights_only=False)
+            ckpt = torch.load(stage2_last, map_location=device, weights_only=False)
             model.load_state_dict(ckpt['model'])
             optimizer.load_state_dict(ckpt['optimizer'])
-            if 'scheduler' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler'])
+            scheduler.load_state_dict(ckpt['scheduler'])
             start_epoch = ckpt['epoch'] + 1
             best_mae = ckpt.get('best_mae', float('inf'))
             no_improve_count = ckpt.get('no_improve_count', 0)
@@ -513,22 +422,12 @@ def main():
     # VALIDAZIONE INIZIALE
     # =========================================================================
     print("\n📋 Valutazione iniziale:")
-    val_results = validate(model, val_loader, device, down_rate)
-    val_results_int = validate_integration(model, val_loader, device, down_rate)
-    print(f"   MAE (pixel>0): {val_results['mae']:.2f}, RMSE: {val_results['rmse']:.2f}")
-    print(f"   MAE (integr.): {val_results_int['mae']:.2f}, RMSE: {val_results_int['rmse']:.2f}")
+    val_results = validate(model, val_loader, device)
+    print(f"   MAE: {val_results['mae']:.2f}")
+    print(f"   Ratio pred/gt: {val_results['ratio']:.3f}")
     
     if val_results['mae'] < best_mae:
         best_mae = val_results['mae']
-        save_checkpoint(
-            {
-                'epoch': 0,
-                'model': model.state_dict(),
-                'mae': best_mae,
-            },
-            os.path.join(output_dir, "stage2_best.pth"),
-            "Best iniziale"
-        )
     
     # =========================================================================
     # TRAINING LOOP
@@ -542,26 +441,24 @@ def main():
         # Train
         train_results = train_one_epoch(
             model, criterion, optimizer, train_loader,
-            device, epoch, down_rate, grad_clip,
-            points_format=args.points_format
+            device, epoch, grad_clip
         )
         
         scheduler.step()
         
         # Validate
         if epoch % val_interval == 0 or epoch == 1:
-            val_results = validate(model, val_loader, device, down_rate)
+            val_results = validate(model, val_loader, device)
             
             current_lr = get_lr(optimizer)
             mae = val_results['mae']
             
-            # Check improvement
             improved = mae < best_mae
             status = "✅ NEW BEST" if improved else ""
             
             print(f"Epoch {epoch:4d} | "
                   f"Train L: {train_results['loss']:.3f} MAE: {train_results['mae']:.1f} | "
-                  f"Val MAE: {mae:.2f} | "
+                  f"Val MAE: {mae:.2f} (r={val_results['ratio']:.2f}) | "
                   f"LR: {current_lr:.2e} | "
                   f"Best: {best_mae:.2f} {status}")
             sys.stdout.flush()
@@ -574,11 +471,10 @@ def main():
                     {
                         'epoch': epoch,
                         'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
                         'mae': mae,
+                        'ratio': val_results['ratio'],
                     },
-                    os.path.join(output_dir, "stage2_best.pth"),
+                    os.path.join(output_dir, "stage2_binary_best.pth"),
                     f"Stage2 Best (MAE={mae:.2f})"
                 )
             else:
@@ -600,8 +496,8 @@ def main():
                     'best_mae': best_mae,
                     'no_improve_count': no_improve_count,
                 },
-                os.path.join(output_dir, "stage2_last.pth"),
-                f"Stage2 Last (Ep {epoch})"
+                os.path.join(output_dir, "stage2_binary_last.pth"),
+                f"Stage2 Ckpt (Ep {epoch})"
             )
     
     # Salvataggio finale
@@ -613,7 +509,7 @@ def main():
             'scheduler': scheduler.state_dict(),
             'best_mae': best_mae,
         },
-        os.path.join(output_dir, "stage2_last.pth"),
+        os.path.join(output_dir, "stage2_binary_last.pth"),
         "Stage2 Final"
     )
     
@@ -621,10 +517,10 @@ def main():
     # RISULTATI
     # =========================================================================
     print("\n" + "=" * 60)
-    print("🏁 STAGE 2 COMPLETATO")
+    print("🏁 STAGE 2 (BINARY) COMPLETATO")
     print("=" * 60)
     print(f"   Best MAE: {best_mae:.2f}")
-    print(f"   Checkpoint: {output_dir}/stage2_best.pth")
+    print(f"   Checkpoint: {output_dir}/stage2_binary_best.pth")
     print("=" * 60)
 
 

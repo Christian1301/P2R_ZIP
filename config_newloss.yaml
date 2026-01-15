@@ -1,4 +1,18 @@
-RUN_NAME: "shha_p2rzip_newloss"
+# =================================================================
+# CONFIG P2R-ZIP V2 - Con P2R Head BINARIO
+# =================================================================
+# 
+# Questa configurazione usa l'architettura P2R originale:
+# - P2R head con 2 canali → differenza (output binario)
+# - Conteggio = (logits > 0).count()
+# - P2RLoss con matching point-to-region
+#
+# =================================================================
+
+# Versione modello: "v1" (density continua) o "v2" (binario come paper P2R)
+MODEL_VERSION: "v2"
+
+RUN_NAME: "shha_p2rzip_binary"
 SEED: 2025
 DEVICE: "cuda"
 
@@ -7,19 +21,19 @@ DATASET: "shha"
 DATA:
   ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
   ZIP_BLOCK_SIZE: 16
-  P2R_DOWNSAMPLE: 8
+  P2R_DOWNSAMPLE: 16  # VGG/32 * upscale2 = /16
   IMG_EXTS: [".jpg", ".png"]
   NORM_MEAN: [0.485, 0.456, 0.406]
   NORM_STD:  [0.229, 0.224, 0.225]
   TRAIN_SPLIT: "train"
   VAL_SPLIT: "test"
-  CROP_SIZE: 384  # Come nel paper originale
+  CROP_SIZE: 256  # Come paper P2R originale
 
   # === AUGMENTATION (come paper P2R) ===
   AUGMENTATION:
     RandomResizedCrop:
       ENABLED: true
-      SCALE: [0.7, 1.3]  # resize_factor=0.3 nel paper
+      SCALE: [0.7, 1.3]
       RATIO: [0.75, 1.33]
     HorizontalFlip:
       ENABLED: true
@@ -33,15 +47,13 @@ DATA:
     RANDOM_GRAY_PROB: 0.25
     GAUSSIAN_BLUR:
       ENABLED: true
-      PROB: 0.8  # Alto come nel paper
+      PROB: 0.8
       KERNEL_SIZE: [3, 5]
 
 # === MODELLO ===
 MODEL:
   BACKBONE: "vgg16_bn"
   ZIP_PI_THRESH: 0.3
-  GATE: "multiply"
-  UPSAMPLE_TO_INPUT: false
   USE_STE_MASK: true
 
 # === ZIP HEAD ===
@@ -75,63 +87,49 @@ ZIP_LOSS:
   OCCUPANCY_THRESHOLD: 0.5
 
 # =================================================================
-# STAGE 2 - P2R TRAINING (ALLINEATO AL PAPER ORIGINALE)
-# =================================================================
-# 
-# Iperparametri dal paper P2R:
-#   - BASE_LR: 5e-5
-#   - BACKBONE_LR: 1e-5
-#   - WEIGHT_DECAY: 1e-4
-#   - CLIP_GRAD: 5.0 (importante!)
-#   - EPOCHS: 1500
-#   - crop_size: 256x256
-#
+# STAGE 2 - P2R BINARIO (come paper originale)
 # =================================================================
 OPTIM_P2R:
-  BATCH_SIZE: 16             # Come nel paper
+  BATCH_SIZE: 16
   NUM_WORKERS: 4
-  EPOCHS: 1500               # Come nel paper
-  LR: 5.0e-5                 # BASE_LR dal paper
-  LR_BACKBONE: 1.0e-5        # BACKBONE_LR dal paper
-  WEIGHT_DECAY: 1.0e-4       # Come nel paper
+  EPOCHS: 1500
+  LR: 5.0e-5              # BASE_LR dal paper
+  LR_BACKBONE: 1.0e-5     # BACKBONE_LR dal paper
+  WEIGHT_DECAY: 1.0e-4
   SCHEDULER: "step"
-  LR_DECAY_EPOCHS: 3500      # Dal config originale
+  LR_DECAY_EPOCHS: 3500
   LR_DECAY_RATE: 0.9
   VAL_INTERVAL: 5
   RESUME_LAST: true
-  SAVE_BEST: true
-  WARMUP_EPOCHS: 0           # No warmup nel paper
   EARLY_STOPPING_PATIENCE: 300
-  GRAD_CLIP: 5.0             # CRITICO! Nel paper è 5.0
+  GRAD_CLIP: 5.0          # CRITICO!
 
-# === P2R LOSS ORIGINALE ===
-# Parametri dalla loss originale del paper
+# === P2R LOSS ===
 P2R_LOSS:
-  MIN_RADIUS: 8              # min_radis nel codice
-  MAX_RADIUS: 96             # max_radis nel codice
-  COST_CLASS: 1              # cost_class nel codice
-  COST_POINT: 8              # cost_point nel codice
+  MIN_RADIUS: 8
+  MAX_RADIUS: 96
+  COST_CLASS: 1
+  COST_POINT: 8
 
 # =================================================================
-# STAGE 3 - JOINT TRAINING
+# STAGE 3 - JOINT (opzionale, da implementare per V2)
 # =================================================================
 OPTIM_JOINT:
   BATCH_SIZE: 8   
   NUM_WORKERS: 4
   EPOCHS: 500
-  LR_BACKBONE: 1.0e-5        # Sblocca backbone
+  LR_BACKBONE: 1.0e-5
   LR_HEADS: 5.0e-6
   WEIGHT_DECAY: 1.0e-4
   VAL_INTERVAL: 5
   EARLY_STOPPING_PATIENCE: 150
-  GRAD_CLIP: 5.0             # Come Stage 2
+  GRAD_CLIP: 5.0
 
 JOINT_LOSS:
   FIXED_ZIP_WEIGHT: 0.1     
   FIXED_P2R_WEIGHT: 1.0     
-  USE_SOFT_WEIGHTING: false 
 
-# === BINS CONFIG ===
+# === BINS CONFIG (per ZIP) ===
 BINS_CONFIG:
   shha:
     bins: [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
@@ -139,14 +137,7 @@ BINS_CONFIG:
   shhb:
     bins: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]]
     bin_centers: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16]
-  qnrf:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
-  nwpu:
-    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
-    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
 
 EXP:
   OUT_DIR: "exp"
   SAVE_BEST: true
-  SAVE_WORST_CASES: true

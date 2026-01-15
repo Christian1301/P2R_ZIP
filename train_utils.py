@@ -92,31 +92,27 @@ def _round_to_multiple(x: int, multiple: int = 16) -> int:
 def collate_fn(batch):
     """
     Collate function UNIFICATA con padding a multipli di 16.
-    
-    IMPORTANTE: Questa funzione deve essere usata in TUTTI gli stage
-    per mantenere consistenza nelle dimensioni.
+    Supporta sia tuple (img, density, points) che dizionari.
     """
     item = batch[0]
-
-    if 'density' in item and isinstance(item['points'], torch.Tensor):
-        # Trova dimensioni massime
-        max_h = max(b['image'].shape[1] for b in batch)
-        max_w = max(b['image'].shape[2] for b in batch)
+    
+    # ========== NUOVO: Supporto per TUPLE ==========
+    if isinstance(item, tuple) and len(item) == 3:
+        # Dataset restituisce (image, density, points)
+        max_h = max(b[0].shape[1] for b in batch)
+        max_w = max(b[0].shape[2] for b in batch)
         
-        # CORREZIONE: Arrotonda a multipli di 16 per VGG backbone
+        # Arrotonda a multipli di 16 per VGG backbone
         max_h = _round_to_multiple(max_h, 16)
         max_w = _round_to_multiple(max_w, 16)
 
         padded_images, padded_densities, points_list = [], [], []
 
-        for b in batch:
-            img, den, pts = b['image'], b['density'], b['points']
+        for img, den, pts in batch:
             h, w = img.shape[1], img.shape[2]
-            
-            # Padding (right, bottom)
             pad_w = max_w - w
             pad_h = max_h - h
-            pad = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+            pad = (0, pad_w, 0, pad_h)
             
             padded_images.append(F.pad(img, pad, mode='constant', value=0))
             padded_densities.append(F.pad(den, pad, mode='constant', value=0))
@@ -124,15 +120,36 @@ def collate_fn(batch):
 
         return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
 
-    elif 'zip_blocks' in item:
-        warnings.warn("collate_fn: formato 'zip_blocks' deprecato")
-        imgs = torch.stack([b["image"] for b in batch], 0)
-        blocks = torch.stack([b["zip_blocks"] for b in batch], 0)
-        points = [b["points"] for b in batch]
-        return imgs, blocks, points
+    # ========== Dizionario (legacy) ==========
+    elif isinstance(item, dict):
+        if 'density' in item and isinstance(item['points'], torch.Tensor):
+            max_h = max(b['image'].shape[1] for b in batch)
+            max_w = max(b['image'].shape[2] for b in batch)
+            max_h = _round_to_multiple(max_h, 16)
+            max_w = _round_to_multiple(max_w, 16)
 
-    raise TypeError(f"Formato batch non riconosciuto: {item.keys()}")
+            padded_images, padded_densities, points_list = [], [], []
 
+            for b in batch:
+                img, den, pts = b['image'], b['density'], b['points']
+                h, w = img.shape[1], img.shape[2]
+                pad_w = max_w - w
+                pad_h = max_h - h
+                pad = (0, pad_w, 0, pad_h)
+                
+                padded_images.append(F.pad(img, pad, mode='constant', value=0))
+                padded_densities.append(F.pad(den, pad, mode='constant', value=0))
+                points_list.append(pts)
+
+            return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
+
+        elif 'zip_blocks' in item:
+            imgs = torch.stack([b["image"] for b in batch], 0)
+            blocks = torch.stack([b["zip_blocks"] for b in batch], 0)
+            points = [b["points"] for b in batch]
+            return imgs, blocks, points
+
+    raise TypeError(f"Formato batch non riconosciuto: tipo={type(item)}, contenuto={item if not isinstance(item, tuple) else 'tuple'}")
 
 def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, warn_tol=0.15):
     """Calcola i fattori di downsampling effettivi."""

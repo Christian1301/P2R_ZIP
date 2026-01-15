@@ -1,20 +1,10 @@
 # P2R_ZIP/datasets/nwpu.py
-# VERSIONE AGGIORNATA per struttura flat (immagini e txt nella stessa cartella)
-#
-# Struttura attesa:
-# ROOT/
-# ├── train/scene01/0001.jpg, 0001.txt, ...
-# ├── val/scene01/...
-# └── test/scene01/...
-#
-# Il file .txt contiene coordinate x y (una per riga)
-
 import os
 import glob
 import numpy as np
-from .base_dataset import BaseCrowdDataset
+from .base_dataset import BaseDataset
 
-class NWPU(BaseCrowdDataset):
+class NWPU(BaseDataset):
     """
     NWPU-Crowd Dataset Loader.
     
@@ -23,9 +13,9 @@ class NWPU(BaseCrowdDataset):
     2. Flat: ROOT/split/scene*/*.jpg + *.txt (stesso nome)
     """
     
-    def get_image_list(self, split):
+    def load_data(self):
         """Trova tutte le immagini per lo split specificato."""
-        
+        split = self.split
         imgs = []
         
         # === PROVA 1: Struttura standard ROOT/split/images/*.jpg ===
@@ -34,7 +24,8 @@ class NWPU(BaseCrowdDataset):
             found = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
             if found:
                 print(f"[NWPU] Trovate {len(found)} immagini in {img_dir}")
-                return found
+                self.img_paths = found
+                return
         
         # === PROVA 2: Struttura flat ROOT/split/scene*/*.jpg ===
         scene_pattern = os.path.join(self.root, split, "scene*")
@@ -46,7 +37,8 @@ class NWPU(BaseCrowdDataset):
         
         if imgs:
             print(f"[NWPU] Trovate {len(imgs)} immagini in {len(scene_dirs)} scene directories")
-            return sorted(imgs)
+            self.img_paths = sorted(imgs)
+            return
         
         # === PROVA 3: Struttura flat diretta ROOT/split/*.jpg ===
         flat_dir = os.path.join(self.root, split)
@@ -54,21 +46,15 @@ class NWPU(BaseCrowdDataset):
             found = sorted(glob.glob(os.path.join(flat_dir, "*.jpg")))
             if found:
                 print(f"[NWPU] Trovate {len(found)} immagini in {flat_dir}")
-                return found
+                self.img_paths = found
+                return
         
         raise FileNotFoundError(
-            f"Nessuna immagine trovata per split '{split}' in {self.root}\n"
-            f"Cercato: {img_dir}, {scene_pattern}, {flat_dir}"
+            f"Nessuna immagine trovata per split '{split}' in {self.root}"
         )
     
     def load_points(self, img_path):
-        """
-        Carica i punti GT per un'immagine.
-        
-        Supporta:
-        1. File .txt nella stessa cartella (struttura flat)
-        2. File .txt in cartella gt/ (struttura standard)
-        """
+        """Carica i punti GT per un'immagine."""
         pts = []
         
         # === PROVA 1: File .txt nella stessa cartella ===
@@ -78,11 +64,7 @@ class NWPU(BaseCrowdDataset):
             return np.array(pts, dtype=np.float32)
         
         # === PROVA 2: File .txt in cartella gt/ ===
-        # img_path: ROOT/train/images/0001.jpg
-        # gt_path:  ROOT/train/gt/0001.txt
         base_name = os.path.splitext(os.path.basename(img_path))[0]
-        
-        # Trova la cartella gt relativa
         img_dir = os.path.dirname(img_path)
         parent_dir = os.path.dirname(img_dir)
         
@@ -96,38 +78,25 @@ class NWPU(BaseCrowdDataset):
                 pts = self._load_txt_points(gt_path)
                 return np.array(pts, dtype=np.float32)
         
-        # Nessun GT trovato - potrebbe essere un'immagine senza persone
-        # NWPU ha molte immagini con 0 persone
         return np.array(pts, dtype=np.float32)
     
     def _load_txt_points(self, txt_path):
-        """
-        Carica punti da file .txt.
-        
-        Formato NWPU: x y (spazi o virgole come separatori)
-        Alcune annotazioni potrebbero avere campi extra.
-        """
+        """Carica punti da file .txt."""
         pts = []
-        
         try:
             with open(txt_path, "r") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    
-                    # Sostituisci virgole con spazi e splitta
                     parts = line.replace(",", " ").split()
-                    
                     if len(parts) >= 2:
                         try:
                             x = float(parts[0])
                             y = float(parts[1])
                             pts.append([x, y])
                         except ValueError:
-                            # Salta righe malformate
                             continue
         except Exception as e:
             print(f"[NWPU] Errore lettura {txt_path}: {e}")
-        
         return pts

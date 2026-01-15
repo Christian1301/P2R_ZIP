@@ -12,7 +12,7 @@ EXPERIMENT_DIR: "exp"
 # ============================================================
 DATASET:
   NAME: "ShanghaiTechA"
-  ROOT: "/mnt/localstorage/cromano/Datasets/ShanghaiTech/part_A"
+  ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-A"
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
 

@@ -1,19 +1,10 @@
 # P2R_ZIP/datasets/ucf_qnrf.py
-# VERSIONE AGGIORNATA per struttura flat (immagini e txt nella stessa cartella)
-#
-# Struttura attesa:
-# ROOT/
-# ├── train/scene01/img_0001.jpg, img_0001.txt, ...
-# └── test/scene01/img_0001.jpg, img_0001.txt, ...
-#
-# Supporta anche struttura originale con Train/Test e .mat files
-
 import os
 import glob
 import numpy as np
-from .base_dataset import BaseCrowdDataset
+from .base_dataset import BaseDataset
 
-class UCF_QNRF(BaseCrowdDataset):
+class UCF_QNRF(BaseDataset):
     """
     UCF-QNRF Dataset Loader.
     
@@ -22,14 +13,15 @@ class UCF_QNRF(BaseCrowdDataset):
     2. Flat: ROOT/train/scene01/*.jpg + *.txt (stesso nome)
     """
     
-    def get_image_list(self, split):
+    def load_data(self):
         """Trova tutte le immagini per lo split specificato."""
+        split = self.split
         
         # Mapping split names
         split_mapping = {
             "train": ["Train", "train"],
             "test": ["Test", "test"],
-            "val": ["Test", "test"],  # UCF-QNRF non ha val, usa test
+            "val": ["Test", "test"],
         }
         
         split_candidates = split_mapping.get(split.lower(), [split])
@@ -43,7 +35,8 @@ class UCF_QNRF(BaseCrowdDataset):
                 found = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
                 if found:
                     print(f"[UCF-QNRF] Trovate {len(found)} immagini in {img_dir}")
-                    return found
+                    self.img_paths = found
+                    return
             
             # Prova struttura flat: ROOT/split/scene*/*.jpg
             scene_pattern = os.path.join(self.root, split_name, "scene*")
@@ -55,7 +48,8 @@ class UCF_QNRF(BaseCrowdDataset):
             
             if imgs:
                 print(f"[UCF-QNRF] Trovate {len(imgs)} immagini in {self.root}/{split_name}/scene*/")
-                return sorted(imgs)
+                self.img_paths = sorted(imgs)
+                return
             
             # Prova struttura flat diretta: ROOT/split/*.jpg
             flat_dir = os.path.join(self.root, split_name)
@@ -63,7 +57,8 @@ class UCF_QNRF(BaseCrowdDataset):
                 found = sorted(glob.glob(os.path.join(flat_dir, "*.jpg")))
                 if found:
                     print(f"[UCF-QNRF] Trovate {len(found)} immagini in {flat_dir}")
-                    return found
+                    self.img_paths = found
+                    return
         
         raise FileNotFoundError(
             f"Nessuna immagine trovata per split '{split}' in {self.root}\n"
@@ -71,13 +66,7 @@ class UCF_QNRF(BaseCrowdDataset):
         )
     
     def load_points(self, img_path):
-        """
-        Carica i punti GT per un'immagine.
-        
-        Supporta:
-        1. File .mat (struttura originale): ROOT/Split/gt/img_name_ann.mat
-        2. File .txt (struttura flat): stesso path dell'immagine, estensione .txt
-        """
+        """Carica i punti GT per un'immagine."""
         pts = []
         
         # === PROVA 1: File .txt nella stessa cartella ===
@@ -87,10 +76,8 @@ class UCF_QNRF(BaseCrowdDataset):
             return np.array(pts, dtype=np.float32)
         
         # === PROVA 2: File .mat in cartella gt/ (struttura originale) ===
-        # img_path: ROOT/Train/images/img_0001.jpg
-        # gt_path:  ROOT/Train/gt/img_0001_ann.mat
         base_name = os.path.splitext(os.path.basename(img_path))[0]
-        parent_dir = os.path.dirname(os.path.dirname(img_path))  # ROOT/Train
+        parent_dir = os.path.dirname(os.path.dirname(img_path))
         
         mat_path = os.path.join(parent_dir, "gt", f"{base_name}_ann.mat")
         if os.path.isfile(mat_path):
@@ -103,12 +90,11 @@ class UCF_QNRF(BaseCrowdDataset):
             pts = self._load_mat_points(mat_path2)
             return np.array(pts, dtype=np.float32)
         
-        # Nessun GT trovato - ritorna array vuoto (immagine senza persone?)
         print(f"[UCF-QNRF] Warning: GT non trovato per {img_path}")
         return np.array(pts, dtype=np.float32)
     
     def _load_txt_points(self, txt_path):
-        """Carica punti da file .txt (formato: x y per riga)."""
+        """Carica punti da file .txt."""
         pts = []
         with open(txt_path, "r") as f:
             for line in f:
@@ -131,12 +117,10 @@ class UCF_QNRF(BaseCrowdDataset):
         try:
             mat = sio.loadmat(mat_path)
             
-            # Prova diverse chiavi comuni
             for key in ["annPoints", "image_info", "points", "gt"]:
                 if key in mat:
                     data = mat[key]
                     
-                    # Gestisci struttura nested di image_info
                     if key == "image_info":
                         try:
                             data = data[0][0][0][0][0]

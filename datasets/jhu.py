@@ -2,13 +2,19 @@
 import os
 import glob
 import numpy as np
-from .base_dataset import BaseCrowdDataset
+from .base_dataset import BaseDataset
 
-class JHU_Crowd(BaseCrowdDataset):
-    def get_image_list(self, split):
-        img_dir = os.path.join(self.root, split, "images")
+class JHU_Crowd(BaseDataset):
+    def load_data(self):
+        """Carica i path delle immagini JHU."""
+        img_dir = os.path.join(self.root, self.split, "images")
         imgs = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
-        return imgs
+        
+        if len(imgs) == 0:
+            raise FileNotFoundError(f"Nessuna immagine trovata in {img_dir}")
+        
+        print(f"JHU Dataset {self.split}: Trovate {len(imgs)} immagini.")
+        self.img_paths = imgs
 
     def load_points(self, img_path):
         gt_path = img_path.replace("/images/", "/gt/").replace(".jpg", ".txt")

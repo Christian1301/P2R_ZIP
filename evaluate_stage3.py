@@ -366,7 +366,7 @@ def main():
             raise FileNotFoundError(f"Nessun checkpoint trovato in {output_dir}")
     
     print(f"🔄 Caricamento pesi da: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if 'model' in state:
         state = state['model']
     model.load_state_dict(state, strict=False)

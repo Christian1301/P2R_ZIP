@@ -90,7 +90,13 @@ def validate_stage2(model, dataloader, device, default_down):
 
 
 def main():
-    with open('config.yaml') as f:
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate Stage 2')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path al file di configurazione YAML')
+    args = parser.parse_args()
+    
+    with open(args.config) as f:
         config = yaml.safe_load(f) or {}
     
     device = torch.device(config.get('DEVICE', 'cuda'))
@@ -175,7 +181,7 @@ def main():
     ckpt_path = os.path.join(output_dir, 'stage2_bypass_best.pth')
     
     print(f"\n✅ Caricamento: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model'], strict=False)
     
     # Mostra log_scale (NON modificarlo!)

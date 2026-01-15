@@ -26,11 +26,11 @@ set -e
 mkdir -p logs
 
 echo "🚀 Avvio Stage 1 (ZIP)..."
-python3 train_stage1_zip.py  > logs/stage1.log 2>&1
+#python3 train_stage1_zip.py  > logs/stage1.log 2>&1
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
-python3 train_stage2_p2r.py --config config.yaml > logs/stage2.log 2>&1
+#python3 train_stage2_p2r.py --config config.yaml > logs/stage2.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."

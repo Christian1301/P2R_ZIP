@@ -16,9 +16,10 @@ def main():
     ap.add_argument("--img", required=True, help="percorso immagine")
     ap.add_argument("--ckpt", default="weights/joint.pth")
     ap.add_argument("--out_dir", default="pred_vis")
+    ap.add_argument("--config", default="config.yaml", help="Path al file di configurazione YAML")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open("config.yaml"))
+    cfg = yaml.safe_load(open(args.config))
     device = torch.device(cfg["DEVICE"] if torch.cuda.is_available() else "cpu")
 
     img = Image.open(args.img).convert("RGB")

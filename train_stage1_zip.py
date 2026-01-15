@@ -393,7 +393,13 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, no_imp
 # =============================================================================
 
 def main():
-    with open('config.yaml') as f:
+    import argparse
+    parser = argparse.ArgumentParser(description='Train Stage 1 ZIP')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path al file di configurazione YAML')
+    args = parser.parse_args()
+    
+    with open(args.config) as f:
         config = yaml.safe_load(f)
     
     device = torch.device(config['DEVICE'])

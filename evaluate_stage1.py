@@ -333,11 +333,17 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
 # =============================================================================
 
 def main():
-    if not os.path.exists("config.yaml"):
-        print("❌ config.yaml non trovato")
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate Stage 1 ZIP')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path al file di configurazione YAML')
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.config):
+        print(f"❌ {args.config} non trovato")
         return
         
-    with open("config.yaml", 'r') as f:
+    with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
     device = torch.device(config['DEVICE'])
@@ -424,7 +430,7 @@ def main():
         return
 
     print(f"\n✅ Caricamento checkpoint: {checkpoint_path}")
-    raw_state = torch.load(checkpoint_path, map_location=device)
+    raw_state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = raw_state.get('model', raw_state)
     model.load_state_dict(state_dict, strict=False)
 

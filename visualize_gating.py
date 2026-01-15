@@ -551,6 +551,8 @@ if __name__ == "__main__":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" 
 
     parser = argparse.ArgumentParser(description="Visualizza le mappe di gating P2R-ZIP con griglia patch.")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="Path al file di configurazione YAML.")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Percorso del checkpoint da caricare. Se omesso usa RUN_NAME/OUT_DIR da config.")
     parser.add_argument("--stage", type=str, default="stage2",
@@ -584,7 +586,7 @@ if __name__ == "__main__":
         torch.manual_seed(args.seed)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = load_config(CONFIG_PATH)
+    config = load_config(args.config)
     
     # Block size da args o config
     block_size = args.block_size or config["DATA"].get("ZIP_BLOCK_SIZE", 16)

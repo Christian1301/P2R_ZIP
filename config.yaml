@@ -1,14 +1,13 @@
 # ============================================================
-# CONFIG V15 - Con ZIP NLL Loss per Stage 1
-# Target: MAE < 60 su ShanghaiTech Part A
+# CONFIG V15 - FINETUNING MODE
+# Obiettivo: Recuperare il best model (Ep 75) e scendere < 60
 # ============================================================
 
-# Run identification
 RUN_NAME: "shha_v15"
 EXPERIMENT_DIR: "exp"
 
 # ============================================================
-# DATASET - MANTIENI LA TUA CONFIGURAZIONE ORIGINALE
+# DATASET
 # ============================================================
 DATASET:
   NAME: "ShanghaiTechA"
@@ -16,141 +15,117 @@ DATASET:
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
 
-# Model architecture
+# ============================================================
+# MODEL
+# ============================================================
 MODEL:
   BACKBONE: "vgg16_bn"
   BACKBONE_PRETRAINED: true
-  FREEZE_BACKBONE_STAGE1: true
+  # In stage 3 sblocchiamo tutto ma con LR basso
+  FREEZE_BACKBONE_STAGE1: false
   FREEZE_BACKBONE_STAGE2: false
-  FREEZE_BACKBONE_STAGE3: true
+  FREEZE_BACKBONE_STAGE3: false
   
-  # ZIP Head parameters
   ZIP_HIDDEN_DIM: 256
-  ZIP_PI_THRESH: 0.2           # Threshold per inference (può essere tuned post-training)
+  ZIP_PI_THRESH: 0.2
   
-  # P2R Head parameters  
   P2R_FEA_CHANNEL: 256
   P2R_OUT_STRIDE: 16
 
-# ============================================================
-# ZIP HEAD - Parametri architettura
-# ============================================================
 ZIP_HEAD:
-  LAMBDA_SCALE: 1.2            # Scala per softplus
-  LAMBDA_MAX: 8.0              # Clamp massimo per lambda
-  USE_SOFTPLUS: true           # Usa softplus invece di exp per lambda
+  LAMBDA_SCALE: 1.2
+  LAMBDA_MAX: 8.0
+  USE_SOFTPLUS: true
 
 # ============================================================
-# STAGE 1: ZIP Pre-training con ZIP NLL
+# STAGE CONFIGURATIONS (Invariati per compatibilità)
 # ============================================================
 OPTIM_ZIP:
   EPOCHS: 3000
   BATCH_SIZE: 8
-  LR: 1.0e-4                   # Learning rate per ZIP head
-  LR_BACKBONE: 1.0e-5          # Learning rate backbone (più conservativo)
-  HEAD_LR: 1.0e-4              # Alias per LR head
+  LR: 1.0e-4
+  LR_BACKBONE: 1.0e-5
+  HEAD_LR: 1.0e-4
   WEIGHT_DECAY: 1.0e-4
-  WARMUP_EPOCHS: 50            # Warmup più lungo per stabilità
+  WARMUP_EPOCHS: 50
   EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 1.0
-  VAL_INTERVAL: 5              # Valida ogni 5 epochs
+  VAL_INTERVAL: 5
   NUM_WORKERS: 4
 
-# ============================================================
-# STAGE 1 V4: ZIP NLL Loss Configuration
-# ============================================================
 ZIP_LOSS_V4:
-  # Pesi loss
-  WEIGHT_NLL: 1.0              # Peso principale ZIP NLL
-  WEIGHT_LAMBDA_REG: 0.01      # Regularizzazione lambda (evita valori estremi)
-  WEIGHT_PI_ENTROPY: 0.0       # Entropy regularization (0 = disabilitato)
-  
-  # Parametri
-  LAMBDA_MAX_TARGET: 8.0       # Target massimo per lambda reg
-  OCCUPANCY_THRESHOLD: 0.5     # Soglia per GT occupancy (per metriche)
-  PI_THRESHOLD: 0.5            # Soglia per predizione binaria (per metriche)
-
-# ============================================================
-# STAGE 1 V3: ZIP Loss (LEGACY - non usato con V4)
-# ============================================================
-ZIP_LOSS_V3:
-  USE_FOCAL: false
-  FOCAL_GAMMA: 2.0
-  POS_WEIGHT: 5.0
-  OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_CLASSIFICATION: 1.0
-  WEIGHT_COUNT: 0.1
+  WEIGHT_NLL: 1.0
   WEIGHT_LAMBDA_REG: 0.01
+  WEIGHT_PI_ENTROPY: 0.0
+  LAMBDA_MAX_TARGET: 8.0
+  OCCUPANCY_THRESHOLD: 0.5
+  PI_THRESHOLD: 0.5
 
-# ============================================================
-# STAGE 2: P2R Training - PARAMETRI CRITICI
-# ============================================================
 OPTIM_P2R:
-  EPOCHS: 3000                 # Ridotto per regularizzazione
+  EPOCHS: 3000
   BATCH_SIZE: 8
-  LR: 5.0e-5                   # Learning rate conservativo
-  LR_BACKBONE: 1.0e-6          # Backbone quasi congelato
-  WEIGHT_DECAY: 1.0e-2         # Aumentato per regularizzazione (era 1e-4)
-  WARMUP_EPOCHS: 50            # Warmup lungo per stabilità
-  EARLY_STOPPING_PATIENCE: 500 # Ridotto (era 2500)
+  LR: 5.0e-5
+  LR_BACKBONE: 1.0e-6
+  WEIGHT_DECAY: 1.0e-2
+  WARMUP_EPOCHS: 50
+  EARLY_STOPPING_PATIENCE: 500
   GRAD_CLIP: 1.0
-  
-  # Scheduler
   SCHEDULER: "cosine"
   MIN_LR: 1.0e-7
-  
-  # Regularizzazione P2R Head
-  DROPOUT: 0.3                 # Dropout nei layer intermedi
-  FINAL_DROPOUT: 0.5           # Dropout prima del layer finale
-  
-  # Data Augmentation Aggressiva
-  USE_AGGRESSIVE_AUG: true     # Abilita augmentation aggressiva
-  AUG_SCALE_RANGE: [0.8, 1.2]  # Random scale
-  AUG_ROTATION: 15             # Rotazione ±15°
-  AUG_ERASING_PROB: 0.3        # Random erasing probability
+  DROPOUT: 0.3
+  FINAL_DROPOUT: 0.5
+  USE_AGGRESSIVE_AUG: true
+  AUG_SCALE_RANGE: [0.8, 1.2]
+  AUG_ROTATION: 15
+  AUG_ERASING_PROB: 0.3
 
 P2R_LOSS:
-  # Multi-scale loss
   USE_MULTI_SCALE: true
   SCALES: [1, 2, 4]
   SCALE_WEIGHTS: [1.0, 0.5, 0.25]
-  
-  # Loss weights
-  COUNT_WEIGHT: 2.0            # Enfatizza count accuracy
-  SPATIAL_WEIGHT: 0.15         # Guida localizzazione
-  SCALE_WEIGHT: 0.5            # Penalizza errore relativo
-  
-  # Log scale initialization
-  LOG_SCALE_INIT: 4.0          # exp(4)≈55
+  COUNT_WEIGHT: 2.0
+  SPATIAL_WEIGHT: 0.15
+  SCALE_WEIGHT: 0.5
+  LOG_SCALE_INIT: 4.0
   LOG_SCALE_CLAMP: [-2.0, 10.0]
   LOG_SCALE_LR_MULT: 0.1
 
 # ============================================================
-# STAGE 3: Joint Training
+# STAGE 3: Joint Training - FINETUNING (CRITICO)
 # ============================================================
 OPTIM_JOINT:
   BATCH_SIZE: 8
-  LR: 1.0e-5          
+  EPOCHS: 2000
+  
+  # --- LEARNING RATES RIDOTTI (10x rispetto a prima) ---
+  # Questo ferma l'overfitting del P2R e stabilizza il training
+  LR_BACKBONE: 1.0e-6     # Era 1e-5
+  LR_ZIP_HEAD: 5.0e-7     # Era 1e-6 (o 2e-5)
+  LR_P2R_HEAD: 1.0e-6     # Era 5e-6
+  # -----------------------------------------------------
+
   WEIGHT_DECAY: 1.0e-4
   EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 0.5
-  EPOCHS: 2000
-  LR_BACKBONE: 0              # Frozen
-  LR_ZIP_HEAD: 1.0e-6         # Era 2e-5 → 20x più basso
-  LR_P2R_HEAD: 5.0e-6         # Era 3e-5 → 6x più basso
-  WARMUP_EPOCHS: 100          # Era 20 → warmup molto più lungo
-  VAL_INTERVAL: 5
+  
+  # Ripartiamo da un modello già caldo, niente warmup
+  WARMUP_EPOCHS: 0        
+  VAL_INTERVAL: 2         # Validazione più frequente per monitorare
 
 JOINT_LOSS:
   COUNT_WEIGHT: 1.0
-  MASK_WEIGHT: 0.0             # Non modificare maschera in Stage 3
+  MASK_WEIGHT: 0.0
   USE_SOFT_MASK: true
-  SOFT_ALPHA: 0.2
+  
+  # Aumentiamo leggermente l'influenza dello ZIP 
+  # per contenere il rumore del P2R (era 0.2)
+  SOFT_ALPHA: 0.25        
+  
   FREEZE_ZIP_HEAD: true
   FREEZE_P2R_BACKBONE_ONLY: true
 
 # ============================================================
-# Data Augmentation
+# AUGMENTATION & LOGGING
 # ============================================================
 AUGMENTATION:
   TRAIN:
@@ -168,13 +143,9 @@ AUGMENTATION:
     GAUSSIAN_BLUR: true
     BLUR_PROB: 0.1
     BLUR_KERNEL: [3, 7]
-  
   VAL:
     RESIZE: false
 
-# ============================================================
-# Logging and Checkpoints
-# ============================================================
 LOGGING:
   LOG_INTERVAL: 50
   VAL_INTERVAL: 1
@@ -184,6 +155,5 @@ LOGGING:
 EXP:
   OUT_DIR: "exp"
 
-# Device
 DEVICE: "cuda"
 SEED: 42

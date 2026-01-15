@@ -546,7 +546,13 @@ def load_stage2_checkpoint(model, output_dir, device):
 # =============================================================================
 
 def main():
-    with open('config.yaml') as f:
+    import argparse
+    parser = argparse.ArgumentParser(description='Train Stage 3 Joint')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path al file di configurazione YAML')
+    args = parser.parse_args()
+    
+    with open(args.config) as f:
         config = yaml.safe_load(f)
     
     device = torch.device(config.get('DEVICE', 'cuda'))
@@ -769,20 +775,20 @@ def main():
         if epoch % val_interval == 0:
             val_results = validate(model, val_loader, device, default_down, soft_weight_alpha)
             
-            # Usa MAE raw come metrica principale (più affidabile)
+            # Usa MAE soft-weighted come metrica principale
             mae_raw = val_results['raw']['mae']
             mae_sw = val_results['soft_weighted']['mae']
             
-            improved = mae_raw < best_mae
+            improved = mae_sw < best_mae
             
             print(f"\nEpoch {epoch}:")
             print(f"   RAW:  MAE={mae_raw:.2f}, Bias={val_results['raw']['bias']:.3f}")
             print(f"   SW:   MAE={mae_sw:.2f}, Bias={val_results['soft_weighted']['bias']:.3f}")
             print(f"   Coverage: {val_results['coverage']:.1f}%")
-            print(f"   Best: {best_mae:.2f} {'✅ NEW!' if improved else ''}")
+            print(f"   Best SW: {best_mae:.2f} {'✅ NEW!' if improved else ''}")
             
             if improved:
-                best_mae = mae_raw
+                best_mae = mae_sw
                 no_improve = 0
                 save_checkpoint(model, optimizer, scheduler, epoch, val_results, best_mae, output_dir, is_best=True)
             else:
@@ -798,7 +804,7 @@ def main():
     print("\n" + "="*60)
     print("🏁 STAGE 3 V2 COMPLETATO")
     print("="*60)
-    print(f"   Best MAE (raw): {best_mae:.2f}")
+    print(f"   Best MAE (SW): {best_mae:.2f}")
     print(f"   Checkpoint: {output_dir}/stage3_best.pth")
     
     if best_mae < 70:

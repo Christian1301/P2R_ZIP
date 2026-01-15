@@ -71,18 +71,6 @@ ZIP_LOSS_V4:
   PI_THRESHOLD: 0.5            # Soglia per predizione binaria (per metriche)
 
 # ============================================================
-# STAGE 1 V3: ZIP Loss (LEGACY - non usato con V4)
-# ============================================================
-ZIP_LOSS_V3:
-  USE_FOCAL: false
-  FOCAL_GAMMA: 2.0
-  POS_WEIGHT: 5.0
-  OCCUPANCY_THRESHOLD: 0.5
-  WEIGHT_CLASSIFICATION: 1.0
-  WEIGHT_COUNT: 0.1
-  WEIGHT_LAMBDA_REG: 0.01
-
-# ============================================================
 # STAGE 2: P2R Training - PARAMETRI CRITICI
 # ============================================================
 OPTIM_P2R:

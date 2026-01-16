@@ -11,7 +11,7 @@ EXPERIMENT_DIR: "exp"
 # ============================================================
 DATASET:
   NAME: "jhu"
-  ROOT: "/mnt/localstorage/cromano/Datasets/jhu_crowd_v2"
+  ROOT: "/home/C.ROMANO50/datasets/content/JHU"
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
 
@@ -41,26 +41,27 @@ ZIP_HEAD:
 # ============================================================
 # STAGE 1 & 2 (Standard per compatibilità)
 # ============================================================
+# ============================================================
+# STAGE 1 - OTTIMIZZATO PER JHU (più conservativo)
+# ============================================================
 OPTIM_ZIP:
-  EPOCHS: 2000
-  BATCH_SIZE: 6
-  LR: 8.0e-5
-  LR_BACKBONE: 4.0e-5
-  HEAD_LR: 8.0e-5
-  WEIGHT_DECAY: 3.0e-5
-  WARMUP_EPOCHS: 100
-  EARLY_STOPPING_PATIENCE: 500
-  GRAD_CLIP: 1.0
-  VAL_INTERVAL: 5
+  EPOCHS: 3000           # Più epoche per dataset complesso
+  BATCH_SIZE: 8          # Batch più grande se possibile
+  LR: 3.0e-5             # LR più basso per stabilità
+  LR_BACKBONE: 1.0e-5    # Backbone ancora più lento
+  HEAD_LR: 5.0e-5        # Head può imparare più veloce
+  WEIGHT_DECAY: 1.0e-4   # Più regularizzazione
+  WARMUP_EPOCHS: 150     # Warmup più lungo
+  EARLY_STOPPING_PATIENCE: 800  # Più pazienza
+  GRAD_CLIP: 0.5         # Clip più aggressivo
+  VAL_INTERVAL: 10
   NUM_WORKERS: 4
 
 ZIP_LOSS_V4:
   WEIGHT_NLL: 1.0
-  WEIGHT_LAMBDA_REG: 0.01
-  WEIGHT_PI_ENTROPY: 0.0
-  LAMBDA_MAX_TARGET: 8.0
-  OCCUPANCY_THRESHOLD: 0.5
-  PI_THRESHOLD: 0.5
+  WEIGHT_LAMBDA_REG: 0.005   # Meno regolarizzazione su λ
+  LAMBDA_MAX_TARGET: 10.0    # JHU ha celle molto dense
+  PI_THRESHOLD: 0.3          # Threshold più basso per recall
 
 OPTIM_P2R:
   EPOCHS: 3500

@@ -1,6 +1,6 @@
 # ============================================================
-# CONFIG SHHB - FINETUNING MODE
-# Obiettivo: Affinare il modello su ShanghaiTech B (Low LR)
+# CONFIG SHHB - RESCUE MODE (STAGE 3 OPTIMIZATION)
+# Obiettivo: Preservare MAE Stage 2 e correggere solo lo Scale
 # ============================================================
 
 RUN_NAME: "shhab"
@@ -10,7 +10,7 @@ EXPERIMENT_DIR: "exp"
 # DATASET
 # ============================================================
 DATASET:
-  NAME: "shhb"   # Importante: cambia il nome per il DataLoader
+  NAME: "shhb"   # Dataset ShanghaiTech Part B
   ROOT: "/home/C.ROMANO50/datasets/content/ShangaiTech-B"
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
@@ -22,13 +22,14 @@ MODEL:
   BACKBONE: "vgg16_bn"
   BACKBONE_PRETRAINED: true
   
-  # Sblocchiamo tutto per il finetuning fine
+  # Per Stage 3, il backbone viene congelato via codice, 
+  # ma lasciamo false qui per flessibilità di caricamento
   FREEZE_BACKBONE_STAGE1: false
   FREEZE_BACKBONE_STAGE2: false
   FREEZE_BACKBONE_STAGE3: false
   
   ZIP_HIDDEN_DIM: 256
-  ZIP_PI_THRESH: 0.2
+  ZIP_PI_THRESH: 0.2    # <--- LASCIATO A 0.2 (OK per SHHB)
   
   P2R_FEA_CHANNEL: 256
   P2R_OUT_STRIDE: 16
@@ -39,7 +40,7 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
 
 # ============================================================
-# STAGE 1 & 2 (Standard per compatibilità caricamento)
+# STAGE 1 & 2 (Configurazioni standard preservate)
 # ============================================================
 OPTIM_ZIP:
   EPOCHS: 3000
@@ -92,32 +93,32 @@ P2R_LOSS:
   LOG_SCALE_LR_MULT: 0.1
 
 # ============================================================
-# STAGE 3: Joint Training - FINETUNING CONFIGURATION
+# STAGE 3: Joint Training - PARAMETRI CRITICI MODIFICATI
 # ============================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 8  # SHHB ha immagini grandi, se va in OOM metti 4
+  BATCH_SIZE: 8
   EPOCHS: 2000
   
-  # --- LEARNING RATES PER FINETUNING ---
-  LR_BACKBONE: 1.0e-6
-  LR_ZIP_HEAD: 5.0e-7
-  LR_P2R_HEAD: 1.0e-6
-  # -------------------------------------
+  # LR di base (sovrascritti da STAGE3_FUSION sotto)
+  LR_BACKBONE: 0.0 
+  LR_ZIP_HEAD: 0.0
+  LR_P2R_HEAD: 1.0e-7
 
   WEIGHT_DECAY: 1.0e-4
   EARLY_STOPPING_PATIENCE: 1000
   GRAD_CLIP: 0.5
-  
   WARMUP_EPOCHS: 0
   VAL_INTERVAL: 2
 
-# Configurazione specifica per lo script Fusion
+# --- CONFIGURAZIONE SPECIFICA FUSION ---
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.3
-  ALPHA_WARMUP: 50
-  LR_P2R: 1.0e-5
-  LR_SCALE: 1.0e-3
+  ALPHA_END: 0.1       # <--- MODIFICA: Abbassato da 0.3 (ZIP incide solo al 10%)
+  ALPHA_WARMUP: 20
+  
+  LR_P2R: 1.0e-7       # <--- MODIFICA: Abbassato drasticamente (Congela i pesi P2R buoni)
+  LR_SCALE: 1.0e-2     # <--- MODIFICA: Alzato x10 (Per adattare velocemente il volume)
+  
   SPATIAL_WEIGHT: 0.05
   EPOCHS: 300
   PATIENCE: 80
@@ -126,7 +127,7 @@ JOINT_LOSS:
   COUNT_WEIGHT: 1.0
   MASK_WEIGHT: 0.0
   USE_SOFT_MASK: true
-  SOFT_ALPHA: 0.25
+  SOFT_ALPHA: 0.1      # <--- MODIFICA: Allineato con ALPHA_END (Prima era 0.25)
   FREEZE_ZIP_HEAD: true
   FREEZE_P2R_BACKBONE_ONLY: true
 
@@ -136,9 +137,7 @@ JOINT_LOSS:
 AUGMENTATION:
   TRAIN:
     RANDOM_CROP: true
-    # SHHB ha immagini 768x1024. 
-    # Crop 384 va bene, 512 catturerebbe più contesto ma pesa in memoria.
-    CROP_SIZE: [384, 384] 
+    CROP_SIZE: [512, 512]  # <--- MODIFICA: Aumentato per catturare più contesto su SHHB
     HORIZONTAL_FLIP: true
     FLIP_PROB: 0.5
     COLOR_JITTER: true
@@ -152,7 +151,7 @@ AUGMENTATION:
     BLUR_PROB: 0.1
     BLUR_KERNEL: [3, 7]
   VAL:
-    RESIZE: false  # Fondamentale: SHHB si valida a risoluzione piena
+    RESIZE: false  # Validazione a risoluzione piena
 
 # ============================================================
 # Logging

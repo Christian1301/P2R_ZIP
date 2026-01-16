@@ -23,33 +23,33 @@ nvidia-smi
 #!/bin/bash
 set -e  
 #rm -rf logs
-mkdir -p logsb
+mkdir -p logs_jhu
 
-CONFIG="config_shhb.yaml"
+CONFIG="config_jhu.yaml"
 echo "📋 Usando configurazione: $CONFIG"
 
 echo "🚀 Avvio Stage 1 (ZIP)..."
-#python3 train_stage1_zip.py --config $CONFIG > logsb/stage1.log 2>&1
+python3 train_stage1_zip.py --config $CONFIG > logs_jhu/stage1.log 2>&1
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
-#python3 train_stage2_p2r.py --config $CONFIG > logsb/stage2.log 2>&1
+python3 train_stage2_p2r.py --config $CONFIG > logs_jhu/stage2.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python3 train_stage3_joint.py --config $CONFIG > logsb/stage3.log 2>&1
+python3 train_stage3_joint.py --config $CONFIG > logs_jhu/stage3.log 2>&1
 echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."
 
-python3 evaluate_stage1.py --config $CONFIG > logsb/ev_stage1.log 2>&1
+python3 evaluate_stage1.py --config $CONFIG > logs_jhu/ev_stage1.log 2>&1
 echo "✅ Valutazione 1 completata!"
 
-python3 evaluate_stage2.py --config $CONFIG > logsb/ev_stage2.log 2>&1
+python3 evaluate_stage2.py --config $CONFIG > logs_jhu/ev_stage2.log 2>&1
 echo "✅ Valutazione 2 completata!"
 
-python evaluate_stage3.py --tta --tta-flip-only --config $CONFIG > logsb/ev_stage3.log 2>&1
+python evaluate_stage3.py --tta --tta-flip-only --config $CONFIG > logs_jhu/ev_stage3.log 2>&1
 echo "✅ Valutazione 3 completata!"
 
-python3 visualize_gating.py --config $CONFIG > logsb/visualize_gating.log 2>&1
+python3 visualize_gating.py --config $CONFIG > logs_jhu/visualize_gating.log 2>&1
 echo "✅ Visualizzazione completata!"

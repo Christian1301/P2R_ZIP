@@ -67,21 +67,53 @@ def draw_grid(img: np.ndarray, block_size: int, color=(0, 255, 255), thickness=1
 # =============================================================================
 
 def get_model(config: dict, device: torch.device) -> P2R_ZIP_Model:
-    dataset_name = config["DATASET"]
-    # Fallback per la chiave bins
-    dataset_key = 'shha' if 'shanghai' in dataset_name.lower() and 'a' in dataset_name.lower() else 'shhb'
-    if 'qnrf' in dataset_name.lower(): dataset_key = 'qnrf'
-    if 'nwpu' in dataset_name.lower(): dataset_key = 'nwpu'
-    if 'jhu' in dataset_name.lower(): dataset_key = 'jhu'
+    # Gestione robusta DATASET (può essere stringa o dict)
+    dataset_section = config.get("DATASET", "shha")
+    if isinstance(dataset_section, dict):
+        dataset_name = dataset_section.get("NAME", "shha")
+    else:
+        dataset_name = dataset_section
+    
+    # Normalizza nome dataset
+    alias_map = {
+        'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
+        'shhb': 'shhb', 'shanghaitechpartb': 'shhb',
+        'ucf': 'ucf', 'ucfqnrf': 'ucf', 'qnrf': 'ucf',
+        'nwpu': 'nwpu', 'jhu': 'jhu'
+    }
+    normalized = ''.join(ch for ch in str(dataset_name).lower() if ch.isalnum())
+    dataset_key = alias_map.get(normalized, 'shha')
+
+    # Default bins per dataset
+    DEFAULT_BINS = {
+        'shha': {
+            'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
+            'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
+        },
+        'shhb': {
+            'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
+            'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
+        },
+        'ucf': {
+            'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+            'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+        },
+        'nwpu': {
+            'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+            'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+        },
+        'jhu': {
+            'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+            'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+        },
+    }
 
     bin_cfg = config.get("BINS_CONFIG", {}).get(dataset_key)
     if not bin_cfg:
-        # Default bins se non trovati nel config
-        print(f"⚠️ Bins non trovati per {dataset_name}, uso default SHHA")
-        bins = [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]]
-        bin_centers = [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0]
-    else:
-        bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
+        bin_cfg = DEFAULT_BINS.get(dataset_key, DEFAULT_BINS['shha'])
+        print(f"ℹ️ Usando bins di default per {dataset_key}")
+    
+    bins, bin_centers = bin_cfg["bins"], bin_cfg["bin_centers"]
 
     model = P2R_ZIP_Model(
         backbone_name=config["MODEL"]["BACKBONE"],
@@ -97,7 +129,7 @@ def load_checkpoint(model: nn.Module, path: str, device: torch.device):
         raise FileNotFoundError(f"Checkpoint non trovato: {path}")
     
     print(f"📥 Caricamento pesi da: {path}")
-    state = torch.load(path, map_location=device)
+    state = torch.load(path, map_location=device, weights_only=False)
     
     # Gestione scale_comp per Stage 3
     scale_val = 1.0
@@ -130,9 +162,31 @@ def visualize_sample(
 ):
     img_tensor = sample['image'].to(device).unsqueeze(0)
     gt_points = sample['points']
-    gt_count = len(gt_points)
     
-    # 1. Forward Pass
+    # =====================================================
+    # 1. FIX: Calcolo GT Count Robusto (Lista vs Mappa)
+    # =====================================================
+    gt_count = 0.0
+    if isinstance(gt_points, (list, np.ndarray)):
+        # Caso: Lista di punti [(x,y), ...]
+        gt_count = float(len(gt_points))
+    elif isinstance(gt_points, torch.Tensor):
+        if gt_points.dim() == 2 and gt_points.shape[1] == 2:
+            # Caso: Tensore coordinate [N, 2]
+            gt_count = float(gt_points.shape[0])
+        elif gt_points.dim() >= 2:
+            # Caso: Density Map [1, H, W] o [H, W] -> SI SOMMANO I PIXEL
+            gt_count = gt_points.sum().item()
+        else:
+            # Fallback
+            gt_count = gt_points.item() if gt_points.numel() == 1 else float(gt_points.shape[0])
+            
+    print(f"\n🔢 VERIFICA CONTEGGIO REALE (GT): {gt_count:.2f}")
+    print(f"   Tipo dati points: {type(gt_points)}")
+    if isinstance(gt_points, torch.Tensor):
+        print(f"   Shape points: {gt_points.shape}")
+    
+    # Forward Pass
     with torch.no_grad():
         outputs = model(img_tensor)
         
@@ -212,8 +266,15 @@ def visualize_sample(
     # Riga 1: Input e Analisi ZIP
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.imshow(cv2.cvtColor(img_grid, cv2.COLOR_BGR2RGB))
-    ax1.set_title(f"Input + Griglia Patch ({args.block_size}px)\nGT Count: {gt_count}")
+    ax1.set_title(f"Input + Griglia Patch ({args.block_size}px)")
     ax1.axis('off')
+    
+    # SCRITTA SOTTO L'IMMAGINE
+    ax1.text(0.5, -0.1, f"Persone Reali (GT): {gt_count:.1f}", 
+             transform=ax1.transAxes, 
+             ha='center', va='top', 
+             fontsize=14, color='black', fontweight='bold', 
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
     
     ax2 = fig.add_subplot(gs[0, 1])
     im2 = ax2.imshow(map_pi, cmap='viridis', vmin=0, vmax=1)
@@ -303,7 +364,7 @@ if __name__ == "__main__":
     # Risoluzione Checkpoint
     ckpt_path = args.checkpoint
     if ckpt_path is None:
-        base_dir = Path(config["EXP"]["OUT_DIR"]) / config["RUN_NAME"]
+        base_dir = Path(config.get("EXP", {}).get("OUT_DIR", "exp")) / config.get("RUN_NAME", "run")
         ckpt_name = DEFAULT_STAGE_FILES.get(args.stage, "stage3_fusion_best.pth")
         ckpt_path = base_dir / ckpt_name
     
@@ -311,10 +372,38 @@ if __name__ == "__main__":
     model = get_model(config, device)
     learned_scale = load_checkpoint(model, str(ckpt_path), device)
     
+    # Gestione robusta config DATA/DATASET
+    dataset_section = config.get('DATASET', 'shha')
+    data_section = config.get('DATA')
+
+    if isinstance(dataset_section, dict):
+        dataset_name_raw = dataset_section.get('NAME', 'shha')
+        data_cfg = {}
+        if isinstance(data_section, dict):
+            data_cfg.update(data_section)
+        data_cfg.update(dataset_section)
+    else:
+        dataset_name_raw = dataset_section
+        data_cfg = data_section.copy() if isinstance(data_section, dict) else {}
+
+    # Normalizza nome dataset
+    alias_map = {
+        'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
+        'shhb': 'shhb', 'shanghaitechpartb': 'shhb',
+        'ucf': 'ucf', 'ucfqnrf': 'ucf',
+        'nwpu': 'nwpu', 'jhu': 'jhu'
+    }
+    normalized = ''.join(ch for ch in str(dataset_name_raw).lower() if ch.isalnum())
+    dataset_name = alias_map.get(normalized, str(dataset_name_raw).lower())
+
+    if 'NORM_MEAN' not in data_cfg:
+        data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
+    if 'NORM_STD' not in data_cfg:
+        data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
+
     # Dataset Validazione
-    data_cfg = config["DATA"]
     val_trans = build_transforms(data_cfg, is_train=False)
-    DatasetClass = get_dataset(config["DATASET"])
+    DatasetClass = get_dataset(dataset_name)
     
     val_ds = DatasetClass(
         root=data_cfg["ROOT"],
@@ -329,7 +418,7 @@ if __name__ == "__main__":
     else:
         idx = random.randint(0, len(val_ds)-1)
     
-    print(f"🖼️ Visualizzazione immagine #{idx} dal dataset {config['DATASET']}")
+    print(f"🖼️ Visualizzazione immagine #{idx} dal dataset {dataset_name}")
     sample = val_ds[idx]
     # Gestione formato dataset (alcuni tornano tuple, altri dict)
     if isinstance(sample, tuple):

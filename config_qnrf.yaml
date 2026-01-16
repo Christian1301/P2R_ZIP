@@ -10,8 +10,8 @@ EXPERIMENT_DIR: "exp"
 # DATASET
 # ============================================================
 DATASET:
-  NAME: "qnrf"
-  ROOT: "/mnt/localstorage/cromano/Datasets/UCF_QNRF"
+  NAME: "ucf"
+  ROOT: "/home/C.ROMANO50/datasets/content/UCF_QNRF"
   BLOCK_SIZE: 16
   NUM_WORKERS: 4
 

@@ -4,18 +4,22 @@
 Evaluation Stage 1 - ZIP Pre-training
 
 METRICHE CALCOLATE:
-1. Loss (BCE)
+1. Loss (NLL o BCE)
 2. Accuracy: (TP + TN) / (TP + TN + FP + FN)
 3. Precision: TP / (TP + FP)
 4. Recall: TP / (TP + FN)
 5. F1-Score: 2 * (Precision * Recall) / (Precision + Recall)
 6. Coverage: % blocchi predetti come "pieni"
 
-dove:
-- TP: True Positives (blocchi pieni correttamente identificati)
-- TN: True Negatives (blocchi vuoti correttamente identificati)
-- FP: False Positives (blocchi vuoti predetti come pieni)
-- FN: False Negatives (blocchi pieni predetti come vuoti)
+USO:
+    # Valuta su val set (default)
+    python evaluate_stage1.py --config config_jhu.yaml
+    
+    # Valuta su test set
+    python evaluate_stage1.py --config config_jhu.yaml --split test
+    
+    # Salva risultati in JSON
+    python evaluate_stage1.py --config config_jhu.yaml --split test --save-results
 """
 
 import torch
@@ -27,6 +31,8 @@ import yaml
 import os
 import numpy as np
 import json
+import argparse
+from datetime import datetime
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -65,62 +71,39 @@ DATASET_ALIAS_MAP = {
 }
 
 
-
-# =============================================================================
-# LOSS (STESSA DEL TRAINING)
-# =============================================================================
-
-class PiHeadLoss(nn.Module):
-    """BCE Loss per π-head."""
-    def __init__(self, pos_weight=5.0, block_size=16):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.block_size = block_size
-        self.bce = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight]),
-            reduction='mean'
-        )
-    
-    def compute_gt_occupancy(self, gt_density):
-        gt_counts_per_block = F.avg_pool2d(
-            gt_density,
-            kernel_size=self.block_size,
-            stride=self.block_size
-        ) * (self.block_size ** 2)
-        return (gt_counts_per_block > 1e-3).float()
-    
-    def forward(self, predictions, gt_density):
-        logit_pi_maps = predictions["logit_pi_maps"]
-        logit_pieno = logit_pi_maps[:, 1:2, :, :] 
-        gt_occupancy = self.compute_gt_occupancy(gt_density)
-        
-        if gt_occupancy.shape[-2:] != logit_pieno.shape[-2:]:
-            gt_occupancy = F.interpolate(
-                gt_occupancy, size=logit_pieno.shape[-2:], mode='nearest'
-            )
-        
-        if self.bce.pos_weight.device != logit_pieno.device:
-            self.bce.pos_weight = self.bce.pos_weight.to(logit_pieno.device)
-            
-        loss = self.bce(logit_pieno, gt_occupancy)
-        return loss
-
-
 # =============================================================================
 # VALIDATION CON METRICHE COMPLETE
 # =============================================================================
 
+def resize_if_needed(images, max_size=2048):
+    """Ridimensiona immagini se troppo grandi per evitare OOM."""
+    _, _, H, W = images.shape
+    max_dim = max(H, W)
+    
+    if max_dim > max_size:
+        scale = max_size / max_dim
+        new_H = int(H * scale)
+        new_W = int(W * scale)
+        # Arrotonda a multiplo di 32
+        new_H = (new_H // 32) * 32
+        new_W = (new_W // 32) * 32
+        images = F.interpolate(images, size=(new_H, new_W), mode='bilinear', align_corners=False)
+        return images, scale
+    return images, 1.0
+
+
 @torch.no_grad()
-def validate_with_metrics(model, criterion, dataloader, device, config):
+def validate_with_metrics(model, dataloader, device, block_size, pi_threshold=0.5, max_size=2048):
     """
     Validazione Stage 1 con metriche dettagliate.
+    
+    Args:
+        max_size: dimensione massima per lato (evita OOM su immagini grandi)
     
     Returns:
         dict con tutte le metriche
     """
     model.eval()
-    
-    total_loss = 0.0
     
     # Confusion Matrix
     total_tp = 0  # True Positives
@@ -128,30 +111,43 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
     total_fp = 0  # False Positives
     total_fn = 0  # False Negatives
     
-    # Statistiche π
+    # Statistiche π e λ
     pi_mean_list = []
     pi_std_list = []
+    lambda_mean_list = []
+    lambda_max_list = []
     coverage_list = []
     
-    # Per MAE indicativo (non affidabile in Stage 1)
+    # Per MAE indicativo (usando π·λ)
     total_mae = 0.0
     total_pred_count = 0.0
     total_gt_count = 0.0
     n_samples = 0
     
-    block_size = config.get('DATA', config.get('DATASET', {})).get('ZIP_BLOCK_SIZE', config.get('DATA', config.get('DATASET', {})).get('BLOCK_SIZE', 16))
+    all_gt_counts = []
+    all_pred_counts = []
     
-    for images, gt_density, points in tqdm(dataloader, desc="Validate Stage1"):
+    for images, gt_density, points in tqdm(dataloader, desc="Evaluating Stage 1"):
         images, gt_density = images.to(device), gt_density.to(device)
+        
+        # Ridimensiona se troppo grande
+        images, scale = resize_if_needed(images, max_size)
+        if scale != 1.0:
+            gt_density = F.interpolate(gt_density, size=images.shape[-2:], mode='bilinear', align_corners=False)
         
         # Forward
         preds = model(images)
-        loss = criterion(preds, gt_density)
-        total_loss += loss.item()
         
         # π predictions
-        pi_logits = preds["logit_pi_maps"]  # [B, 2, Hb, Wb]
-        pi_probs = torch.sigmoid(pi_logits[:, 1:2])  # Prob "pieno"
+        pi_probs = preds.get('pi_probs')
+        if pi_probs is None:
+            pi_logits = preds.get("logit_pi_maps")
+            if pi_logits is not None:
+                pi_probs = torch.sigmoid(pi_logits[:, 1:2])
+            else:
+                raise KeyError("No pi_probs or logit_pi_maps in model output")
+        
+        lambda_maps = preds.get('lambda_maps')
         
         # Ground truth occupancy
         gt_counts_per_block = F.avg_pool2d(
@@ -169,8 +165,8 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
                 mode='nearest'
             )
         
-        # Predizioni binarie (threshold 0.5)
-        pred_occupancy = (pi_probs > 0.5).float()
+        # Predizioni binarie
+        pred_occupancy = (pi_probs > pi_threshold).float()
         
         # Confusion matrix per batch
         tp = ((pred_occupancy == 1) & (gt_occupancy == 1)).sum().item()
@@ -186,10 +182,14 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
         # Statistiche π
         pi_mean_list.append(pi_probs.mean().item())
         pi_std_list.append(pi_probs.std().item())
-        coverage_list.append((pi_probs > 0.5).float().mean().item() * 100)
+        coverage_list.append((pi_probs > pi_threshold).float().mean().item() * 100)
+        
+        # Statistiche λ
+        if lambda_maps is not None:
+            lambda_mean_list.append(lambda_maps.mean().item())
+            lambda_max_list.append(lambda_maps.max().item())
         
         # MAE indicativo (usando λ maps)
-        lambda_maps = preds.get("lambda_maps")
         if lambda_maps is not None:
             pred_count_map = pi_probs * lambda_maps
             
@@ -201,13 +201,13 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
                 total_pred_count += pred
                 total_gt_count += gt
                 n_samples += 1
+                
+                all_gt_counts.append(gt)
+                all_pred_counts.append(pred)
     
     # =========================================================================
     # CALCOLA METRICHE AGGREGATE
     # =========================================================================
-    
-    n_batches = len(dataloader)
-    avg_loss = total_loss / n_batches
     
     # Classification metrics
     total_samples = total_tp + total_tn + total_fp + total_fn
@@ -222,90 +222,19 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
     avg_pi_std = np.mean(pi_std_list)
     avg_coverage = np.mean(coverage_list)
     
+    # λ statistics
+    avg_lambda_mean = np.mean(lambda_mean_list) if lambda_mean_list else 0
+    avg_lambda_max = np.mean(lambda_max_list) if lambda_max_list else 0
+    
     # MAE (solo indicativo)
     mae = total_mae / n_samples if n_samples > 0 else 0
     bias = total_pred_count / total_gt_count if total_gt_count > 0 else 0
     
-    # =========================================================================
-    # REPORT DETTAGLIATO
-    # =========================================================================
-    
-    print("\n" + "="*70)
-    print("📊 STAGE 1 VALIDATION RESULTS")
-    print("="*70)
-    
-    print(f"\n🔢 Confusion Matrix:")
-    print(f"   True Positives (TP):   {total_tp:,}")
-    print(f"   True Negatives (TN):   {total_tn:,}")
-    print(f"   False Positives (FP):  {total_fp:,}")
-    print(f"   False Negatives (FN):  {total_fn:,}")
-    print(f"   Total blocks:          {total_samples:,}")
-    
-    print(f"\n📈 Classification Metrics:")
-    print(f"   Accuracy:  {accuracy*100:.2f}%")
-    print(f"   Precision: {precision*100:.2f}%")
-    print(f"   Recall:    {recall*100:.2f}%")
-    print(f"   F1-Score:  {f1_score*100:.2f}%")
-    
-    print(f"\n🎯 π-Head Statistics:")
-    print(f"   Loss (BCE):      {avg_loss:.4f}")
-    print(f"   π Mean:          {avg_pi_mean:.3f}")
-    print(f"   π Std:           {avg_pi_std:.3f}")
-    print(f"   Coverage:        {avg_coverage:.1f}%")
-    
-    print(f"\n📊 Count Metrics (Indicativo):")
-    print(f"   MAE (π·λ):       {mae:.2f}")
-    print(f"   Bias:            {bias:.3f}")
-    print(f"   ⚠️  Non affidabile in Stage 1 - solo per monitoring")
-    
-    print("\n" + "="*70)
-    
-    # =========================================================================
-    # INTERPRETAZIONE
-    # =========================================================================
-    
-    print("\n💡 Interpretazione:")
-    
-    if recall < 0.85:
-        print(f"   ⚠️  Recall basso ({recall*100:.1f}%)")
-        print(f"       → Il modello perde troppi blocchi con persone (FN alto)")
-        print(f"       → Soluzione: aumentare pos_weight in BCE")
-    elif recall > 0.95:
-        print(f"   ✅ Recall alto ({recall*100:.1f}%)")
-        print(f"       → Buona copertura dei blocchi occupati")
-    
-    if precision < 0.70:
-        print(f"   ⚠️  Precision bassa ({precision*100:.1f}%)")
-        print(f"       → Troppi falsi positivi (FP alto)")
-        print(f"       → Il modello predice persone dove non ci sono")
-    elif precision > 0.85:
-        print(f"   ✅ Precision alta ({precision*100:.1f}%)")
-        print(f"       → Poche false detection")
-    
-    if f1_score > 0.80:
-        print(f"   🎯 F1-Score alto ({f1_score*100:.1f}%)")
-        print(f"       → Buon bilanciamento precision/recall")
-    elif f1_score < 0.70:
-        print(f"   ⚠️  F1-Score basso ({f1_score*100:.1f}%)")
-        print(f"       → Sbilanciamento tra precision e recall")
-    
-    if avg_coverage < 10:
-        print(f"   ⚠️  Coverage molto bassa ({avg_coverage:.1f}%)")
-        print(f"       → Il modello è troppo conservativo")
-    elif avg_coverage > 40:
-        print(f"   ⚠️  Coverage molto alta ({avg_coverage:.1f}%)")
-        print(f"       → Il modello è troppo aggressivo")
-    else:
-        print(f"   ✅ Coverage ragionevole ({avg_coverage:.1f}%)")
-    
-    print("\n" + "="*70)
-    
-    # =========================================================================
-    # RETURN RESULTS
-    # =========================================================================
+    # Count statistics
+    all_gt_counts = np.array(all_gt_counts)
+    all_pred_counts = np.array(all_pred_counts)
     
     return {
-        'loss': avg_loss,
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
@@ -315,17 +244,106 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
             'tn': total_tn,
             'fp': total_fp,
             'fn': total_fn,
+            'total': total_samples,
         },
         'pi_stats': {
             'mean': avg_pi_mean,
             'std': avg_pi_std,
             'coverage': avg_coverage,
         },
+        'lambda_stats': {
+            'mean': avg_lambda_mean,
+            'max': avg_lambda_max,
+        },
         'count_metrics': {
             'mae': mae,
             'bias': bias,
-        }
+            'gt_total': int(total_gt_count),
+            'pred_total': float(total_pred_count),
+            'gt_mean': float(np.mean(all_gt_counts)) if len(all_gt_counts) > 0 else 0,
+            'pred_mean': float(np.mean(all_pred_counts)) if len(all_pred_counts) > 0 else 0,
+        },
+        'num_images': n_samples,
     }
+
+
+def print_results(results, split):
+    """Stampa risultati in formato leggibile."""
+    
+    print("\n" + "="*70)
+    print(f"📊 STAGE 1 EVALUATION RESULTS - {split.upper()} SET")
+    print("="*70)
+    
+    print(f"\n🔢 Confusion Matrix:")
+    cm = results['confusion_matrix']
+    print(f"   True Positives (TP):   {cm['tp']:,}")
+    print(f"   True Negatives (TN):   {cm['tn']:,}")
+    print(f"   False Positives (FP):  {cm['fp']:,}")
+    print(f"   False Negatives (FN):  {cm['fn']:,}")
+    print(f"   Total blocks:          {cm['total']:,}")
+    
+    print(f"\n📈 Classification Metrics:")
+    print(f"   Accuracy:  {results['accuracy']*100:.2f}%")
+    print(f"   Precision: {results['precision']*100:.2f}%")
+    print(f"   Recall:    {results['recall']*100:.2f}%")
+    print(f"   F1-Score:  {results['f1_score']*100:.2f}%")
+    
+    print(f"\n🎯 π-Head Statistics:")
+    pi = results['pi_stats']
+    print(f"   π Mean:     {pi['mean']:.3f}")
+    print(f"   π Std:      {pi['std']:.3f}")
+    print(f"   Coverage:   {pi['coverage']:.1f}%")
+    
+    print(f"\n📊 λ-Head Statistics:")
+    lam = results['lambda_stats']
+    print(f"   λ Mean:     {lam['mean']:.3f}")
+    print(f"   λ Max:      {lam['max']:.3f}")
+    
+    print(f"\n📊 Count Metrics (Indicativo - π·λ):")
+    cnt = results['count_metrics']
+    print(f"   MAE:        {cnt['mae']:.2f}")
+    print(f"   Bias:       {cnt['bias']:.3f}")
+    print(f"   GT Total:   {cnt['gt_total']:,}")
+    print(f"   Pred Total: {cnt['pred_total']:,.0f}")
+    print(f"   GT Mean:    {cnt['gt_mean']:.1f}")
+    print(f"   Pred Mean:  {cnt['pred_mean']:.1f}")
+    
+    print(f"\n📁 Images evaluated: {results['num_images']}")
+    
+    # =========================================================================
+    # INTERPRETAZIONE
+    # =========================================================================
+    
+    print("\n" + "-"*70)
+    print("💡 Interpretazione:")
+    
+    if results['recall'] < 0.85:
+        print(f"   ⚠️  Recall basso ({results['recall']*100:.1f}%)")
+        print(f"       → Il modello perde troppi blocchi con persone (FN alto)")
+    elif results['recall'] > 0.90:
+        print(f"   ✅ Recall alto ({results['recall']*100:.1f}%)")
+        print(f"       → Buona copertura dei blocchi occupati")
+    
+    if results['precision'] < 0.70:
+        print(f"   ⚠️  Precision bassa ({results['precision']*100:.1f}%)")
+        print(f"       → Troppi falsi positivi (FP alto)")
+    elif results['precision'] > 0.85:
+        print(f"   ✅ Precision alta ({results['precision']*100:.1f}%)")
+        print(f"       → Poche false detection")
+    
+    if results['f1_score'] > 0.80:
+        print(f"   🎯 F1-Score alto ({results['f1_score']*100:.1f}%)")
+    elif results['f1_score'] < 0.70:
+        print(f"   ⚠️  F1-Score basso ({results['f1_score']*100:.1f}%)")
+    
+    if pi['coverage'] < 10:
+        print(f"   ⚠️  Coverage molto bassa ({pi['coverage']:.1f}%)")
+    elif pi['coverage'] > 40:
+        print(f"   ⚠️  Coverage molto alta ({pi['coverage']:.1f}%)")
+    else:
+        print(f"   ✅ Coverage ragionevole ({pi['coverage']:.1f}%)")
+    
+    print("="*70)
 
 
 # =============================================================================
@@ -333,10 +351,21 @@ def validate_with_metrics(model, criterion, dataloader, device, config):
 # =============================================================================
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description='Evaluate Stage 1 ZIP')
     parser.add_argument('--config', type=str, default='config.yaml',
                         help='Path al file di configurazione YAML')
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'],
+                        help='Split da usare (val o test)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path checkpoint (default: cerca automaticamente)')
+    parser.add_argument('--pi-threshold', type=float, default=0.5,
+                        help='Threshold per π (default: 0.5)')
+    parser.add_argument('--max-size', type=int, default=2048,
+                        help='Max image size per side to avoid OOM (default: 2048)')
+    parser.add_argument('--save-results', action='store_true',
+                        help='Salva risultati in JSON')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Path output JSON')
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
@@ -349,11 +378,12 @@ def main():
     device = torch.device(config['DEVICE'])
     init_seeds(config['SEED'])
 
-    print("="*60)
-    print("🔍 EVALUATION STAGE 1 - ZIP Pre-training")
-    print("="*60)
+    print("="*70)
+    print(f"🔍 EVALUATION STAGE 1 - ZIP Pre-training ({args.split.upper()} SET)")
+    print("="*70)
     print(f"Device: {device}")
-    print("="*60)
+    print(f"π threshold: {args.pi_threshold}")
+    print("="*70)
 
     # Setup Modello - gestione robusta config
     dataset_section = config.get('DATASET', {})
@@ -362,7 +392,7 @@ def main():
     # Estrai nome dataset
     if isinstance(dataset_section, dict):
         dataset_name_raw = dataset_section.get('NAME', 'shha')
-        data_cfg = dict(dataset_section)  # Usa DATASET come DATA
+        data_cfg = dict(dataset_section)
         if isinstance(data_section, dict):
             data_cfg.update(data_section)
     else:
@@ -389,17 +419,14 @@ def main():
         data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
     if 'NORM_STD' not in data_cfg:
         data_cfg['NORM_STD'] = [0.229, 0.224, 0.225]
-    if 'ZIP_BLOCK_SIZE' not in data_cfg:
-        data_cfg['ZIP_BLOCK_SIZE'] = data_cfg.get('BLOCK_SIZE', 16)
-    if 'VAL_SPLIT' not in data_cfg:
-        data_cfg['VAL_SPLIT'] = 'val'
+    
+    block_size = data_cfg.get('ZIP_BLOCK_SIZE', data_cfg.get('BLOCK_SIZE', 16))
 
     zip_head_cfg = config.get("ZIP_HEAD", {})
     zip_head_kwargs = {
-        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 0.5),
+        "lambda_scale": zip_head_cfg.get("LAMBDA_SCALE", 1.2),
         "lambda_max": zip_head_cfg.get("LAMBDA_MAX", 8.0),
         "use_softplus": zip_head_cfg.get("USE_SOFTPLUS", True),
-        "lambda_noise_std": zip_head_cfg.get("LAMBDA_NOISE_STD", 0.0),
     }
 
     model_cfg = config.get('MODEL', {})
@@ -420,10 +447,13 @@ def main():
         config.get('RUN_NAME', 'stage1')
     )
     
-    # Cerca checkpoint
-    checkpoint_path = os.path.join(output_dir, "best_model.pth")
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = os.path.join(output_dir, "last.pth")
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+    else:
+        # Cerca checkpoint
+        checkpoint_path = os.path.join(output_dir, "best_model.pth")
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = os.path.join(output_dir, "last.pth")
 
     if not os.path.isfile(checkpoint_path):
         print(f"❌ Nessun checkpoint trovato in {output_dir}")
@@ -433,71 +463,94 @@ def main():
     raw_state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = raw_state.get('model', raw_state)
     model.load_state_dict(state_dict, strict=False)
-
-    # Setup Loss
-    pos_weight = config.get("ZIP_LOSS", {}).get("POS_WEIGHT_BCE", 5.0)
-    criterion = PiHeadLoss(
-        pos_weight=pos_weight,
-        block_size=data_cfg['ZIP_BLOCK_SIZE']
-    ).to(device)
+    
+    if 'epoch' in raw_state:
+        print(f"   Epoch: {raw_state['epoch']}")
+    if 'best_metrics' in raw_state:
+        bm = raw_state['best_metrics']
+        print(f"   Best F1: {bm.get('f1', 0)*100:.1f}%, Recall: {bm.get('recall', 0)*100:.1f}%")
 
     # Dataset
     DatasetClass = get_dataset(dataset_name)
     val_tf = build_transforms(data_cfg, is_train=False)
     
-    val_dataset = DatasetClass(
+    # Scegli split (con auto-detection)
+    if args.split == 'test':
+        # Cerca in ordine: TEST_SPLIT config, poi 'test', poi 'testing'
+        split_name = data_cfg.get('TEST_SPLIT', None)
+        if split_name is None:
+            for candidate in ['test', 'testing', 'eval']:
+                test_path = os.path.join(data_cfg['ROOT'], candidate)
+                if os.path.isdir(test_path):
+                    split_name = candidate
+                    break
+            if split_name is None:
+                split_name = 'test'  # fallback default
+    else:
+        split_name = data_cfg.get('VAL_SPLIT', 'val')
+    
+    dataset = DatasetClass(
         root=data_cfg['ROOT'],
-        split=data_cfg['VAL_SPLIT'],
-        block_size=data_cfg['ZIP_BLOCK_SIZE'],
+        split=split_name,
+        block_size=block_size,
         transforms=val_tf,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
+    dataloader = DataLoader(
+        dataset,
         batch_size=1,
         shuffle=False,
         num_workers=config.get('OPTIM_ZIP', {}).get('NUM_WORKERS', 4),
         collate_fn=collate_fn
     )
 
-    print(f"\nValidation samples: {len(val_dataset)}")
+    print(f"\n📊 Dataset: {dataset_name}")
+    print(f"   Split: {split_name}")
+    print(f"   Images: {len(dataset)}")
 
     # Validazione
-    results = validate_with_metrics(model, criterion, val_loader, device, config)
+    results = validate_with_metrics(
+        model, dataloader, device, block_size, 
+        pi_threshold=args.pi_threshold,
+        max_size=args.max_size
+    )
+
+    # Stampa risultati
+    print_results(results, args.split)
 
     # Salva metriche
-    metrics_path = os.path.join(output_dir, "stage1_metrics.json")
-    
-    # Converti per JSON
-    results_json = {
-        'loss': float(results['loss']),
-        'accuracy': float(results['accuracy']),
-        'precision': float(results['precision']),
-        'recall': float(results['recall']),
-        'f1_score': float(results['f1_score']),
-        'confusion_matrix': results['confusion_matrix'],
-        'pi_stats': {k: float(v) for k, v in results['pi_stats'].items()},
-        'count_metrics': {k: float(v) for k, v in results['count_metrics'].items()},
-    }
-    
-    with open(metrics_path, 'w') as f:
-        json.dump(results_json, f, indent=2)
-    
-    print(f"\n💾 Metriche salvate in: {metrics_path}")
-    
-    # Summary
-    print(f"\n📋 SUMMARY:")
-    print(f"   Accuracy:  {results['accuracy']*100:.2f}%")
-    print(f"   Precision: {results['precision']*100:.2f}%")
-    print(f"   Recall:    {results['recall']*100:.2f}%")
-    print(f"   F1-Score:  {results['f1_score']*100:.2f}%")
-    
-    if results['f1_score'] > 0.80 and results['recall'] > 0.90:
-        print(f"\n   ✅ Stage 1 performance eccellente!")
-    elif results['f1_score'] > 0.70:
-        print(f"\n   ✅ Stage 1 performance buona")
-    else:
-        print(f"\n   ⚠️  Stage 1 necessita miglioramenti")
+    if args.save_results or args.output:
+        if args.output:
+            output_path = args.output
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(output_dir, f"stage1_eval_{args.split}_{timestamp}.json")
+        
+        # Converti per JSON
+        results_json = {
+            'accuracy': float(results['accuracy']),
+            'precision': float(results['precision']),
+            'recall': float(results['recall']),
+            'f1_score': float(results['f1_score']),
+            'confusion_matrix': results['confusion_matrix'],
+            'pi_stats': {k: float(v) for k, v in results['pi_stats'].items()},
+            'lambda_stats': {k: float(v) for k, v in results['lambda_stats'].items()},
+            'count_metrics': results['count_metrics'],
+            'num_images': results['num_images'],
+            'metadata': {
+                'checkpoint': checkpoint_path,
+                'config': args.config,
+                'split': args.split,
+                'pi_threshold': args.pi_threshold,
+                'timestamp': datetime.now().isoformat(),
+            }
+        }
+        
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(results_json, f, indent=2)
+        
+        print(f"\n💾 Risultati salvati: {output_path}")
 
 
 if __name__ == '__main__':

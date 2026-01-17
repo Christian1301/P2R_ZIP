@@ -8,9 +8,18 @@ Supporta:
 2. TTA: flip orizzontale + multi-scale
 3. Modalità: RAW, MASKED, SOFT
 
-Usage:
-    python evaluate_stage3_tta.py --config config.yaml --checkpoint stage3_fusion_best.pth
-    python evaluate_stage3_tta.py --config config.yaml --tta --tta-scales 0.9,1.0,1.1
+USO:
+    # Valuta su val set (default)
+    python evaluate_stage3.py --config config_jhu.yaml
+    
+    # Valuta su test set
+    python evaluate_stage3.py --config config_jhu.yaml --split test
+    
+    # Con TTA
+    python evaluate_stage3.py --config config_jhu.yaml --split test --tta
+    
+    # Salva risultati
+    python evaluate_stage3.py --config config_jhu.yaml --split test --save-results
 """
 
 import os
@@ -23,6 +32,8 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 import math
+import json
+from datetime import datetime
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -30,8 +41,57 @@ from datasets.transforms import build_transforms
 from train_utils import collate_fn, canonicalize_p2r_grid
 
 
+# Default bins config
+DEFAULT_BINS_CONFIG = {
+    'shha': {
+        'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
+        'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
+    },
+    'shhb': {
+        'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
+        'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
+    },
+    'ucf': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'nwpu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+    'jhu': {
+        'bins': [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]],
+        'bin_centers': [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86],
+    },
+}
+
+DATASET_ALIASES = {
+    'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
+    'shhb': 'shhb', 'shanghaitechpartb': 'shhb',
+    'ucf': 'ucf', 'ucfqnrf': 'ucf',
+    'nwpu': 'nwpu', 'jhu': 'jhu',
+}
+
+
+def resize_if_needed(images, max_size=2048):
+    """Ridimensiona immagini se troppo grandi per evitare OOM."""
+    _, _, H, W = images.shape
+    max_dim = max(H, W)
+    
+    if max_dim > max_size:
+        scale = max_size / max_dim
+        new_H = int(H * scale)
+        new_W = int(W * scale)
+        # Arrotonda a multiplo di 32
+        new_H = (new_H // 32) * 32
+        new_W = (new_W // 32) * 32
+        images = F.interpolate(images, size=(new_H, new_W), mode='bilinear', align_corners=False)
+        return images, scale
+    return images, 1.0
+
+
 # =============================================================================
-# SCALE COMPENSATION (deve matchare quello in train_stage3_fusion.py)
+# SCALE COMPENSATION
 # =============================================================================
 
 class ScaleCompensation(nn.Module):
@@ -81,16 +141,7 @@ def apply_hard_mask(density, pi_probs, threshold=0.5):
 # =============================================================================
 
 class TTAWrapper:
-    """
-    Test-Time Augmentation per crowd counting.
-    
-    Strategia: calcola COUNT per ogni augmentation, poi media i count.
-    Non media le density map direttamente (problematico con scale diverse).
-    
-    Augmentations:
-    - Flip orizzontale
-    - Multi-scale (opzionale, spesso non aiuta molto)
-    """
+    """Test-Time Augmentation per crowd counting."""
     
     def __init__(
         self,
@@ -108,15 +159,8 @@ class TTAWrapper:
     
     @torch.no_grad()
     def __call__(self, images: torch.Tensor, default_down: int) -> dict:
-        """
-        Forward con TTA.
-        
-        Returns:
-            dict con 'p2r_density', 'pi_probs' e count mediato
-        """
         B, C, H, W = images.shape
         
-        # Per scale=1.0, teniamo la density originale per il soft weighting
         base_density = None
         base_pi = None
         
@@ -124,11 +168,9 @@ class TTAWrapper:
         all_pi_means = []
         
         for scale in self.scales:
-            # Resize se scale != 1.0
             if scale != 1.0:
                 new_H = int(H * scale)
                 new_W = int(W * scale)
-                # Arrotonda a multiplo di 32
                 new_H = (new_H // 32) * 32
                 new_W = (new_W // 32) * 32
                 if new_H < 128 or new_W < 128:
@@ -137,19 +179,16 @@ class TTAWrapper:
             else:
                 scaled_images = images
             
-            # Forward normale
             density, pi, cell_area = self._forward_single(scaled_images, default_down)
             count = (density.sum(dim=[1, 2, 3]) / cell_area)
             all_counts.append(count)
             all_pi_means.append(pi.mean(dim=[1, 2, 3]))
             
-            # Salva base per scale=1.0
             if scale == 1.0:
                 base_density = density
                 base_pi = pi
                 base_cell_area = cell_area
             
-            # Flip orizzontale
             if self.use_flip:
                 flipped_images = torch.flip(scaled_images, dims=[3])
                 density_flip, pi_flip, cell_area_flip = self._forward_single(flipped_images, default_down)
@@ -157,15 +196,11 @@ class TTAWrapper:
                 all_counts.append(count_flip)
                 all_pi_means.append(pi_flip.mean(dim=[1, 2, 3]))
         
-        # Media dei count
-        avg_count = torch.stack(all_counts, dim=0).mean(dim=0)  # [B]
-        avg_pi_mean = torch.stack(all_pi_means, dim=0).mean(dim=0)  # [B]
+        avg_count = torch.stack(all_counts, dim=0).mean(dim=0)
+        avg_pi_mean = torch.stack(all_pi_means, dim=0).mean(dim=0)
         
-        # Per soft weighting, usiamo la density di scale=1.0 ma la scalamo
-        # per matchare il count medio
         if base_density is not None:
             original_count = base_density.sum(dim=[1, 2, 3]) / base_cell_area
-            # Scala la density per ottenere il count medio
             scale_factor = avg_count / (original_count + 1e-8)
             scaled_density = base_density * scale_factor.view(B, 1, 1, 1)
         else:
@@ -181,16 +216,13 @@ class TTAWrapper:
         }
     
     def _forward_single(self, images: torch.Tensor, default_down: int):
-        """Forward singolo, ritorna density, pi, e cell_area."""
         outputs = self.model(images)
         density = outputs['p2r_density']
         pi_probs = outputs['pi_probs']
         
-        # Applica scale compensation se presente
         if self.scale_comp is not None:
             density = self.scale_comp(density)
         
-        # Canonicalize
         _, _, H_in, W_in = images.shape
         density, down_tuple, _ = canonicalize_p2r_grid(density, (H_in, W_in), default_down)
         cell_area = down_tuple[0] * down_tuple[1]
@@ -213,16 +245,18 @@ def evaluate(
     soft_alpha=0.2,
     use_tta=False,
     tta_scales=None,
+    max_size=2048,
 ):
     """
     Valuta con tre modalità: RAW, MASKED (hard), SOFT.
-    Opzionalmente usa TTA.
+    
+    Args:
+        max_size: dimensione massima per lato (evita OOM su immagini grandi)
     """
     model.eval()
     if scale_comp is not None:
         scale_comp.eval()
     
-    # Setup TTA
     if use_tta:
         tta_wrapper = TTAWrapper(
             model=model,
@@ -235,9 +269,9 @@ def evaluate(
     
     # Risultati per modalità
     results = {
-        'raw': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
-        'masked': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
-        'soft': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0},
+        'raw': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0, 'preds': [], 'gts': []},
+        'masked': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0, 'preds': [], 'gts': []},
+        'soft': {'mae': [], 'mse': [], 'pred': 0, 'gt': 0, 'preds': [], 'gts': []},
     }
     
     # Per analisi per densità
@@ -259,14 +293,15 @@ def evaluate(
         images = images.to(device)
         points_list = [p.to(device) for p in points]
         
+        # Ridimensiona se troppo grande
+        images, scale = resize_if_needed(images, max_size)
+        
         if use_tta:
-            # TTA forward
             outputs = tta_wrapper(images, default_down)
             raw_density = outputs['p2r_density']
             pi_probs = outputs['pi_probs']
             cell_area = outputs['cell_area']
         else:
-            # Normal forward
             outputs = model(images)
             raw_density = outputs['p2r_density']
             pi_probs = outputs['pi_probs']
@@ -275,7 +310,6 @@ def evaluate(
             raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
             cell_area = down_tuple[0] * down_tuple[1]
             
-            # Applica scale compensation
             if scale_comp is not None:
                 raw_density = raw_density * scale_value
         
@@ -287,7 +321,6 @@ def evaluate(
         else:
             pi_probs_resized = pi_probs
         
-        # Coverage e π ratio
         coverage = (pi_probs_resized > pi_threshold).float().mean().item() * 100
         coverages.append(coverage)
         pi_ratios.append(pi_probs_resized.mean().item())
@@ -299,19 +332,18 @@ def evaluate(
         for i, pts in enumerate(points_list):
             gt = len(pts)
             
-            # Counts
             pred_raw = (raw_density[i].sum() / cell_area).item()
             pred_masked = (masked_density[i].sum() / cell_area).item()
             pred_soft = (soft_density[i].sum() / cell_area).item()
             
-            # Update results
             for mode, pred in [('raw', pred_raw), ('masked', pred_masked), ('soft', pred_soft)]:
                 results[mode]['mae'].append(abs(pred - gt))
                 results[mode]['mse'].append((pred - gt) ** 2)
                 results[mode]['pred'] += pred
                 results[mode]['gt'] += gt
+                results[mode]['preds'].append(pred)
+                results[mode]['gts'].append(gt)
                 
-                # Per density bin
                 for bin_name, (lo, hi) in density_bins.items():
                     if lo <= gt < hi:
                         density_results[mode][bin_name]['mae'].append(abs(pred - gt))
@@ -322,34 +354,45 @@ def evaluate(
     
     for mode in ['raw', 'masked', 'soft']:
         r = results[mode]
+        preds = np.array(r['preds'])
+        gts = np.array(r['gts'])
+        
         final_results[mode] = {
-            'mae': np.mean(r['mae']),
-            'rmse': np.sqrt(np.mean(r['mse'])),
-            'bias': r['pred'] / r['gt'] if r['gt'] > 0 else 0,
+            'mae': float(np.mean(r['mae'])),
+            'rmse': float(np.sqrt(np.mean(r['mse']))),
+            'mse': float(np.mean(r['mse'])),
+            'bias': float(r['pred'] / r['gt']) if r['gt'] > 0 else 0,
+            'nae': float(np.sum(r['mae']) / np.sum(gts)) if np.sum(gts) > 0 else 0,
+            'gt_total': int(np.sum(gts)),
+            'pred_total': float(np.sum(preds)),
+            'gt_mean': float(np.mean(gts)),
+            'pred_mean': float(np.mean(preds)),
+            'gt_std': float(np.std(gts)),
+            'pred_std': float(np.std(preds)),
         }
         
-        # Per densità
         final_results[mode]['by_density'] = {}
         for bin_name in density_bins:
             dr = density_results[mode][bin_name]
             if dr['mae']:
                 final_results[mode]['by_density'][bin_name] = {
-                    'mae': np.mean(dr['mae']),
+                    'mae': float(np.mean(dr['mae'])),
                     'count': dr['count'],
                 }
     
-    final_results['coverage'] = np.mean(coverages)
-    final_results['pi_mean'] = np.mean(pi_ratios)
+    final_results['coverage'] = float(np.mean(coverages))
+    final_results['pi_mean'] = float(np.mean(pi_ratios))
     final_results['scale'] = scale_value
+    final_results['num_images'] = len(results['raw']['mae'])
     
     return final_results
 
 
-def print_results(results, pi_threshold, soft_alpha, use_tta):
+def print_results(results, pi_threshold, soft_alpha, use_tta, split):
     """Stampa risultati in formato tabellare."""
     
     print("=" * 70)
-    print(f"📊 RISULTATI VALUTAZIONE {'(con TTA)' if use_tta else ''}")
+    print(f"📊 STAGE 3 EVALUATION RESULTS - {split.upper()} SET {'(con TTA)' if use_tta else ''}")
     print("=" * 70)
     
     print(f"\n📏 Scale Compensation: {results['scale']:.4f}")
@@ -359,21 +402,27 @@ def print_results(results, pi_threshold, soft_alpha, use_tta):
         pi_threshold, soft_alpha))
     print("-" * 62)
     
-    for metric in ['mae', 'rmse', 'bias']:
+    for metric in ['mae', 'rmse', 'bias', 'nae']:
         raw = results['raw'][metric]
         masked = results['masked'][metric]
         soft = results['soft'][metric]
         
-        if metric == 'bias':
+        if metric in ['bias', 'nae']:
             print(f"{metric.upper():<12} {raw:<15.3f} {masked:<20.3f} {soft:<15.3f}")
         else:
             print(f"{metric.upper():<12} {raw:<15.2f} {masked:<20.2f} {soft:<15.2f}")
+    
+    print(f"\n📈 Statistiche Conteggi (RAW):")
+    print(f"   GT Total:   {results['raw']['gt_total']:,}")
+    print(f"   Pred Total: {results['raw']['pred_total']:,.0f}")
+    print(f"   GT Mean:    {results['raw']['gt_mean']:.1f} ± {results['raw']['gt_std']:.1f}")
+    print(f"   Pred Mean:  {results['raw']['pred_mean']:.1f} ± {results['raw']['pred_std']:.1f}")
     
     print(f"\n📈 Coverage medio (τ={pi_threshold}): {results['coverage']:.1f}%")
     print(f"   π-head active ratio: {results['pi_mean']*100:.1f}%")
     
     # Per densità
-    print("\n📊 Per densità:")
+    print("\n📊 MAE per densità:")
     density_labels = {
         'sparse': 'Sparse  (0-100)',
         'medium': 'Medium (100-500)',
@@ -391,9 +440,9 @@ def print_results(results, pi_threshold, soft_alpha, use_tta):
         count = raw_data.get('count', 0)
         
         if count > 0:
-            delta_masked = raw_mae - masked_mae
-            delta_soft = raw_mae - soft_mae
-            print(f"   {density_labels[bin_name]}: RAW={raw_mae:.1f} → MASKED={masked_mae:.1f} (Δ{delta_masked:+.1f}) | SOFT={soft_mae:.1f} (Δ{delta_soft:+.1f}) [{count} imgs]")
+            print(f"   {density_labels[bin_name]}: RAW={raw_mae:.1f} | MASKED={masked_mae:.1f} | SOFT={soft_mae:.1f} [{count} imgs]")
+    
+    print(f"\n📁 Images evaluated: {results['num_images']}")
     
     # Box finale
     print("\n" + "=" * 70)
@@ -403,20 +452,18 @@ def print_results(results, pi_threshold, soft_alpha, use_tta):
     best_mode = min(['raw', 'masked', 'soft'], key=lambda m: results[m]['mae'])
     best_mae = results[best_mode]['mae']
     
-    print(f"   ┌{'─'*50}┐")
-    print(f"   │  MAE RAW:        {results['raw']['mae']:<30.2f}│")
-    print(f"   │  MAE MASKED:     {results['masked']['mae']:<30.2f}│")
-    print(f"   │  MAE SOFT:       {results['soft']['mae']:<30.2f}│")
-    print(f"   │{'─'*50}│")
-    print(f"   │  MIGLIORE:       {best_mode.upper():<30}│")
-    print(f"   │  MAE:            {best_mae:<30.2f}│")
-    print(f"   └{'─'*50}┘")
+    print(f"   MAE RAW:        {results['raw']['mae']:.2f}")
+    print(f"   MAE MASKED:     {results['masked']['mae']:.2f}")
+    print(f"   MAE SOFT:       {results['soft']['mae']:.2f}")
+    print(f"   MIGLIORE:       {best_mode.upper()} (MAE={best_mae:.2f})")
     print("=" * 70)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate Stage 3 con TTA')
+    parser = argparse.ArgumentParser(description='Evaluate Stage 3')
     parser.add_argument('--config', type=str, default='config.yaml')
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'],
+                        help='Split da usare (val o test)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path checkpoint (default: cerca automaticamente)')
     parser.add_argument('--pi-thresh', type=float, default=None)
@@ -429,7 +476,13 @@ def main():
     parser.add_argument('--no-scale-comp', action='store_true',
                         help='Ignora scale compensation anche se presente')
     parser.add_argument('--tta-flip-only', action='store_true',
-                        help='TTA con solo flip (senza multi-scale, più stabile)')
+                        help='TTA con solo flip (senza multi-scale)')
+    parser.add_argument('--max-size', type=int, default=2048,
+                        help='Max image size per side to avoid OOM (default: 2048)')
+    parser.add_argument('--save-results', action='store_true',
+                        help='Salva risultati in JSON')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Path output JSON')
     args = parser.parse_args()
     
     with open(args.config) as f:
@@ -439,11 +492,11 @@ def main():
     
     # Parse TTA scales
     if args.tta_flip_only:
-        tta_scales = [1.0]  # Solo scale 1.0 = solo flip
+        tta_scales = [1.0]
     else:
         tta_scales = [float(s) for s in args.tta_scales.split(',')]
     
-    # Gestione robusta config DATA/DATASET
+    # Gestione config
     dataset_section = config.get('DATASET', 'shha')
     data_section = config.get('DATA')
 
@@ -457,15 +510,8 @@ def main():
         dataset_name_raw = dataset_section
         data_cfg = data_section.copy() if isinstance(data_section, dict) else {}
 
-    # Normalizza nome dataset
-    alias_map = {
-        'shha': 'shha', 'shanghaitecha': 'shha', 'shanghaitechparta': 'shha',
-        'shhb': 'shhb', 'shanghaitechpartb': 'shhb',
-        'ucf': 'ucf', 'ucfqnrf': 'ucf',
-        'nwpu': 'nwpu', 'jhu': 'jhu'
-    }
     normalized_name = ''.join(ch for ch in str(dataset_name_raw).lower() if ch.isalnum())
-    dataset_name = alias_map.get(normalized_name, str(dataset_name_raw).lower())
+    dataset_name = DATASET_ALIASES.get(normalized_name, str(dataset_name_raw).lower())
 
     if 'NORM_MEAN' not in data_cfg:
         data_cfg['NORM_MEAN'] = [0.485, 0.456, 0.406]
@@ -475,18 +521,18 @@ def main():
     default_down = data_cfg.get('P2R_DOWNSAMPLE', 8)
     block_size = data_cfg.get('ZIP_BLOCK_SIZE', 16)
     
-    pi_threshold = args.pi_thresh if args.pi_thresh is not None else config['MODEL'].get('ZIP_PI_THRESH', 0.5)
+    pi_threshold = args.pi_thresh if args.pi_thresh is not None else config.get('MODEL', {}).get('ZIP_PI_THRESH', 0.5)
     soft_alpha = args.soft_alpha
     
     print("=" * 70)
-    print("🔬 EVALUATE STAGE 3 CON SCALE COMPENSATION + TTA")
+    print(f"🔬 EVALUATE STAGE 3 ({args.split.upper()} SET)")
     print("=" * 70)
     print(f"   π-threshold: {pi_threshold}")
     print(f"   soft-alpha: {soft_alpha}")
     print(f"   TTA: {'ON' if args.tta else 'OFF'}")
     if args.tta:
         if args.tta_flip_only:
-            print(f"   TTA mode: FLIP ONLY (più stabile)")
+            print(f"   TTA mode: FLIP ONLY")
         else:
             print(f"   TTA scales: {tta_scales}")
     print("=" * 70)
@@ -494,34 +540,42 @@ def main():
     # Dataset
     val_tf = build_transforms(data_cfg, is_train=False)
     DatasetClass = get_dataset(dataset_name)
-    val_ds = DatasetClass(
+    
+    # Scegli split (con auto-detection)
+    if args.split == 'test':
+        # Cerca in ordine: TEST_SPLIT config, poi 'test', poi 'testing'
+        split_name = data_cfg.get('TEST_SPLIT', None)
+        if split_name is None:
+            for candidate in ['test', 'testing', 'eval']:
+                test_path = os.path.join(data_cfg['ROOT'], candidate)
+                if os.path.isdir(test_path):
+                    split_name = candidate
+                    break
+            if split_name is None:
+                split_name = 'test'  # fallback default
+    else:
+        split_name = data_cfg.get('VAL_SPLIT', 'val')
+    
+    dataset = DatasetClass(
         root=data_cfg['ROOT'],
-        split=data_cfg.get('VAL_SPLIT', 'val'),
+        split=split_name,
         block_size=block_size,
         transforms=val_tf
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn
+    dataloader = DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn
     )
-    print(f"📊 Dataset: {dataset_name}, {len(val_ds)} immagini")
+    
+    print(f"\n📊 Dataset: {dataset_name}")
+    print(f"   Split: {split_name}")
+    print(f"   Images: {len(dataset)}")
     
     # Model
     bins_config = config.get('BINS_CONFIG', {})
-    default_bins = {
-        'shha': {
-            'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
-            'bin_centers': [0.0, 2.0, 5.0, 8.5, 13.0, 19.0, 27.5, 45.0],
-        },
-        'shhb': {
-            'bins': [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9999]],
-            'bin_centers': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.16],
-        },
-    }
-    
     if dataset_name in bins_config:
         bin_config = bins_config[dataset_name]
-    elif dataset_name in default_bins:
-        bin_config = default_bins[dataset_name]
+    elif dataset_name in DEFAULT_BINS_CONFIG:
+        bin_config = DEFAULT_BINS_CONFIG[dataset_name]
     else:
         raise KeyError(f"BINS_CONFIG missing for dataset '{dataset_name}'")
     
@@ -546,21 +600,18 @@ def main():
     scale_comp = ScaleCompensation(init_scale=1.0, learnable=False).to(device)
     
     # Load checkpoint
-    run_name = config.get('RUN_NAME', 'shha_v15')
-    output_dir = os.path.join(config.get('EXP', {}).get('OUT_DIR', 'exp'), run_name)
+    run_name = config.get('RUN_NAME', 'stage3')
+    exp_cfg = config.get('EXP', {})
+    output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), run_name)
     
     if args.checkpoint:
         ckpt_path = args.checkpoint
     else:
-        # Cerca automaticamente - priorità Stage 3 fusion
         search_order = [
             'stage3_fusion_best.pth',
             'stage3_fusion_last.pth', 
             'stage3_curriculum_best.pth',
             'stage3_best.pth',
-            'stage2_bypass_best.pth',
-            'stage2_best.pth',
-            'best_model.pth',
         ]
         ckpt_path = None
         for name in search_order:
@@ -570,18 +621,16 @@ def main():
                 break
         
         if ckpt_path is None:
-            raise FileNotFoundError(f"Nessun checkpoint trovato in {output_dir}")
+            raise FileNotFoundError(f"Nessun checkpoint Stage 3 trovato in {output_dir}")
     
     print(f"\n🔄 Caricamento: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     
-    # Carica model weights
     if 'model' in state:
         model.load_state_dict(state['model'], strict=False)
     else:
         model.load_state_dict(state, strict=False)
     
-    # Carica scale_comp se presente
     if 'scale_comp' in state and not args.no_scale_comp:
         scale_comp.load_state_dict(state['scale_comp'])
         print(f"✅ Scale Compensation caricato: {scale_comp.get_scale():.4f}")
@@ -589,61 +638,55 @@ def main():
         scale_comp = None
         print("ℹ️ Scale Compensation non trovato o disabilitato")
     
-    # Info dal checkpoint
     if 'epoch' in state:
         print(f"   Epoch: {state['epoch']}")
     if 'best_mae' in state:
         print(f"   Best MAE (training): {state['best_mae']:.2f}")
-    if 'alpha' in state:
-        print(f"   Alpha (training): {state['alpha']:.3f}")
     
     # Valutazione
-    print(f"\n{'='*70}")
     results = evaluate(
         model=model,
         scale_comp=scale_comp,
-        dataloader=val_loader,
+        dataloader=dataloader,
         device=device,
         default_down=default_down,
         pi_threshold=pi_threshold,
         soft_alpha=soft_alpha,
         use_tta=args.tta,
         tta_scales=tta_scales,
+        max_size=args.max_size,
     )
     
     # Stampa risultati
-    print_results(results, pi_threshold, soft_alpha, args.tta)
+    print_results(results, pi_threshold, soft_alpha, args.tta, args.split)
     
-    # Confronto con/senza TTA
-    if args.tta:
-        print("\n🔄 Confronto senza TTA per riferimento:")
-        results_no_tta = evaluate(
-            model=model,
-            scale_comp=scale_comp,
-            dataloader=val_loader,
-            device=device,
-            default_down=default_down,
-            pi_threshold=pi_threshold,
-            soft_alpha=soft_alpha,
-            use_tta=False,
-            tta_scales=None,
-        )
+    # Salva risultati
+    if args.save_results or args.output:
+        if args.output:
+            output_path = args.output
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(output_dir, f"stage3_eval_{args.split}_{timestamp}.json")
         
-        print(f"\n   {'Modalità':<12} {'Senza TTA':<15} {'Con TTA':<15} {'Δ MAE':<10}")
-        print("   " + "-" * 52)
-        for mode in ['raw', 'masked', 'soft']:
-            mae_no_tta = results_no_tta[mode]['mae']
-            mae_tta = results[mode]['mae']
-            delta = mae_no_tta - mae_tta
-            print(f"   {mode.upper():<12} {mae_no_tta:<15.2f} {mae_tta:<15.2f} {delta:+.2f}")
+        results_json = {
+            **results,
+            'metadata': {
+                'checkpoint': ckpt_path,
+                'config': args.config,
+                'split': args.split,
+                'pi_threshold': pi_threshold,
+                'soft_alpha': soft_alpha,
+                'tta': args.tta,
+                'tta_scales': tta_scales if args.tta else None,
+                'timestamp': datetime.now().isoformat(),
+            }
+        }
         
-        print(f"\n   {'Modalità':<12} {'RMSE no TTA':<15} {'RMSE TTA':<15} {'Δ RMSE':<10}")
-        print("   " + "-" * 52)
-        for mode in ['raw', 'masked', 'soft']:
-            rmse_no_tta = results_no_tta[mode]['rmse']
-            rmse_tta = results[mode]['rmse']
-            delta = rmse_no_tta - rmse_tta
-            print(f"   {mode.upper():<12} {rmse_no_tta:<15.2f} {rmse_tta:<15.2f} {delta:+.2f}")
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(results_json, f, indent=2)
+        
+        print(f"\n💾 Risultati salvati: {output_path}")
 
 
 if __name__ == '__main__':

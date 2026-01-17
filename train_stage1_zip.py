@@ -9,6 +9,11 @@ CAMBIAMENTO PRINCIPALE DA V3:
 - Non richiede tuning di pos_weight per bilanciamento classi
 - π e λ vengono appresi congiuntamente in modo naturale
 
+CRITERIO BEST CHECKPOINT:
+- Priorità al recall (non perdere persone)
+- Se recall >= soglia (85%), confronta F1
+- Se recall sotto soglia, preferisce recall più alto
+
 TARGET:
 - Recall > 90% (priorità alta - non perdere persone)
 - Precision > 50% (accettabile - Stage 2 correggerà)
@@ -25,13 +30,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 import numpy as np
 import json
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
 from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn
-from losses.zip_nll import zip_nll  # Usa il tuo file zip_nll.py
+from losses.zip_nll import zip_nll
 
 
 # Default bin configurations for common datasets
@@ -60,7 +65,78 @@ DEFAULT_BINS_CONFIG = {
 
 
 # =============================================================================
-# COMPUTE LOSS AND METRICS - Usa direttamente zip_nll
+# BEST CHECKPOINT SELECTION - Criterio composito
+# =============================================================================
+
+def is_better_checkpoint(
+    current: Dict[str, float], 
+    best: Dict[str, float], 
+    min_recall: float = 0.85,
+    recall_margin: float = 0.02
+) -> bool:
+    """
+    Criterio di selezione best checkpoint per Stage 1.
+    
+    Priorità:
+    1. Se current recall >= min_recall e best recall < min_recall → current vince
+    2. Se entrambi sotto min_recall → preferisce recall più alto
+    3. Se entrambi sopra min_recall → confronta F1
+    4. A parità di recall (±margin), preferisce F1 più alto
+    
+    Args:
+        current: metriche del checkpoint corrente
+        best: metriche del miglior checkpoint finora
+        min_recall: soglia minima di recall desiderata (default 85%)
+        recall_margin: margine per considerare recall "a parità" (default 2%)
+    
+    Returns:
+        True se current è migliore di best
+    """
+    curr_r = current['recall']
+    curr_f1 = current['f1']
+    best_r = best['recall']
+    best_f1 = best['f1']
+    
+    # Caso 1: current sopra soglia, best sotto → current vince sempre
+    if curr_r >= min_recall and best_r < min_recall:
+        return True
+    
+    # Caso 2: current sotto soglia, best sopra → best vince sempre
+    if curr_r < min_recall and best_r >= min_recall:
+        return False
+    
+    # Caso 3: entrambi sotto soglia → priorità al recall
+    if curr_r < min_recall and best_r < min_recall:
+        # Se current ha recall significativamente più alto, vince
+        if curr_r > best_r + recall_margin:
+            return True
+        # Se best ha recall significativamente più alto, vince
+        elif best_r > curr_r + recall_margin:
+            return False
+        # A parità di recall (±margin), guarda F1
+        else:
+            return curr_f1 > best_f1
+    
+    # Caso 4: entrambi sopra soglia → confronta F1 (recall già garantito)
+    # Ma se uno ha recall molto più alto, consideralo
+    if curr_r > best_r + recall_margin and curr_f1 >= best_f1 - 0.02:
+        # Recall molto migliore e F1 non troppo peggiore
+        return True
+    
+    # Default: confronta F1
+    return curr_f1 > best_f1
+
+
+def format_metrics_comparison(current: Dict, best: Dict) -> str:
+    """Formatta un confronto tra metriche per il logging."""
+    return (
+        f"Current: R={current['recall']*100:.1f}% F1={current['f1']*100:.1f}% P={current['precision']*100:.1f}% | "
+        f"Best: R={best['recall']*100:.1f}% F1={best['f1']*100:.1f}% P={best['precision']*100:.1f}%"
+    )
+
+
+# =============================================================================
+# COMPUTE LOSS AND METRICS
 # =============================================================================
 
 def compute_zip_loss_and_metrics(
@@ -86,7 +162,7 @@ def compute_zip_loss_and_metrics(
         stride=block_size
     ) * (block_size ** 2)
     
-    # 1. ZIP NLL Loss (usa la tua funzione - gestisce già l'allineamento dimensioni)
+    # 1. ZIP NLL Loss
     loss_nll = zip_nll(pi_probs, lambda_maps, gt_counts, reduction='mean')
     
     # 2. Lambda regularization (opzionale)
@@ -117,6 +193,7 @@ def compute_zip_loss_and_metrics(
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-6)
+        accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
         
         pi_mean = pi_probs.mean().item()
         pi_std = pi_probs.std().item()
@@ -130,6 +207,7 @@ def compute_zip_loss_and_metrics(
         'precision': precision,
         'recall': recall,
         'f1': f1,
+        'accuracy': accuracy,
         'pi_mean': pi_mean,
         'pi_std': pi_std,
         'lambda_mean': lambda_mean,
@@ -256,6 +334,7 @@ def validate(
     precision = total_tp / max(total_tp + total_fp, 1)
     recall = total_tp / max(total_tp + total_fn, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-6)
+    accuracy = (total_tp + total_tn) / max(total_tp + total_tn + total_fp + total_fn, 1)
     
     return {
         'loss': total_loss / n,
@@ -263,6 +342,7 @@ def validate(
         'precision': precision,
         'recall': recall,
         'f1': f1,
+        'accuracy': accuracy,
         'tp': total_tp, 'tn': total_tn, 'fp': total_fp, 'fn': total_fn,
         'pi_mean': np.mean(pi_means),
         'pi_std': np.mean(pi_stds),
@@ -271,7 +351,7 @@ def validate(
 
 
 # =============================================================================
-# THRESHOLD FINDER - Trova τ ottimale per recall alto
+# THRESHOLD FINDER
 # =============================================================================
 
 @torch.no_grad()
@@ -368,7 +448,18 @@ def find_optimal_threshold(
 # CHECKPOINT
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, no_improve, output_dir, is_best=False):
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    epoch: int,
+    metrics: dict,
+    best_metrics: dict,
+    no_improve: int,
+    output_dir: str,
+    is_best: bool = False
+):
+    """Salva checkpoint con tutte le metriche."""
     os.makedirs(output_dir, exist_ok=True)
     
     state = {
@@ -377,7 +468,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, no_imp
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict() if scheduler else None,
         'metrics': metrics,
-        'best_f1': best_f1,
+        'best_metrics': best_metrics,
         'no_improve': no_improve,
     }
     
@@ -385,7 +476,11 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_f1, no_imp
     
     if is_best:
         torch.save(state, os.path.join(output_dir, 'best_model.pth'))
-        print(f"💾 Best: F1={metrics['f1']*100:.2f}%, P={metrics['precision']*100:.1f}%, R={metrics['recall']*100:.1f}%")
+        print(f"💾 New Best @ Epoch {epoch}:")
+        print(f"   Recall:    {metrics['recall']*100:.2f}%")
+        print(f"   Precision: {metrics['precision']*100:.2f}%")
+        print(f"   F1-Score:  {metrics['f1']*100:.2f}%")
+        print(f"   Accuracy:  {metrics['accuracy']*100:.2f}%")
 
 
 # =============================================================================
@@ -410,6 +505,7 @@ def main():
     print("="*70)
     print(f"Device: {device}")
     print(f"Target: Recall > 90%, F1 > 65%")
+    print(f"Best Selection: Recall-priority composite criterion")
     print("="*70)
     
     # Config
@@ -454,6 +550,11 @@ def main():
 
     optim_cfg = config['OPTIM_ZIP']
     loss_cfg = config.get('ZIP_LOSS_V4', {})
+    
+    # Parametri per selezione best checkpoint
+    best_selection_cfg = config.get('BEST_SELECTION', {})
+    min_recall_threshold = best_selection_cfg.get('MIN_RECALL', 0.85)
+    recall_margin = best_selection_cfg.get('RECALL_MARGIN', 0.02)
     
     block_size = data_cfg.get('ZIP_BLOCK_SIZE', data_cfg.get('BLOCK_SIZE', 16))
     
@@ -524,6 +625,9 @@ def main():
     print(f"   Weight λ reg: {loss_cfg.get('WEIGHT_LAMBDA_REG', 0.01)}")
     print(f"   λ max target: {loss_cfg.get('LAMBDA_MAX_TARGET', 8.0)}")
     print(f"   π threshold:  {loss_cfg.get('PI_THRESHOLD', 0.5)}")
+    print(f"\n⚙️ Best Selection Config:")
+    print(f"   Min recall threshold: {min_recall_threshold*100:.0f}%")
+    print(f"   Recall margin: {recall_margin*100:.0f}%")
     
     # Optimizer
     base_lr = float(optim_cfg.get('LR', 1e-4))
@@ -551,7 +655,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     # Resume
-    best_f1 = 0.0
+    best_metrics: Optional[Dict] = None
     start_epoch = 1
     patience = optim_cfg.get('EARLY_STOPPING_PATIENCE', 800)
     no_improve = 0
@@ -566,9 +670,19 @@ def main():
         if checkpoint.get('scheduler'):
             scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch'] + 1
-        best_f1 = checkpoint.get('best_f1', 0.0)
+        best_metrics = checkpoint.get('best_metrics', None)
         no_improve = checkpoint.get('no_improve', 0)
-        print(f"   Epoch {checkpoint['epoch']}, Best F1: {best_f1*100:.2f}%")
+        
+        if best_metrics:
+            print(f"   Epoch {checkpoint['epoch']}")
+            print(f"   Best: R={best_metrics['recall']*100:.1f}% F1={best_metrics['f1']*100:.1f}% P={best_metrics['precision']*100:.1f}%")
+        else:
+            # Backward compatibility: convert old format
+            old_best_f1 = checkpoint.get('best_f1', 0.0)
+            old_metrics = checkpoint.get('metrics', {})
+            if old_metrics:
+                best_metrics = old_metrics
+                print(f"   Epoch {checkpoint['epoch']}, converted from old format")
     
     print(f"\n🚀 Training: {start_epoch} → {epochs}")
     
@@ -589,18 +703,33 @@ def main():
             print(f"   Precision: {val_metrics['precision']*100:.2f}%")
             print(f"   Recall:    {val_metrics['recall']*100:.2f}%")
             print(f"   F1-Score:  {val_metrics['f1']*100:.2f}%")
+            print(f"   Accuracy:  {val_metrics['accuracy']*100:.2f}%")
             print(f"   π mean:    {val_metrics['pi_mean']:.3f} ± {val_metrics['pi_std']:.3f}")
             print(f"   λ mean:    {val_metrics['lambda_mean']:.3f}")
             
-            is_best = val_metrics['f1'] > best_f1
+            # Determina se è il best usando criterio composito
+            if best_metrics is None:
+                is_best = True
+            else:
+                is_best = is_better_checkpoint(
+                    val_metrics, 
+                    best_metrics,
+                    min_recall=min_recall_threshold,
+                    recall_margin=recall_margin
+                )
+                print(f"   {format_metrics_comparison(val_metrics, best_metrics)}")
             
             if is_best:
-                best_f1 = val_metrics['f1']
+                best_metrics = val_metrics.copy()
                 no_improve = 0
             else:
                 no_improve += val_interval
             
-            save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, best_f1, no_improve, output_dir, is_best)
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, 
+                val_metrics, best_metrics, no_improve, 
+                output_dir, is_best
+            )
             
             # Check targets
             if val_metrics['recall'] > 0.90 and val_metrics['f1'] > 0.65:
@@ -617,6 +746,7 @@ def main():
     if os.path.exists(best_path):
         best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state['model'])
+        print(f"   Loaded best model from epoch {best_state['epoch']}")
     
     thresh_results = find_optimal_threshold(
         model, val_loader, device, block_size,
@@ -634,12 +764,16 @@ def main():
     print(f"\n✅ Per Recall ≥ 90%: τ = {best_for_recall['threshold']}")
     print(f"   R={best_for_recall['recall']*100:.1f}%, P={best_for_recall['precision']*100:.1f}%, F1={best_for_recall['f1']*100:.1f}%")
     
-    # Save
+    # Save results
     results = {
-        'best_f1': best_f1,
+        'best_metrics': best_metrics,
         'optimal_threshold_for_recall': best_for_recall['threshold'],
         'optimal_threshold_for_f1': thresh_results['for_best_f1']['threshold'],
         'threshold_analysis': thresh_results['all_results'],
+        'selection_config': {
+            'min_recall_threshold': min_recall_threshold,
+            'recall_margin': recall_margin,
+        }
     }
     
     with open(os.path.join(output_dir, 'stage1_v4_results.json'), 'w') as f:
@@ -647,7 +781,12 @@ def main():
     
     print(f"\n{'='*70}")
     print(f"🏁 STAGE 1 V4 COMPLETATO")
-    print(f"   Best F1: {best_f1*100:.2f}%")
+    if best_metrics:
+        print(f"   Best Recall:    {best_metrics['recall']*100:.2f}%")
+        print(f"   Best Precision: {best_metrics['precision']*100:.2f}%")
+        print(f"   Best F1:        {best_metrics['f1']*100:.2f}%")
+        if 'accuracy' in best_metrics:
+            print(f"   Best Accuracy:  {best_metrics['accuracy']*100:.2f}%")
     print(f"   Threshold consigliato: {best_for_recall['threshold']}")
     print(f"{'='*70}")
 

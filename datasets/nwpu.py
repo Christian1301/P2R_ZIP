@@ -1,4 +1,3 @@
-# P2R_ZIP/datasets/nwpu.py
 import os
 import glob
 import numpy as np
@@ -7,96 +6,80 @@ from .base_dataset import BaseDataset
 class NWPU(BaseDataset):
     """
     NWPU-Crowd Dataset Loader.
-    
-    Supporta due strutture:
-    1. Standard: ROOT/split/images/*.jpg + ROOT/split/gt/*.txt
-    2. Flat: ROOT/split/scene*/*.jpg + *.txt (stesso nome)
+    Struttura rilevata:
+    - root/train/scene01/0001.jpg
+    - root/train/scene01/0001.txt
     """
     
     def load_data(self):
-        """Trova tutte le immagini per lo split specificato."""
-        split = self.split
-        imgs = []
+        """
+        Cerca le immagini navigando nelle cartelle (es. scene01, scene02...)
+        poiché non sono presenti file .list nella root.
+        """
+        # Gestione split: NWPU ha solitamente 'train', 'val', 'test'
+        # Se chiedi 'val' e non esiste, usiamo 'test' (o 'train' se preferisci fare split automatico)
+        split_name = self.split
+        if split_name == "val":
+            # Spesso il val set è una parte del train o il test set stesso in alcuni benchmark
+            # Qui cerchiamo la cartella "val", se non c'è proviamo "test"
+            if not os.path.isdir(os.path.join(self.root, "val")):
+                split_name = "test"
+
+        # Costruisce il path base: es. .../NWPU/train
+        base_dir = os.path.join(self.root, split_name)
         
-        # === PROVA 1: Struttura standard ROOT/split/images/*.jpg ===
-        img_dir = os.path.join(self.root, split, "images")
-        if os.path.isdir(img_dir):
-            found = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
-            if found:
-                print(f"[NWPU] Trovate {len(found)} immagini in {img_dir}")
-                self.img_paths = found
-                return
+        if not os.path.exists(base_dir):
+             raise FileNotFoundError(f"Cartella dello split non trovata: {base_dir}")
+
+        self.img_paths = []
         
-        # === PROVA 2: Struttura flat ROOT/split/scene*/*.jpg ===
-        scene_pattern = os.path.join(self.root, split, "scene*")
-        scene_dirs = sorted(glob.glob(scene_pattern))
+        # === STRATEGIA DI RICERCA ===
+        # Cerca pattern: ROOT/split/scene*/*.jpg
+        # Questo cattura scene01, scene02, etc.
+        search_pattern = os.path.join(base_dir, "scene*", "*.jpg")
+        found_imgs = sorted(glob.glob(search_pattern))
         
-        for scene_dir in scene_dirs:
-            found = sorted(glob.glob(os.path.join(scene_dir, "*.jpg")))
-            imgs.extend(found)
-        
-        if imgs:
-            print(f"[NWPU] Trovate {len(imgs)} immagini in {len(scene_dirs)} scene directories")
-            self.img_paths = sorted(imgs)
-            return
-        
-        # === PROVA 3: Struttura flat diretta ROOT/split/*.jpg ===
-        flat_dir = os.path.join(self.root, split)
-        if os.path.isdir(flat_dir):
-            found = sorted(glob.glob(os.path.join(flat_dir, "*.jpg")))
-            if found:
-                print(f"[NWPU] Trovate {len(found)} immagini in {flat_dir}")
-                self.img_paths = found
-                return
-        
-        raise FileNotFoundError(
-            f"Nessuna immagine trovata per split '{split}' in {self.root}"
-        )
-    
+        if len(found_imgs) > 0:
+            print(f"[NWPU] Trovate {len(found_imgs)} immagini in {base_dir}/scene*")
+            self.img_paths = found_imgs
+        else:
+            direct_pattern = os.path.join(base_dir, "*.jpg")
+            found_imgs = sorted(glob.glob(direct_pattern))
+            if len(found_imgs) > 0:
+                print(f"[NWPU] Trovate {len(found_imgs)} immagini direttamente in {base_dir}")
+                self.img_paths = found_imgs
+            else:
+                 raise RuntimeError(f"Nessuna immagine .jpg trovata in {base_dir} (cercato in scene* e root)")
+
     def load_points(self, img_path):
-        """Carica i punti GT per un'immagine."""
+        """
+        Carica i punti GT dal file .txt che si trova ACCANTO all'immagine.
+        """
         pts = []
         
-        # === PROVA 1: File .txt nella stessa cartella ===
+        # Sostituzione diretta: immagine.jpg -> immagine.txt
         txt_path = img_path.replace(".jpg", ".txt")
-        if os.path.isfile(txt_path):
-            pts = self._load_txt_points(txt_path)
-            return np.array(pts, dtype=np.float32)
         
-        # === PROVA 2: File .txt in cartella gt/ ===
-        base_name = os.path.splitext(os.path.basename(img_path))[0]
-        img_dir = os.path.dirname(img_path)
-        parent_dir = os.path.dirname(img_dir)
-        
-        gt_candidates = [
-            os.path.join(parent_dir, "gt", f"{base_name}.txt"),
-            os.path.join(img_dir.replace("/images", "/gt"), f"{base_name}.txt"),
-        ]
-        
-        for gt_path in gt_candidates:
-            if os.path.isfile(gt_path):
-                pts = self._load_txt_points(gt_path)
-                return np.array(pts, dtype=np.float32)
-        
-        return np.array(pts, dtype=np.float32)
-    
-    def _load_txt_points(self, txt_path):
-        """Carica punti da file .txt."""
-        pts = []
-        try:
-            with open(txt_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.replace(",", " ").split()
-                    if len(parts) >= 2:
-                        try:
-                            x = float(parts[0])
-                            y = float(parts[1])
-                            pts.append([x, y])
-                        except ValueError:
+        if os.path.exists(txt_path):
+            try:
+                with open(txt_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
                             continue
-        except Exception as e:
-            print(f"[NWPU] Errore lettura {txt_path}: {e}")
-        return pts
+                        
+                        # Parsing robusto: gestisce spazi o virgole
+                        parts = line.replace(",", " ").split()
+                        
+                        # NWPU solitamente ha formato: x y (e a volte altri dati che ignoriamo)
+                        if len(parts) >= 2:
+                            try:
+                                x = float(parts[0])
+                                y = float(parts[1])
+                                pts.append([x, y])
+                            except ValueError:
+                                continue
+            except Exception as e:
+                print(f"[NWPU] Errore lettura file {txt_path}: {e}")
+                
+        return np.array(pts, dtype=np.float32)

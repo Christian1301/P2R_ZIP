@@ -18,6 +18,9 @@ TARGET:
 - Recall > 90% (priorità alta - non perdere persone)
 - Precision > 50% (accettabile - Stage 2 correggerà)
 - F1 > 65%
+
+FIX v4.1:
+- Aggiunto resize automatico per immagini grandi durante validazione (evita OOM)
 """
 
 import os
@@ -133,6 +136,62 @@ def format_metrics_comparison(current: Dict, best: Dict) -> str:
         f"Current: R={current['recall']*100:.1f}% F1={current['f1']*100:.1f}% P={current['precision']*100:.1f}% | "
         f"Best: R={best['recall']*100:.1f}% F1={best['f1']*100:.1f}% P={best['precision']*100:.1f}%"
     )
+
+
+# =============================================================================
+# HELPER: Resize immagini grandi per evitare OOM
+# =============================================================================
+
+def resize_if_needed(
+    images: torch.Tensor,
+    gt_density: torch.Tensor,
+    block_size: int,
+    max_size: int = 1024
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Ridimensiona immagini e density map se superano max_size.
+    
+    Conserva il count totale nella density map scalando appropriatamente.
+    Assicura che le dimensioni siano multipli di block_size.
+    
+    Args:
+        images: [B, C, H, W] tensor immagini
+        gt_density: [B, 1, H, W] tensor density map
+        block_size: dimensione blocco per allineamento
+        max_size: dimensione massima consentita
+    
+    Returns:
+        images, gt_density ridimensionati (o originali se non necessario)
+    """
+    _, _, H, W = images.shape
+    
+    if max(H, W) <= max_size:
+        return images, gt_density
+    
+    # Calcola scala
+    scale = max_size / max(H, W)
+    new_H = int(H * scale)
+    new_W = int(W * scale)
+    
+    # Arrotonda a multiplo di block_size
+    new_H = (new_H // block_size) * block_size
+    new_W = (new_W // block_size) * block_size
+    
+    # Assicura dimensioni minime
+    new_H = max(new_H, block_size)
+    new_W = max(new_W, block_size)
+    
+    # Resize immagini
+    images = F.interpolate(images, size=(new_H, new_W), mode='bilinear', align_corners=False)
+    
+    # Resize density e scala per conservare count totale
+    # count_originale = sum(density) * pixel_area
+    # Dopo resize: count = sum(new_density) * new_pixel_area
+    # Per conservare: new_density = density * (H*W) / (new_H*new_W)
+    gt_density = F.interpolate(gt_density, size=(new_H, new_W), mode='bilinear', align_corners=False)
+    gt_density = gt_density * (H * W) / (new_H * new_W)
+    
+    return images, gt_density
 
 
 # =============================================================================
@@ -290,8 +349,19 @@ def validate(
     device: torch.device,
     block_size: int,
     loss_cfg: dict,
+    max_size: int = 1024,
 ) -> dict:
-    """Validazione con metriche complete."""
+    """
+    Validazione con metriche complete.
+    
+    Args:
+        model: modello da validare
+        dataloader: validation dataloader
+        device: device per computazione
+        block_size: dimensione blocco ZIP
+        loss_cfg: configurazione loss
+        max_size: dimensione massima immagine (evita OOM)
+    """
     model.eval()
     
     total_tp, total_tn, total_fp, total_fn = 0, 0, 0, 0
@@ -305,6 +375,9 @@ def validate(
     for images, gt_density, _ in tqdm(dataloader, desc="Validate", leave=False):
         images = images.to(device)
         gt_density = gt_density.to(device)
+        
+        # Resize se necessario per evitare OOM
+        images, gt_density = resize_if_needed(images, gt_density, block_size, max_size)
         
         outputs = model(images)
         loss, batch_metrics = compute_zip_loss_and_metrics(
@@ -361,10 +434,20 @@ def find_optimal_threshold(
     device: torch.device,
     block_size: int,
     target_recall: float = 0.90,
-    thresholds: List[float] = None
+    thresholds: List[float] = None,
+    max_size: int = 1024,
 ) -> dict:
     """
     Trova il threshold che garantisce un certo recall target.
+    
+    Args:
+        model: modello da analizzare
+        dataloader: validation dataloader
+        device: device per computazione
+        block_size: dimensione blocco ZIP
+        target_recall: recall minimo desiderato
+        thresholds: lista di threshold da testare
+        max_size: dimensione massima immagine (evita OOM)
     """
     if thresholds is None:
         thresholds = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
@@ -373,9 +456,12 @@ def find_optimal_threshold(
     
     threshold_stats = {t: {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0} for t in thresholds}
     
-    for images, gt_density, _ in dataloader:
+    for images, gt_density, _ in tqdm(dataloader, desc="Threshold Search", leave=False):
         images = images.to(device)
         gt_density = gt_density.to(device)
+        
+        # Resize se necessario per evitare OOM
+        images, gt_density = resize_if_needed(images, gt_density, block_size, max_size)
         
         outputs = model(images)
         pi_probs = outputs['pi_probs']
@@ -501,7 +587,7 @@ def main():
     init_seeds(config['SEED'])
     
     print("="*70)
-    print("🚀 STAGE 1 V4 - ZIP Pre-training con ZIP NLL Loss")
+    print("🚀 STAGE 1 V4.1 - ZIP Pre-training con ZIP NLL Loss")
     print("="*70)
     print(f"Device: {device}")
     print(f"Target: Recall > 90%, F1 > 65%")
@@ -556,6 +642,9 @@ def main():
     min_recall_threshold = best_selection_cfg.get('MIN_RECALL', 0.85)
     recall_margin = best_selection_cfg.get('RECALL_MARGIN', 0.02)
     
+    # Parametro per max_size validazione (evita OOM)
+    val_max_size = config.get('VAL_MAX_SIZE', 1024)
+    
     block_size = data_cfg.get('ZIP_BLOCK_SIZE', data_cfg.get('BLOCK_SIZE', 16))
     
     # Dataset
@@ -594,6 +683,7 @@ def main():
     )
     
     print(f"\n📊 Dataset: Train={len(train_dataset)}, Val={len(val_dataset)}")
+    print(f"📐 Validation max_size: {val_max_size} (resize immagini grandi)")
     
     # Model
     bins_config = config.get('BINS_CONFIG', {})
@@ -696,7 +786,10 @@ def main():
         
         # Validate
         if epoch % val_interval == 0:
-            val_metrics = validate(model, val_loader, device, block_size, loss_cfg)
+            val_metrics = validate(
+                model, val_loader, device, block_size, loss_cfg,
+                max_size=val_max_size
+            )
             
             print(f"\n📊 Epoch {epoch}:")
             print(f"   NLL:       {val_metrics['nll']:.4f}")
@@ -751,7 +844,8 @@ def main():
     thresh_results = find_optimal_threshold(
         model, val_loader, device, block_size,
         target_recall=0.90,
-        thresholds=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+        thresholds=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
+        max_size=val_max_size,
     )
     
     print(f"\n📊 Threshold Analysis:")
@@ -773,14 +867,15 @@ def main():
         'selection_config': {
             'min_recall_threshold': min_recall_threshold,
             'recall_margin': recall_margin,
-        }
+        },
+        'val_max_size': val_max_size,
     }
     
     with open(os.path.join(output_dir, 'stage1_v4_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
     
     print(f"\n{'='*70}")
-    print(f"🏁 STAGE 1 V4 COMPLETATO")
+    print(f"🏁 STAGE 1 V4.1 COMPLETATO")
     if best_metrics:
         print(f"   Best Recall:    {best_metrics['recall']*100:.2f}%")
         print(f"   Best Precision: {best_metrics['precision']*100:.2f}%")

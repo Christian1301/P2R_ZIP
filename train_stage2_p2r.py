@@ -551,8 +551,9 @@ def validate(
     dataloader: DataLoader,
     device: torch.device,
     default_down: int,
+    max_size: int = 1536  # Dimensione massima della patch per evitare OOM
 ) -> dict:
-    """Validazione."""
+    """Validazione con Sliding Window per immagini grandi."""
     model.eval()
     
     all_preds = []
@@ -561,30 +562,67 @@ def validate(
     
     for images, gt_density, points_list in tqdm(dataloader, desc="Validate"):
         images = images.to(device)
-        points_list = [p.to(device) for p in points_list]
+        # points_list è una lista di tensori, prendiamo il primo (batch size 1 in val)
+        pts = points_list[0]
+        gt = len(pts)
         
-        # Forward
-        outputs = model(images)
-        pred_density = outputs['p2r_density']
-        pi_probs = outputs['pi_probs']
+        B, C, H, W = images.shape
         
-        # Canonicalize
-        _, _, H_in, W_in = images.shape
-        pred_density, down_tuple, _ = canonicalize_p2r_grid(
-            pred_density, (H_in, W_in), default_down
-        )
-        cell_area = down_tuple[0] * down_tuple[1]
-        
-        # Count
-        for i, pts in enumerate(points_list):
-            gt = len(pts)
-            pred = (pred_density[i].sum() / cell_area).item()
+        # Se l'immagine è troppo grande, usa sliding window
+        if H > max_size or W > max_size:
+            pred_count = 0.0
+            pi_cov_temp = []
             
-            all_gts.append(gt)
-            all_preds.append(pred)
-        
-        # π coverage
-        coverage = (pi_probs > 0.5).float().mean().item() * 100
+            # Definisci patch size e stride (non sovrapposti per semplicità di conteggio)
+            patch_h, patch_w = max_size, max_size
+            
+            for y in range(0, H, patch_h):
+                for x in range(0, W, patch_w):
+                    # Calcola dimensioni effettive patch (gestione bordi)
+                    h_end = min(y + patch_h, H)
+                    w_end = min(x + patch_w, W)
+                    
+                    # Estrai patch
+                    patch = images[:, :, y:h_end, x:w_end]
+                    
+                    # Forward sulla patch
+                    outputs = model(patch)
+                    p_density = outputs['p2r_density']
+                    p_pi = outputs['pi_probs']
+                    
+                    # Canonicalize per ottenere l'area corretta della cella
+                    # Nota: down_tuple dipende dai canali, ma qui serve solo l'area
+                    _, down_tuple, _ = canonicalize_p2r_grid(
+                        p_density, (h_end-y, w_end-x), default_down
+                    )
+                    cell_area = down_tuple[0] * down_tuple[1]
+                    
+                    # Somma il conteggio della patch
+                    pred_count += (p_density.sum() / cell_area).item()
+                    
+                    # Monitoraggio PI coverage (approssimato per patch)
+                    pi_cov_temp.append((p_pi > 0.5).float().mean().item())
+            
+            pred = pred_count
+            coverage = np.mean(pi_cov_temp) * 100
+            
+        else:
+            # Procedura standard per immagini piccole
+            outputs = model(images)
+            pred_density = outputs['p2r_density']
+            pi_probs = outputs['pi_probs']
+            
+            _, _, H_in, W_in = images.shape
+            pred_density, down_tuple, _ = canonicalize_p2r_grid(
+                pred_density, (H_in, W_in), default_down
+            )
+            cell_area = down_tuple[0] * down_tuple[1]
+            
+            pred = (pred_density.sum() / cell_area).item()
+            coverage = (pi_probs > 0.5).float().mean().item() * 100
+
+        all_gts.append(gt)
+        all_preds.append(pred)
         pi_coverages.append(coverage)
     
     # Metriche

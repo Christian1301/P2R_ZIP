@@ -551,70 +551,96 @@ def validate(
     dataloader: DataLoader,
     device: torch.device,
     default_down: int,
-    max_size: int = 1536  # Dimensione massima della patch per evitare OOM
+    max_size: int = 1536  # Patch size (max VRAM usage)
 ) -> dict:
-    """Validazione con Sliding Window per immagini grandi."""
+    """
+    Validazione con Sliding Window e Safe Padding.
+    Gestisce immagini giganti e previene crash su patch troppo piccoli.
+    """
     model.eval()
     
     all_preds = []
     all_gts = []
     pi_coverages = []
     
+    # Fattore di downsample della backbone (VGG16 = 32)
+    # Serve per il padding: input deve essere multiplo di questo per evitare errori di arrotondamento/pooling
+    divisor = 32 
+    
     for images, gt_density, points_list in tqdm(dataloader, desc="Validate"):
         images = images.to(device)
-        # points_list è una lista di tensori, prendiamo il primo (batch size 1 in val)
         pts = points_list[0]
         gt = len(pts)
         
         B, C, H, W = images.shape
         
-        # Se l'immagine è troppo grande, usa sliding window
+        # SLIDING WINDOW LOGIC
         if H > max_size or W > max_size:
             pred_count = 0.0
             pi_cov_temp = []
             
-            # Definisci patch size e stride (non sovrapposti per semplicità di conteggio)
             patch_h, patch_w = max_size, max_size
             
             for y in range(0, H, patch_h):
                 for x in range(0, W, patch_w):
-                    # Calcola dimensioni effettive patch (gestione bordi)
                     h_end = min(y + patch_h, H)
                     w_end = min(x + patch_w, W)
                     
-                    # Estrai patch
                     patch = images[:, :, y:h_end, x:w_end]
                     
-                    # Forward sulla patch
+                    # --- SAFE PADDING START ---
+                    # Calcola dimensioni attuali
+                    curr_h, curr_w = patch.shape[2], patch.shape[3]
+                    
+                    # Calcola quanto padding serve per arrivare al prossimo multiplo di 32
+                    # Questo previene il crash "Output size is too small" su strisce sottili
+                    pad_h = (divisor - curr_h % divisor) % divisor
+                    pad_w = (divisor - curr_w % divisor) % divisor
+                    
+                    if pad_h > 0 or pad_w > 0:
+                        # Pad: (left, right, top, bottom)
+                        patch = F.pad(patch, (0, pad_w, 0, pad_h))
+                    # --- SAFE PADDING END ---
+
+                    # Forward
                     outputs = model(patch)
                     p_density = outputs['p2r_density']
                     p_pi = outputs['pi_probs']
                     
-                    # Canonicalize per ottenere l'area corretta della cella
-                    # Nota: down_tuple dipende dai canali, ma qui serve solo l'area
+                    # Canonicalize
+                    # Qui è importante: usiamo le dimensioni PADDATE per calcolare l'area corretta
+                    # perché la densità predetta copre anche l'area di padding.
+                    # Poiché il padding è nero, la densità lì sarà ~0, quindi sommare tutto è sicuro.
                     _, down_tuple, _ = canonicalize_p2r_grid(
-                        p_density, (h_end-y, w_end-x), default_down
+                        p_density, (curr_h + pad_h, curr_w + pad_w), default_down
                     )
                     cell_area = down_tuple[0] * down_tuple[1]
                     
-                    # Somma il conteggio della patch
+                    # Accumula conteggio
                     pred_count += (p_density.sum() / cell_area).item()
                     
-                    # Monitoraggio PI coverage (approssimato per patch)
+                    # Stats
                     pi_cov_temp.append((p_pi > 0.5).float().mean().item())
             
             pred = pred_count
             coverage = np.mean(pi_cov_temp) * 100
             
         else:
-            # Procedura standard per immagini piccole
+            # Immagine intera (se piccola) - Applichiamo lo stesso padding per sicurezza
+            curr_h, curr_w = H, W
+            pad_h = (divisor - curr_h % divisor) % divisor
+            pad_w = (divisor - curr_w % divisor) % divisor
+            
+            if pad_h > 0 or pad_w > 0:
+                images = F.pad(images, (0, pad_w, 0, pad_h))
+                
             outputs = model(images)
             pred_density = outputs['p2r_density']
             pi_probs = outputs['pi_probs']
             
-            _, _, H_in, W_in = images.shape
-            pred_density, down_tuple, _ = canonicalize_p2r_grid(
-                pred_density, (H_in, W_in), default_down
+            # Canonicalize su dimensioni paddate
+            _, down_tuple, _ = canonicalize_p2r_grid(
+                pred_density, (curr_h + pad_h, curr_w + pad_w), default_down
             )
             cell_area = down_tuple[0] * down_tuple[1]
             
@@ -625,7 +651,7 @@ def validate(
         all_preds.append(pred)
         pi_coverages.append(coverage)
     
-    # Metriche
+    # Calcolo metriche finali
     all_preds = np.array(all_preds)
     all_gts = np.array(all_gts)
     
@@ -633,10 +659,7 @@ def validate(
     rmse = np.sqrt(np.mean((all_preds - all_gts) ** 2))
     
     valid_mask = all_gts > 0
-    if valid_mask.sum() > 0:
-        bias = np.mean(all_preds[valid_mask] / all_gts[valid_mask])
-    else:
-        bias = 1.0
+    bias = np.mean(all_preds[valid_mask] / all_gts[valid_mask]) if valid_mask.sum() > 0 else 1.0
     
     return {
         'mae': mae,

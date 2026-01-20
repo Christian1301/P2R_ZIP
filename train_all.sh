@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=p2r_crowd
+#SBATCH --job-name=train_sha
 #SBATCH --account=did_crowd_counting_339   # ECCO IL NOME ESATTO (col 339 finale)
-#SBATCH --partition=aiq                    # Usiamo la partizione AIQ (suggerita dal QOS)
+#SBATCH --partition=gpuq                    # Usiamo la partizione AIQ (suggerita dal QOS)
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --time=07:00:00                    # Limite massimo
@@ -30,11 +30,11 @@ echo "🚀 Avvio Stage 1 (ZIP)..."
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
-#python3 train_stage2_p2r.py --config config.yaml > logs/stage2.log 2>&1
+python3 train_stage2_pure.py  > logs/stage2_pure.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python3 train_stage3_joint.py  > logs/stage3.log 2>&1
+python stage3_dual_fusion.py --ckpt-zip "exp/shha_v15/best_model.pth" --ckpt-p2r "exp/shha_v15/stage2_best.pth" > logs/stage3_alter.log 2>&1
 echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."

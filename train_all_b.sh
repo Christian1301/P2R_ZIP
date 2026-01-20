@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=p2r_crowd
+#SBATCH --job-name=train_b
 #SBATCH --account=did_crowd_counting_339   # ECCO IL NOME ESATTO (col 339 finale)
 #SBATCH --partition=aiq                    # Usiamo la partizione AIQ (suggerita dal QOS)
 #SBATCH --gres=gpu:1

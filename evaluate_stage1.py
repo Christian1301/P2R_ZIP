@@ -93,7 +93,7 @@ def resize_if_needed(images, max_size=2048):
 
 
 @torch.no_grad()
-def validate_with_metrics(model, dataloader, device, block_size, pi_threshold=0.5, max_size=2048):
+def validate_with_metrics(model, dataloader, device, block_size, pi_threshold=0.3, max_size=2048):
     """
     Validazione Stage 1 con metriche dettagliate.
     

@@ -362,8 +362,11 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(model, scale_comp, dataloader, device, default_down, alpha):
-    """Validazione con soft weighting."""
+def validate(model, scale_comp, dataloader, device, default_down, alpha, max_size=1536):
+    """
+    Validazione Stage 3 con Sliding Window e Safe Padding.
+    Previene OOM e crash 'Output size too small'.
+    """
     model.eval()
     scale_comp.eval()
     
@@ -372,47 +375,119 @@ def validate(model, scale_comp, dataloader, device, default_down, alpha):
         'weighted': {'mae': [], 'pred': 0, 'gt': 0},
     }
     
+    # Ottieni il fattore di scala attuale
     scale = scale_comp.get_scale()
+    
+    # Fattore di downsample della backbone (VGG16 = 32)
+    divisor = 32
     
     for images, _, points in tqdm(dataloader, desc="Validate", leave=False):
         images = images.to(device)
-        points_list = [p.to(device) for p in points]
+        pts = points[0]
+        gt = len(pts)
         
-        outputs = model(images)
-        raw_density = outputs['p2r_density']
-        pi_probs = outputs['pi_probs']
+        B, C, H, W = images.shape
         
-        _, _, H_in, W_in = images.shape
-        raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
-        cell_area = down_tuple[0] * down_tuple[1]
+        # Accumulatori per l'immagine corrente
+        pred_raw_total = 0.0
+        pred_weighted_total = 0.0
         
-        # Applica scale
-        scaled_density = raw_density * scale
-        
-        # Align π
-        if pi_probs.shape[-2:] != scaled_density.shape[-2:]:
-            pi_aligned = F.interpolate(pi_probs, size=scaled_density.shape[-2:], mode='bilinear', align_corners=False)
+        # --- LOGICA SLIDING WINDOW ---
+        if H > max_size or W > max_size:
+            patch_h, patch_w = max_size, max_size
+            
+            for y in range(0, H, patch_h):
+                for x in range(0, W, patch_w):
+                    # Coordinate effettive patch
+                    h_end = min(y + patch_h, H)
+                    w_end = min(x + patch_w, W)
+                    
+                    patch = images[:, :, y:h_end, x:w_end]
+                    
+                    # --- SAFE PADDING START ---
+                    curr_h, curr_w = patch.shape[2], patch.shape[3]
+                    pad_h = (divisor - curr_h % divisor) % divisor
+                    pad_w = (divisor - curr_w % divisor) % divisor
+                    
+                    if pad_h > 0 or pad_w > 0:
+                        patch = F.pad(patch, (0, pad_w, 0, pad_h))
+                    # --- SAFE PADDING END ---
+                    
+                    # Forward sulla patch
+                    outputs = model(patch)
+                    raw_density = outputs['p2r_density']
+                    pi_probs = outputs['pi_probs']
+                    
+                    # Canonicalize (usa dimensioni paddate per area corretta)
+                    # Il padding è nero -> density 0 -> somma corretta
+                    _, down_tuple, _ = canonicalize_p2r_grid(
+                        raw_density, (curr_h + pad_h, curr_w + pad_w), default_down
+                    )
+                    cell_area = down_tuple[0] * down_tuple[1]
+                    
+                    # 1. Applica Scale Compensation
+                    scaled_density = raw_density * scale
+                    
+                    # 2. Allinea π alla density
+                    if pi_probs.shape[-2:] != scaled_density.shape[-2:]:
+                        pi_aligned = F.interpolate(
+                            pi_probs, 
+                            size=scaled_density.shape[-2:], 
+                            mode='bilinear', 
+                            align_corners=False
+                        )
+                    else:
+                        pi_aligned = pi_probs
+                    
+                    # 3. Calcola Soft Weights
+                    soft_weights = (1 - alpha) + alpha * pi_aligned
+                    
+                    # 4. Calcola density pesata
+                    weighted_density = scaled_density * soft_weights
+                    
+                    # Somma i conteggi della patch
+                    pred_raw_total += (scaled_density.sum() / cell_area).item()
+                    pred_weighted_total += (weighted_density.sum() / cell_area).item()
+                    
         else:
-            pi_aligned = pi_probs
-        
-        # Soft weights
-        soft_weights = (1 - alpha) + alpha * pi_aligned
-        weighted_density = scaled_density * soft_weights
-        
-        for i, pts in enumerate(points_list):
-            gt = len(pts)
+            # --- IMMAGINE PICCOLA (Standard con Padding) ---
+            # Anche qui applichiamo padding per sicurezza se le dimensioni sono strane
+            curr_h, curr_w = H, W
+            pad_h = (divisor - curr_h % divisor) % divisor
+            pad_w = (divisor - curr_w % divisor) % divisor
             
-            # Raw (con scale applicato)
-            pred_raw = (scaled_density[i].sum() / cell_area).item()
-            results['raw']['mae'].append(abs(pred_raw - gt))
-            results['raw']['pred'] += pred_raw
-            results['raw']['gt'] += gt
+            if pad_h > 0 or pad_w > 0:
+                images = F.pad(images, (0, pad_w, 0, pad_h))
+
+            outputs = model(images)
+            raw_density = outputs['p2r_density']
+            pi_probs = outputs['pi_probs']
             
-            # Weighted (con scale applicato)
-            pred_w = (weighted_density[i].sum() / cell_area).item()
-            results['weighted']['mae'].append(abs(pred_w - gt))
-            results['weighted']['pred'] += pred_w
-            results['weighted']['gt'] += gt
+            _, _, H_in, W_in = images.shape # H_in/W_in sono già paddati qui
+            raw_density, down_tuple, _ = canonicalize_p2r_grid(raw_density, (H_in, W_in), default_down)
+            cell_area = down_tuple[0] * down_tuple[1]
+            
+            scaled_density = raw_density * scale
+            
+            if pi_probs.shape[-2:] != scaled_density.shape[-2:]:
+                pi_aligned = F.interpolate(pi_probs, size=scaled_density.shape[-2:], mode='bilinear', align_corners=False)
+            else:
+                pi_aligned = pi_probs
+            
+            soft_weights = (1 - alpha) + alpha * pi_aligned
+            weighted_density = scaled_density * soft_weights
+            
+            pred_raw_total = (scaled_density.sum() / cell_area).item()
+            pred_weighted_total = (weighted_density.sum() / cell_area).item()
+
+        # --- AGGIORNAMENTO METRICHE ---
+        results['raw']['mae'].append(abs(pred_raw_total - gt))
+        results['raw']['pred'] += pred_raw_total
+        results['raw']['gt'] += gt
+        
+        results['weighted']['mae'].append(abs(pred_weighted_total - gt))
+        results['weighted']['pred'] += pred_weighted_total
+        results['weighted']['gt'] += gt
     
     return {
         'mae_raw': np.mean(results['raw']['mae']),

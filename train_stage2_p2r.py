@@ -675,7 +675,7 @@ def validate(
 # CHECKPOINT
 # =============================================================================
 
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_mae, output_dir, is_best=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_mae, output_dir, is_best=False, early_stopping=None):
     """Salva checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -688,6 +688,10 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, best_mae, outpu
         'best_mae': best_mae,
         'mae': metrics['mae'],
         'log_scale': model.p2r_head.get_log_scale(),
+        'early_stopping': {
+            'counter': early_stopping.counter,
+            'best_score': early_stopping.best_score,
+        } if early_stopping else None,
     }
     
     torch.save(checkpoint, os.path.join(output_dir, 'stage2_bypass_last.pth'))
@@ -1020,6 +1024,11 @@ def main():
             scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
         best_mae = ckpt.get('best_mae', float('inf'))
+        # Ripristina stato early stopping
+        if ckpt.get('early_stopping'):
+            early_stopping.counter = ckpt['early_stopping']['counter']
+            early_stopping.best_score = ckpt['early_stopping']['best_score']
+            print(f"   Early stopping: counter={early_stopping.counter}, best_score={early_stopping.best_score:.2f}")
         print(f"   Epoch {ckpt['epoch']}, Best MAE: {best_mae:.2f}")
     
     # =========================================================================
@@ -1084,7 +1093,8 @@ def main():
             
             save_checkpoint(
                 model, optimizer, scheduler, epoch,
-                val_metrics, best_mae, output_dir, is_best
+                val_metrics, best_mae, output_dir, is_best,
+                early_stopping=early_stopping
             )
             
             # Save history

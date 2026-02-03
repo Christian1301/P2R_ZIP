@@ -97,30 +97,26 @@ P2R_LOSS:
 # ============================================================
 OPTIM_JOINT:
   BATCH_SIZE: 8
-  EPOCHS: 2000
-  
-  # LR di base (sovrascritti da STAGE3_FUSION sotto)
-  LR_BACKBONE: 0.0 
-  LR_ZIP_HEAD: 0.0
-  LR_P2R_HEAD: 1.0e-7
 
-  WEIGHT_DECAY: 1.0e-4
-  EARLY_STOPPING_PATIENCE: 1000
-  GRAD_CLIP: 0.5
-  WARMUP_EPOCHS: 0
-  VAL_INTERVAL: 2
-
-# --- CONFIGURAZIONE SPECIFICA FUSION ---
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.1       # <--- MODIFICA: Abbassato da 0.3 (ZIP incide solo al 10%)
-  ALPHA_WARMUP: 20
+  ALPHA_END: 0.1        # (Era 0.2/0.3 - Troppo aggressivo)
+  ALPHA_WARMUP: 20      # Warmup veloce
+
+  # --- CRUCIALE: FREEZE P2R ---
+  # Mettendo LR a 0.0, impediamo che i pesi dello Stage 2 cambino.
+  # Il MAE RAW rimarrà fisso a ~62.22.
+  LR_P2R: 0.0           # (Era 1.0e-5 - Questo ha causato il peggioramento)
   
-  LR_P2R: 1.0e-7       # <--- MODIFICA: Abbassato drasticamente (Congela i pesi P2R buoni)
-  LR_SCALE: 1.0e-2     # <--- MODIFICA: Alzato x10 (Per adattare velocemente il volume)
+  # Imariamo solo la compensazione di scala
+  LR_SCALE: 1.0e-3
   
-  SPATIAL_WEIGHT: 0.05
-  EPOCHS: 300
+  # --- CRUCIALE: DISABILITA SPATIAL LOSS ---
+  # Su JHU la ZIP map è imprecisa. Non forzare la density ad assomigliarle.
+  SPATIAL_WEIGHT: 0.0   # (Era 0.05 - Questo confondeva il conteggio)
+
+  # Training rapido (stiamo calibrando solo lo scale)
+  EPOCHS: 150      
   PATIENCE: 80
 
 JOINT_LOSS:

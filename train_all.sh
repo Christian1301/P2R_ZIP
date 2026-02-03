@@ -34,7 +34,7 @@ python3 train_stage2_pure.py  > logs/stage2_pure.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python stage3_dual_fusion.py --ckpt-zip "exp/shha_v15/best_model.pth" --ckpt-p2r "exp/shha_v15/stage2_best.pth" > logs/stage3_alter.log 2>&1
+python3 train_stage3_alter.py --ckpt-zip "exp/shha_v15/best_model.pth" --ckpt-p2r "exp/shha_v15/stage2_best.pth" > logs/stage3_alter.log 2>&1
 echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."

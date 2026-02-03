@@ -29,7 +29,7 @@ CONFIG="config_nwpu.yaml"
 echo "📋 Usando configurazione: $CONFIG"
 
 echo "🚀 Avvio Stage 1 (ZIP)..."
-python3 train_stage1_zip.py --config $CONFIG > logs_nwpu/stage1.log 2>&1
+#python3 train_stage1_zip.py --config $CONFIG > logs_nwpu/stage1.log 2>&1
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."

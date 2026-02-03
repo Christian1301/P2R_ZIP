@@ -93,20 +93,30 @@ P2R_LOSS:
   LOG_SCALE_LR_MULT: 0.1
 
 # ============================================================
-# STAGE 3 FUSION CONFIGURATION
+# STAGE 3 FUSION CONFIGURATION (JHU OPTIMIZED - FROZEN MODE)
 # ============================================================
 OPTIM_JOINT:
-  BATCH_SIZE: 6  # Se OOM, riduci a 4
-  
-# Parametri specifici per lo script Fusion
+  BATCH_SIZE: 6
+
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.3
-  ALPHA_WARMUP: 50
-  LR_P2R: 1.0e-5
+  ALPHA_END: 0.1        # (Era 0.2/0.3 - Troppo aggressivo)
+  ALPHA_WARMUP: 20      # Warmup veloce
+
+  # --- CRUCIALE: FREEZE P2R ---
+  # Mettendo LR a 0.0, impediamo che i pesi dello Stage 2 cambino.
+  # Il MAE RAW rimarrà fisso a ~62.22.
+  LR_P2R: 0.0           # (Era 1.0e-5 - Questo ha causato il peggioramento)
+  
+  # Imariamo solo la compensazione di scala
   LR_SCALE: 1.0e-3
-  SPATIAL_WEIGHT: 0.05
-  EPOCHS: 300
+  
+  # --- CRUCIALE: DISABILITA SPATIAL LOSS ---
+  # Su JHU la ZIP map è imprecisa. Non forzare la density ad assomigliarle.
+  SPATIAL_WEIGHT: 0.0   # (Era 0.05 - Questo confondeva il conteggio)
+
+  # Training rapido (stiamo calibrando solo lo scale)
+  EPOCHS: 150      
   PATIENCE: 80
 
 # ============================================================

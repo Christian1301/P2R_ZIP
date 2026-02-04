@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train_qnrf
 #SBATCH --account=did_crowd_counting_339   # ECCO IL NOME ESATTO (col 339 finale)
-#SBATCH --partition=aiq                    # Usiamo la partizione AIQ (suggerita dal QOS)
+#SBATCH --partition=gpuq                    # Usiamo la partizione GPUQ (suggerita dal QOS)
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --time=07:00:00                    # Limite massimo
@@ -37,12 +37,14 @@ echo "🚀 Avvio Stage 2 (P2R)..."
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python train_stage3_joint.py --config config_qnrf.yaml \
-    --alpha-end 0.10 \
-    --alpha-warmup 20 \
-    --epochs 60 \
-    --lr-scale 0.01 \
-    --patience 30 > logs_qnrf/stage3.log 2>&1
+python3 train_stage3_joint.py --config config_qnrf.yaml \
+    --alpha-end 0.15 \
+    --alpha-warmup 30 \
+    --lr-p2r 5e-6 \
+    --lr-scale 1e-3 \
+    --spatial-weight 0.02 \
+    --epochs 200 \
+    --patience 60 > logs_qnrf/stage3.log 2>&1
 echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."
@@ -53,10 +55,10 @@ echo "✅ Valutazione 1 completata!"
 python3 evaluate_stage2.py --config $CONFIG --split test > logs_qnrf/ev_stage2.log 2>&1
 echo "✅ Valutazione 2 completata!"
 
-python evaluate_stage3.py --config config_qnrf.yaml \
+python3 evaluate_stage3.py --config config_qnrf.yaml \
     --split test \
-    --checkpoint exp/qnrf/stage2_bypass_best.pth \
-    --soft-alpha 0.10 \
+    --checkpoint exp/qnrf/stage3_fusion_best.pth \
+    --soft-alpha 0.15 \
     --pi-thresh 0.2 \
     --tta --tta-flip-only > logs_qnrf/ev_stage3.log 2>&1
 echo "✅ Valutazione 3 completata!"

@@ -30,11 +30,18 @@ echo "🚀 Avvio Stage 1 (ZIP)..."
 echo "✅ Stage 1 completato!"
 
 echo "🚀 Avvio Stage 2 (P2R)..."
-python3 train_stage2_pure.py  > logs/stage2_pure.log 2>&1
+#python3 train_stage2_pure.py  > logs/stage2_pure.log 2>&1
 echo "✅ Stage 2 completato!"
 
 echo "🚀 Avvio Stage 3 (JOINT)..."
-python3 train_stage3_alter.py --ckpt-zip "exp/shha_v15/best_model.pth" --ckpt-p2r "exp/shha_v15/stage2_best.pth" > logs/stage3_alter.log 2>&1
+python3 train_stage3_joint.py --config config.yaml \
+    --alpha-end 0.3 \
+    --alpha-warmup 50 \
+    --lr-p2r 1e-5 \
+    --lr-scale 1e-3 \
+    --spatial-weight 0.05 \
+    --epochs 300 \
+    --patience 80 > logs/stage3_joint.log 2>&1
 echo "✅ Stage 3 completato!"
 
 echo "🚀 Avvio Valutazioni..."
@@ -48,7 +55,12 @@ echo "✅ Valutazione 2 completata!"
 python3 tune_alpha.py > logs/tune_alpha.log 2>&1
 echo "✅ Tuning alpha completato!"
 
-python evaluate_stage3.py --config config.yaml --tta --tta-flip-only > logs/ev_stage3.log 2>&1
+python3 evaluate_stage3.py --config config.yaml \
+    --split test \
+    --checkpoint exp/shha_v15/stage3_fusion_best_daUsare.pth \
+    --soft-alpha 0.3 \
+    --pi-thresh 0.2 \
+    --tta --tta-flip-only > logs/ev_stage3.log 2>&1
 echo "✅ Valutazione 3 completata!"
 
 python3 visualize_gating.py > logs/visualize_gating.log 2>&1

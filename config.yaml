@@ -93,34 +93,15 @@ P2R_LOSS:
 # ============================================================
 # STAGE 3: Joint Training - FINETUNING (CRITICO)
 # ============================================================
-OPTIM_JOINT:
-  BATCH_SIZE: 8
-  EPOCHS: 2000
-  
-  # --- LEARNING RATES RIDOTTI (10x rispetto a prima) ---
-  # Questo ferma l'overfitting del P2R e stabilizza il training
-  LR_BACKBONE: 1.0e-6     # Era 1e-5
-  LR_ZIP_HEAD: 5.0e-7     # Era 1e-6 (o 2e-5)
-  LR_P2R_HEAD: 1.0e-6     # Era 5e-6
-  # -----------------------------------------------------
-
-  WEIGHT_DECAY: 1.0e-4
-  EARLY_STOPPING_PATIENCE: 1000
-  GRAD_CLIP: 0.5
-  
-  # Ripartiamo da un modello già caldo, niente warmup
-  WARMUP_EPOCHS: 0        
-  VAL_INTERVAL: 2         # Validazione più frequente per monitorare
-
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.3
-  ALPHA_WARMUP: 50
-  LR_P2R: 1.0e-5
-  LR_SCALE: 1.0e-3
-  SPATIAL_WEIGHT: 0.05
-  EPOCHS: 300
-  PATIENCE: 80
+  ALPHA_END: 0.15        # Ridotto da 0.3
+  ALPHA_WARMUP: 30       # Ridotto da 50
+  LR_P2R: 5.0e-6         # Ridotto da 1e-5
+  LR_SCALE: 5.0e-3
+  SPATIAL_WEIGHT: 0.0    # Disabilitato (era 0.05)
+  EPOCHS: 100
+  PATIENCE: 40
 
 JOINT_LOSS:
   COUNT_WEIGHT: 1.0

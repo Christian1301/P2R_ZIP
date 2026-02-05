@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluate Stage 3 - Con Scale Compensation e TTA
+Evaluate Stage 3 - Con Scale Compensation, TTA e Confusion Matrix
 
 Supporta:
 1. Scale Compensation dal checkpoint Stage 3
 2. TTA: flip orizzontale + multi-scale
 3. Modalità: RAW, MASKED, SOFT
+4. Confusion Matrix per la ZIP Head (Background vs Crowd)
 
 USO:
-    # Valuta su val set (default)
-    python evaluate_stage3.py --config config_jhu.yaml
-    
-    # Valuta su test set
-    python evaluate_stage3.py --config config_jhu.yaml --split test
-    
-    # Con TTA
-    python evaluate_stage3.py --config config_jhu.yaml --split test --tta
-    
-    # Salva risultati
     python evaluate_stage3.py --config config_jhu.yaml --split test --save-results
 """
 
@@ -34,6 +25,11 @@ import argparse
 import math
 import json
 from datetime import datetime
+
+# --- IMPORTS PER CONFUSION MATRIX ---
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 from models.p2r_zip_model import P2R_ZIP_Model
 from datasets import get_dataset
@@ -246,12 +242,11 @@ def evaluate(
     use_tta=False,
     tta_scales=None,
     max_size=2048,
+    output_dir=None,  # Aggiunto per salvare la CM
 ):
     """
     Valuta con tre modalità: RAW, MASKED (hard), SOFT.
-    
-    Args:
-        max_size: dimensione massima per lato (evita OOM su immagini grandi)
+    Genera anche la Confusion Matrix per la ZIP Head.
     """
     model.eval()
     if scale_comp is not None:
@@ -285,12 +280,17 @@ def evaluate(
         for mode in ['raw', 'masked', 'soft']
     }
     
+    # Accumulatore per Confusion Matrix (0=Bkg, 1=Crowd)
+    # Formato: [[TN, FP], [FN, TP]]
+    total_cm = np.zeros((2, 2), dtype=np.int64)
+    
     coverages = []
     pi_ratios = []
     scale_value = scale_comp.get_scale() if scale_comp else 1.0
     
     for images, densities, points in tqdm(dataloader, desc="Evaluating"):
         images = images.to(device)
+        gt_density_map = densities.to(device) # GT density per la CM
         points_list = [p.to(device) for p in points]
         
         # Ridimensiona se troppo grande
@@ -313,19 +313,38 @@ def evaluate(
             if scale_comp is not None:
                 raw_density = raw_density * scale_value
         
-        # Resize π
-        if pi_probs.shape[-2:] != raw_density.shape[-2:]:
+        # --- CONFUSION MATRIX CALCULATION ---
+        # 1. Resize PI to match GT Density (o viceversa). 
+        # Solitamente GT Density ha dimensione dell'input originale o scalata.
+        # Adattiamo PI alla dimensione della GT Density per il confronto pixel-wise.
+        if pi_probs.shape[-2:] != gt_density_map.shape[-2:]:
             pi_probs_resized = F.interpolate(
-                pi_probs, size=raw_density.shape[-2:], mode='bilinear', align_corners=False
+                pi_probs, size=gt_density_map.shape[-2:], mode='bilinear', align_corners=False
             )
         else:
             pi_probs_resized = pi_probs
+
+        # 2. Binarizzazione corretta
+        # GT: 0 = Sfondo, 1 = Folla (già corretta)
+        binary_gt = (gt_density_map > 1e-3).cpu().numpy().flatten()
+
+        # Pred: pi_probs è la probabilità di FOLLA (canale 1)
+        # Se Pi >= 0.5 significa che il modello vede FOLLA (1)
+        binary_pred = (pi_probs_resized >= 0.5).cpu().numpy().flatten()
+        
+        # 3. Accumulo Batch-wise (per memoria)
+        # labels=[0, 1] assicura che la matrice sia sempre 2x2 anche se mancano classi nel batch
+        batch_cm = confusion_matrix(binary_gt, binary_pred, labels=[0, 1])
+        total_cm += batch_cm
+        
+        # --- FINE CM CALCULATION ---
         
         coverage = (pi_probs_resized > pi_threshold).float().mean().item() * 100
         coverages.append(coverage)
         pi_ratios.append(pi_probs_resized.mean().item())
         
-        # Density variants
+        # Density variants (nota: qui pi_probs_resized è utile per applicare mask coerenti se servisse, 
+        # ma le funzioni apply_... gestiscono internamente l'interpolazione su raw_density)
         masked_density = apply_hard_mask(raw_density, pi_probs, pi_threshold)
         soft_density = apply_soft_weighting(raw_density, pi_probs, soft_alpha)
         
@@ -349,6 +368,35 @@ def evaluate(
                         density_results[mode][bin_name]['mae'].append(abs(pred - gt))
                         density_results[mode][bin_name]['count'] += 1
     
+    # --- PLOT CONFUSION MATRIX ---
+    if output_dir:
+        try:
+            # Normalizza per righe (True Label) per avere le percentuali
+            cm_normalized = total_cm.astype('float') / total_cm.sum(axis=1)[:, np.newaxis]
+            
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm_normalized, annot=True, fmt=".2%", cmap="Blues",
+                        xticklabels=["Background", "Crowd"],
+                        yticklabels=["Background", "Crowd"])
+            plt.xlabel("Predicted Label (via ZIP)")
+            plt.ylabel("True Label (via Density)")
+            plt.title("ZIP Head Classification Performance (Pixel-level)")
+            
+            cm_path = os.path.join(output_dir, "confusion_matrix.png")
+            plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"\n📊 Confusion Matrix salvata in: {cm_path}")
+            
+            # Stampa anche testuale
+            tn, fp, fn, tp = total_cm.ravel()
+            print(f"   TN (Bkg correctly identified): {tn:,}")
+            print(f"   FP (Bkg classified as Crowd):  {fp:,}")
+            print(f"   FN (Crowd missed - dangerous): {fn:,}")
+            print(f"   TP (Crowd correctly found):    {tp:,}")
+            
+        except Exception as e:
+            print(f"⚠️ Errore durante generazione plot CM: {e}")
+
     # Calcola metriche finali
     final_results = {}
     
@@ -643,6 +691,13 @@ def main():
     if 'best_mae' in state:
         print(f"   Best MAE (training): {state['best_mae']:.2f}")
     
+    # Definisci directory di output per la CM (di default nella cartella exp)
+    if args.output:
+        cm_output_dir = os.path.dirname(args.output)
+    else:
+        cm_output_dir = output_dir
+    os.makedirs(cm_output_dir, exist_ok=True)
+
     # Valutazione
     results = evaluate(
         model=model,
@@ -655,6 +710,7 @@ def main():
         use_tta=args.tta,
         tta_scales=tta_scales,
         max_size=args.max_size,
+        output_dir=cm_output_dir
     )
     
     # Stampa risultati
@@ -682,7 +738,9 @@ def main():
             }
         }
         
-        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        # Le array numpy della CM nel plot non sono serializzabili nel json principale,
+        # quindi non c'è problema perché non le salviamo in results, ma solo il png.
+        
         with open(output_path, 'w') as f:
             json.dump(results_json, f, indent=2)
         

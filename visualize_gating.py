@@ -332,6 +332,38 @@ def visualize_sample(
     plt.savefig(out_name, dpi=150)
     print(f"💾 Visualizzazione salvata: {out_name}")
     plt.close()
+    
+    # Apri automaticamente l'immagine
+    import subprocess
+    import platform
+    import shutil
+    
+    abs_path = str(out_name.resolve())
+    system = platform.system()
+    opened = False
+    
+    try:
+        if system == "Linux":
+            # Prova diversi visualizzatori comuni su Linux
+            viewers = ["xdg-open", "eog", "feh", "display", "gpicview", "sxiv", "code"]
+            for viewer in viewers:
+                if shutil.which(viewer):
+                    subprocess.Popen([viewer, abs_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"🖼️ Immagine aperta con: {viewer}")
+                    opened = True
+                    break
+        elif system == "Darwin":  # macOS
+            subprocess.Popen(["open", abs_path])
+            opened = True
+        elif system == "Windows":
+            os.startfile(abs_path)
+            opened = True
+            
+        if not opened:
+            print(f"📂 Nessun visualizzatore trovato. Apri manualmente:\n   {abs_path}")
+    except Exception as e:
+        print(f"⚠️ Impossibile aprire l'immagine automaticamente: {e}")
+        print(f"📂 Percorso immagine: {abs_path}")
 
 # =============================================================================
 # MAIN
@@ -345,7 +377,7 @@ if __name__ == "__main__":
     
     # Parametri visualizzazione
     parser.add_argument("--block-size", type=int, default=16, help="Dimensione blocco ZIP")
-    parser.add_argument("--tau", type=float, default=0.5, help="Soglia per visualizzazione Hard Gating")
+    parser.add_argument("--tau", type=float, default=0.3, help="Soglia per visualizzazione Hard Gating")
     
     # Parametri Stage 3 Soft
     parser.add_argument("--alpha", type=float, default=0.25, help="Alpha per Soft Fusion (0.25 default)")

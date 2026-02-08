@@ -1,0 +1,165 @@
+# ============================================================
+# CONFIG JHU-CROWD++ - FUSION MODE
+# Obiettivo: Joint Training su JHU (Dataset Complesso e Vario)
+# ============================================================
+
+RUN_NAME: "jhu"
+EXPERIMENT_DIR: "exp"
+
+# ============================================================
+# DATASET
+# ============================================================
+DATASET:
+  NAME: "jhu"
+  ROOT: "/home/C.ROMANO50/datasets/content/JHU"
+  BLOCK_SIZE: 16
+  NUM_WORKERS: 4
+
+# ============================================================
+# MODEL
+# ============================================================
+MODEL:
+  BACKBONE: "vgg16_bn"
+  BACKBONE_PRETRAINED: true
+  
+  # Stage 3 Fusion sblocca tutto
+  FREEZE_BACKBONE_STAGE1: false
+  FREEZE_BACKBONE_STAGE2: false
+  FREEZE_BACKBONE_STAGE3: false
+  
+  ZIP_HIDDEN_DIM: 256
+  ZIP_PI_THRESH: 0.2
+  
+  P2R_FEA_CHANNEL: 256
+  P2R_OUT_STRIDE: 16
+
+ZIP_HEAD:
+  LAMBDA_SCALE: 1.2
+  LAMBDA_MAX: 8.0
+  USE_SOFTPLUS: true
+
+# ============================================================
+# STAGE 1 & 2 (Standard per compatibilità)
+# ============================================================
+# ============================================================
+# STAGE 1 - OTTIMIZZATO PER JHU (più conservativo)
+# ============================================================
+OPTIM_ZIP:
+  EPOCHS: 3000           # Più epoche per dataset complesso
+  BATCH_SIZE: 8          # Batch più grande se possibile
+  LR: 3.0e-5             # LR più basso per stabilità
+  LR_BACKBONE: 1.0e-5    # Backbone ancora più lento
+  HEAD_LR: 5.0e-5        # Head può imparare più veloce
+  WEIGHT_DECAY: 1.0e-4   # Più regularizzazione
+  WARMUP_EPOCHS: 150     # Warmup più lungo
+  EARLY_STOPPING_PATIENCE: 900  # Più pazienza
+  GRAD_CLIP: 0.5         # Clip più aggressivo
+  VAL_INTERVAL: 10
+  NUM_WORKERS: 4
+
+ZIP_LOSS_V4:
+  WEIGHT_NLL: 1.0
+  WEIGHT_LAMBDA_REG: 0.005   # Meno regolarizzazione su λ
+  LAMBDA_MAX_TARGET: 10.0    # JHU ha celle molto dense
+  PI_THRESHOLD: 0.2          # Threshold più basso per recall
+
+OPTIM_P2R:
+  EPOCHS: 3500
+  BATCH_SIZE: 6
+  LR: 5.0e-5
+  LR_BACKBONE: 1.0e-6
+  WEIGHT_DECAY: 1.0e-4
+  WARMUP_EPOCHS: 60
+  EARLY_STOPPING_PATIENCE: 180
+  GRAD_CLIP: 1.0
+  SCHEDULER: "cosine"
+  MIN_LR: 1.0e-7
+  DROPOUT: 0.3
+  FINAL_DROPOUT: 0.5
+  USE_AGGRESSIVE_AUG: true
+  AUG_SCALE_RANGE: [0.8, 1.2]
+  AUG_ROTATION: 15
+  AUG_ERASING_PROB: 0.3
+
+P2R_LOSS:
+  USE_MULTI_SCALE: true
+  SCALES: [1, 2, 4]
+  SCALE_WEIGHTS: [1.0, 0.5, 0.25]
+  COUNT_WEIGHT: 2.0
+  SPATIAL_WEIGHT: 0.15
+  SCALE_WEIGHT: 0.5
+  LOG_SCALE_INIT: 4.0
+  LOG_SCALE_CLAMP: [-2.0, 10.0]
+  LOG_SCALE_LR_MULT: 0.1
+
+# ============================================================
+# STAGE 3 FUSION CONFIGURATION (JHU OPTIMIZED - FROZEN MODE)
+# ============================================================
+OPTIM_JOINT:
+  BATCH_SIZE: 6
+
+STAGE3_FUSION:
+  ALPHA_START: 0.0
+  ALPHA_END: 0.1        # (Era 0.2/0.3 - Troppo aggressivo)
+  ALPHA_WARMUP: 20      # Warmup veloce
+
+  # --- CRUCIALE: FREEZE P2R ---
+  # Mettendo LR a 0.0, impediamo che i pesi dello Stage 2 cambino.
+  # Il MAE RAW rimarrà fisso a ~62.22.
+  LR_P2R: 0.0           # (Era 1.0e-5 - Questo ha causato il peggioramento)
+  
+  # Imariamo solo la compensazione di scala
+  LR_SCALE: 1.0e-3
+  
+  # --- CRUCIALE: DISABILITA SPATIAL LOSS ---
+  # Su JHU la ZIP map è imprecisa. Non forzare la density ad assomigliarle.
+  SPATIAL_WEIGHT: 0.0   # (Era 0.05 - Questo confondeva il conteggio)
+
+  # Training rapido (stiamo calibrando solo lo scale)
+  EPOCHS: 150      
+  PATIENCE: 80
+
+# ============================================================
+# BIN CONFIGURATION (Specifica per JHU)
+# ============================================================
+BINS_CONFIG:
+  jhu:
+    bins: [[0,0],[1,1],[2,2],[3,3],[4,4],[5,5],[6,6],[7,7],[8,8],[9,9],[10,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,23],[24,26],[27,29],[30,33],[34,9999]]
+    bin_centers: [0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.43,13.43,15.44,17.44,19.43,21.83,24.85,27.87,31.24,38.86]
+
+# ============================================================
+# AUGMENTATION
+# ============================================================
+AUGMENTATION:
+  TRAIN:
+    RANDOM_CROP: true
+    CROP_SIZE: [384, 384]
+    HORIZONTAL_FLIP: true
+    FLIP_PROB: 0.5
+    COLOR_JITTER: true
+    JITTER_BRIGHTNESS: 0.2
+    JITTER_CONTRAST: 0.2
+    JITTER_SATURATION: 0.1
+    JITTER_HUE: 0.05
+    RANDOM_GRAYSCALE: true
+    GRAYSCALE_PROB: 0.1
+    GAUSSIAN_BLUR: true
+    BLUR_PROB: 0.1
+    BLUR_KERNEL: [3, 7]
+  VAL:
+    RESIZE: false
+
+# ============================================================
+# Logging
+# ============================================================
+LOGGING:
+  LOG_INTERVAL: 50
+  VAL_INTERVAL: 1
+  SAVE_BEST_ONLY: true
+  TENSORBOARD: true
+
+EXP:
+  OUT_DIR: "exp"
+
+DEVICE: "cuda"
+SEED: 2025

@@ -29,3 +29,9 @@ venv/
 # Sistemi operativi
 .DS_Store
 Thumbs.db
+
+# Immagini generate
+visualizations/
+
+# file che iniziano con master_
+master_*

@@ -67,7 +67,6 @@ class CrowdDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         W, H = img.size
 
-        # points path: sostituisci estensione con .txt/.npy
         points = np.zeros((0,2), dtype=np.float32)
         if self.points_root:
             rel = os.path.relpath(img_path, self.img_root)
@@ -80,7 +79,6 @@ class CrowdDataset(Dataset):
             elif os.path.isfile(p2):
                 points = _read_points_file(p2)
 
-        # build zip blocks from points
         Hb = math.ceil(H / self.block)
         Wb = math.ceil(W / self.block)
         blocks = np.zeros((Hb, Wb), dtype=np.float32)

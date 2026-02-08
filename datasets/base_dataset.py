@@ -1,52 +1,111 @@
-# P2R_ZIP/datasets/base_dataset.py
 import os
-import numpy as np
-from torch.utils.data import Dataset
-from PIL import Image
+import glob
 import torch
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset
 
-class BaseCrowdDataset(Dataset):
+class BaseDataset(Dataset):
     """
-    Classe base per dataset di crowd counting.
-    Ogni sottoclasse deve implementare:
-        - load_points(img_path): restituisce np.ndarray Nx2
-        - get_image_list(split): restituisce lista path immagini
+    Classe base robusta.
+    Genera la GT Density (Dot Map) automaticamente DOPO le trasformazioni,
+    garantendo che le dimensioni immagine/densità siano sempre allineate.
     """
-    def __init__(self, root, split="train", block_size=32, mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)):
+    def __init__(self, root, split, block_size=16, transforms=None):
         self.root = root
         self.split = split
-        self.block = block_size
-        self.mean = torch.tensor(mean).view(3,1,1)
-        self.std  = torch.tensor(std).view(3,1,1)
-        self.img_list = self.get_image_list(split)
-        assert len(self.img_list) > 0, f"Nessuna immagine trovata in {root}/{split}"
+        self.block_size = block_size
+        self.transforms = transforms
+        self.img_paths = []
+        self.load_data()
+
+    def load_data(self):
+        raise NotImplementedError
 
     def __len__(self):
-        return len(self.img_list)
+        return len(self.img_paths)
 
-    def __getitem__(self, idx):
-        img_path = self.img_list[idx]
-        img = Image.open(img_path).convert("RGB")
-        W, H = img.size
+    def __getitem__(self, index):
+        img_path = self.img_paths[index]
+        
+        # 1. Carica Immagine
+        img = Image.open(img_path).convert('RGB')
+        
+        # 2. Carica Punti
+        pts = self.load_points(img_path) 
+        
+        # 3. Gestione Density Pre-Transform
+        # Se esiste un .npy lo carichiamo, ma potremmo scartarlo dopo se le dimensioni non tornano
+        den_path = img_path.replace('.jpg', '.npy').replace('images', 'ground_truth')
+        den_np = None
+        if os.path.exists(den_path):
+            try:
+                den_np = np.load(den_path).astype(np.float32, copy=False)
+            except:
+                pass 
 
-        pts = self.load_points(img_path)
-        pts = np.array(pts, dtype=np.float32)
-        Hb, Wb = int(np.ceil(H / self.block)), int(np.ceil(W / self.block))
-        blocks = np.zeros((Hb, Wb), dtype=np.float32)
-        for (x, y) in pts:
-            xb = min(int(x // self.block), Wb - 1)
-            yb = min(int(y // self.block), Hb - 1)
-            blocks[yb, xb] += 1
+        # 4. Applicazione Trasformazioni
+        if self.transforms:
+            img_tensor, pts_transformed, den_np_transformed = self.transforms(img, pts, den_np)
+        else:
+            img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+            pts_transformed = torch.from_numpy(pts).float()
+            den_np_transformed = den_np
 
-        arr = np.asarray(img).astype(np.float32) / 255.0
-        if arr.ndim == 2:
-            arr = np.stack([arr, arr, arr], axis=-1)
-        timg = torch.from_numpy(arr).permute(2,0,1)
-        timg = (timg - self.mean) / self.std
+        # 5. Fix Formato Punti (Tensor)
+        if isinstance(pts_transformed, torch.Tensor):
+            pts_tensor = pts_transformed
+        elif isinstance(pts_transformed, np.ndarray):
+            pts_tensor = torch.from_numpy(pts_transformed).float()
+        else:
+            pts_tensor = torch.tensor(pts_transformed, dtype=torch.float32) if len(pts_transformed) > 0 else torch.zeros((0, 2), dtype=torch.float32)
 
-        return {
-            "image": timg,
-            "points": torch.from_numpy(pts),
-            "zip_blocks": torch.from_numpy(blocks).unsqueeze(0),
-            "img_path": img_path
-        }
+        # 6. Generazione GT Density (IL FIX)
+        # Assicuriamoci che la densità corrisponda ESATTAMENTE alle dimensioni dell'immagine trasformata.
+        h, w = img_tensor.shape[1], img_tensor.shape[2]
+        
+        # Controlla se la densità uscita dalle trasformazioni è valida e ha le dimensioni giuste
+        use_transformed_den = False
+        if den_np_transformed is not None:
+            # Recupera H, W della densità
+            if isinstance(den_np_transformed, np.ndarray):
+                dh, dw = den_np_transformed.shape[-2:] # gestisce (H,W) o (C,H,W)
+            else:
+                dh, dw = den_np_transformed.shape[-2:]
+            
+            if dh == h and dw == w:
+                use_transformed_den = True
+        
+        if use_transformed_den:
+             # Usiamo quella trasformata
+             if isinstance(den_np_transformed, np.ndarray):
+                 gt_density = torch.from_numpy(den_np_transformed)
+             else:
+                 gt_density = den_np_transformed
+             if gt_density.dim() == 2: gt_density = gt_density.unsqueeze(0)
+        
+        else:
+             # RIGENERAZIONE "ON-THE-FLY" (Dot Map)
+             # Questo salva il training: crea una mappa zeri delle dimensioni giuste e mette un 1 dove ci sono i punti.
+             gt_density = torch.zeros((1, h, w), dtype=torch.float32)
+             
+             if len(pts_tensor) > 0:
+                 p = pts_tensor.long()
+                 # Sicurezza: rimuovi punti che per arrotondamento escono di 1 pixel
+                 p[:, 0] = p[:, 0].clamp(0, w - 1)
+                 p[:, 1] = p[:, 1].clamp(0, h - 1)
+                 
+                 # Metodo veloce per disegnare i punti: Scatter Add
+                 # Calcola indice lineare (y * w + x)
+                 indices = p[:, 1] * w + p[:, 0]
+                 values = torch.ones(indices.size(0), dtype=torch.float32)
+                 
+                 # Somma 1.0 nella mappa (gestisce anche punti sovrapposti)
+                 gt_density.view(-1).scatter_add_(0, indices, values)
+
+        return img_tensor, gt_density, pts_tensor
+
+    def load_points(self, img_path):
+        return np.array([], dtype=np.float32)
+
+BaseCrowdDataset = BaseDataset

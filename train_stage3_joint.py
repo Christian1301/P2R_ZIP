@@ -724,6 +724,8 @@ def main():
     initial_mae = val_results['mae_raw']
     print(f"   MAE raw: {initial_mae:.2f}")
     print(f"   Bias: {val_results['bias_raw']:.3f}")
+    # Salva anche il primo best checkpoint
+    save_checkpoint(model, scale_comp, optimizer, scheduler, 0, val_results, initial_mae, output_dir, is_best=True)
     
     # =========================================================================
     # TRAINING

@@ -1,0 +1,10 @@
+flask>=2.3
+torch>=1.12
+torchvision>=0.13
+numpy
+opencv-python-headless
+matplotlib
+Pillow
+pyyaml
+scikit-learn
+seaborn

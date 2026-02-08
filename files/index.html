@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P2R-ZIP · Crowd Counting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,300;8..60,400;8..60,600&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════════════
+   CSS VARIABLES & RESET
+   ═══════════════════════════════════════════════════════════ */
+
+:root {
+  --bg-primary: #f5f4ef;
+  --bg-chat: #faf9f5;
+  --bg-message-user: #ffffff;
+  --bg-message-ai: transparent;
+  --bg-sidebar: #eae8e0;
+  --bg-input: #ffffff;
+  --bg-button: #c96442;
+  --bg-button-hover: #b5573a;
+  --bg-model-chip: #e8e5db;
+  --bg-model-chip-active: #c96442;
+
+  --text-primary: #1a1a1a;
+  --text-secondary: #6b6459;
+  --text-tertiary: #9a9288;
+  --text-inverse: #ffffff;
+  --text-accent: #c96442;
+
+  --border-light: #e0ddd4;
+  --border-focus: #c96442;
+
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.06);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.08);
+  --shadow-card: 0 1px 4px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.03);
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  --font-display: 'Source Serif 4', Georgia, serif;
+  --font-body: 'DM Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --chat-max-width: 780px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TOP BAR
+   ═══════════════════════════════════════════════════════════ */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--bg-chat);
+  border-bottom: 1px solid var(--border-light);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.topbar-logo {
+  width: 34px;
+  height: 34px;
+  background: var(--bg-button);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: white;
+  font-weight: 600;
+  font-family: var(--font-display);
+}
+
+.topbar-title {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.topbar-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 1px;
+}
+
+/* Model selector - Claude style dropdown */
+.model-selector {
+  position: relative;
+  user-select: none;
+}
+
+.model-selector-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-model-chip);
+  cursor: pointer;
+  transition: all var(--transition);
+  border: 1.5px solid transparent;
+}
+
+.model-selector-trigger:hover {
+  background: #ddd9cc;
+}
+
+.model-selector-trigger .trigger-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.model-selector-trigger .trigger-chevron {
+  width: 16px;
+  height: 16px;
+  color: var(--text-tertiary);
+  transition: transform var(--transition);
+}
+
+.model-selector.open .trigger-chevron {
+  transform: rotate(180deg);
+}
+
+.model-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 320px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+  opacity: 0;
+  transform: translateY(-6px);
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  overflow: hidden;
+}
+
+.model-selector.open .model-dropdown {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: all;
+}
+
+.model-dropdown-header {
+  padding: 12px 16px 8px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+  font-weight: 600;
+}
+
+.model-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+
+.model-option:hover {
+  background: #f5f3ee;
+}
+
+.model-option.active {
+  background: #fef3ee;
+}
+
+.model-option.unavailable {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.model-option-radio {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid #c8c3b8;
+  flex-shrink: 0;
+  margin-top: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+}
+
+.model-option.active .model-option-radio {
+  border-color: var(--bg-button);
+}
+
+.model-option.active .model-option-radio::after {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--bg-button);
+}
+
+.model-option-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.model-option-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.model-option-desc {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CHAT AREA
+   ═══════════════════════════════════════════════════════════ */
+
+.chat-container {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg-chat);
+  scroll-behavior: smooth;
+}
+
+.chat-scroll {
+  max-width: var(--chat-max-width);
+  margin: 0 auto;
+  padding: 32px 24px 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* Welcome screen */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px 60px;
+  text-align: center;
+  animation: fadeInUp 0.6s ease-out;
+}
+
+.welcome-icon {
+  width: 64px;
+  height: 64px;
+  background: linear-gradient(135deg, #c96442, #e8956d);
+  border-radius: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 30px;
+  margin-bottom: 24px;
+  box-shadow: 0 8px 24px rgba(201, 100, 66, 0.25);
+}
+
+.welcome h1 {
+  font-family: var(--font-display);
+  font-size: 1.75rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 10px;
+  letter-spacing: -0.03em;
+}
+
+.welcome p {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  max-width: 420px;
+  line-height: 1.6;
+}
+
+.welcome-hint {
+  margin-top: 32px;
+  padding: 14px 22px;
+  background: var(--bg-model-chip);
+  border-radius: var(--radius-md);
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Messages ────────────────────────────────────────────── */
+
+.message {
+  display: flex;
+  gap: 14px;
+  animation: fadeInUp 0.35s ease-out;
+}
+
+.message.user {
+  flex-direction: row-reverse;
+}
+
+.message-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.message.user .message-avatar {
+  background: #ddd9cc;
+  color: var(--text-secondary);
+}
+
+.message.ai .message-avatar {
+  background: var(--bg-button);
+  color: white;
+  font-family: var(--font-display);
+}
+
+.message-content {
+  max-width: 90%;
+  min-width: 0;
+}
+
+.message.user .message-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+/* User uploaded image */
+.user-image-wrap {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+  max-width: 320px;
+}
+
+.user-image-wrap img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* AI response */
+.ai-response {
+  line-height: 1.65;
+  font-size: 0.92rem;
+  color: var(--text-primary);
+}
+
+.ai-response .count-highlight {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #fef3ee, #fde8db);
+  border: 1px solid #f0c8b0;
+  border-radius: var(--radius-sm);
+  padding: 10px 16px;
+  margin: 12px 0;
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  font-weight: 600;
+  color: #b5573a;
+}
+
+.ai-response .count-highlight .count-number {
+  font-size: 1.8rem;
+  font-weight: 600;
+}
+
+/* Stats grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.stat-card {
+  background: #f7f5f0;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+}
+
+.stat-card .stat-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  margin-bottom: 3px;
+}
+
+.stat-card .stat-value {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* Visualization cards */
+.viz-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.viz-card {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #1a1a2e;
+  box-shadow: var(--shadow-card);
+  cursor: pointer;
+  transition: transform var(--transition), box-shadow var(--transition);
+}
+
+.viz-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.viz-card img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.viz-card .viz-label {
+  padding: 8px 12px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #b0aaa0;
+  text-align: center;
+  background: #1a1a2e;
+}
+
+/* Inference time */
+.inference-time {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 8px;
+  font-family: var(--font-mono);
+}
+
+/* Loading */
+.loading-dots {
+  display: flex;
+  gap: 4px;
+  padding: 16px 0;
+}
+
+.loading-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  animation: bounce 1.4s infinite;
+}
+
+.loading-dots span:nth-child(2) { animation-delay: 0.16s; }
+.loading-dots span:nth-child(3) { animation-delay: 0.32s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   INPUT BAR (bottom)
+   ═══════════════════════════════════════════════════════════ */
+
+.input-bar-wrapper {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: center;
+  padding: 16px 24px 24px;
+  background: linear-gradient(to top, var(--bg-chat) 70%, transparent);
+  pointer-events: none;
+}
+
+.input-bar {
+  pointer-events: all;
+  width: 100%;
+  max-width: var(--chat-max-width);
+  background: var(--bg-input);
+  border: 1.5px solid var(--border-light);
+  border-radius: var(--radius-xl);
+  display: flex;
+  align-items: center;
+  padding: 6px 8px 6px 20px;
+  gap: 8px;
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.input-bar:hover {
+  border-color: #c8c3b8;
+}
+
+.input-bar:focus-within {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px rgba(201, 100, 66, 0.1), var(--shadow-md);
+}
+
+.input-bar .hint-text {
+  flex: 1;
+  font-size: 0.88rem;
+  color: var(--text-tertiary);
+  user-select: none;
+}
+
+.input-bar input[type="file"] {
+  display: none;
+}
+
+.upload-btn {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: none;
+  background: var(--bg-button);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+
+.upload-btn:hover {
+  background: var(--bg-button-hover);
+  transform: scale(1.05);
+}
+
+.upload-btn:active {
+  transform: scale(0.95);
+}
+
+.upload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.upload-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   LIGHTBOX
+   ═══════════════════════════════════════════════════════════ */
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+
+.lightbox.open {
+  opacity: 1;
+  pointer-events: all;
+}
+
+.lightbox img {
+  max-width: 90vw;
+  max-height: 88vh;
+  border-radius: var(--radius-md);
+  box-shadow: 0 16px 64px rgba(0,0,0,0.4);
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255,255,255,0.15);
+  color: white;
+  font-size: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--transition);
+}
+
+.lightbox-close:hover { background: rgba(255,255,255,0.25); }
+
+/* ═══════════════════════════════════════════════════════════
+   ANIMATIONS
+   ═══════════════════════════════════════════════════════════ */
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════════════════════ */
+
+@media (max-width: 768px) {
+  .topbar { padding: 10px 16px; }
+  .model-selector { display: none; }
+  .chat-scroll { padding: 20px 16px 120px; }
+  .viz-grid { grid-template-columns: 1fr; }
+  .welcome h1 { font-size: 1.4rem; }
+  .input-bar-wrapper { padding: 12px 16px 20px; }
+
+  /* Show model selector as dropdown on mobile */
+  .mobile-model-select {
+    display: block !important;
+  }
+}
+
+.mobile-model-select {
+  display: none;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+  background: var(--bg-input);
+  font-family: var(--font-body);
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+/* GT file upload button */
+.gt-upload-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  background: #f5f3ee;
+  border: 1.5px solid var(--border-light);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: all var(--transition);
+  flex-shrink: 0;
+  font-family: var(--font-body);
+}
+
+.gt-upload-btn:hover {
+  background: #ebe8df;
+  border-color: #c8c3b8;
+}
+
+.gt-upload-btn.loaded {
+  background: #eef7ee;
+  border-color: #8bc48b;
+}
+
+.gt-btn-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.gt-upload-btn.loaded .gt-btn-label {
+  color: #3a7a3a;
+}
+
+.gt-btn-status {
+  font-size: 0.78rem;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  color: #3a7a3a;
+}
+
+/* Scrollbar styling */
+.chat-container::-webkit-scrollbar { width: 6px; }
+.chat-container::-webkit-scrollbar-track { background: transparent; }
+.chat-container::-webkit-scrollbar-thumb {
+  background: #d0ccc3;
+  border-radius: 3px;
+}
+.chat-container::-webkit-scrollbar-thumb:hover { background: #b8b3a8; }
+</style>
+</head>
+<body>
+
+<!-- ─── TOP BAR ──────────────────────────────────────────── -->
+<div class="topbar">
+  <div class="topbar-brand">
+    <div class="topbar-logo">P</div>
+    <div>
+      <div class="topbar-title">P2R-ZIP</div>
+      <div class="topbar-subtitle">Crowd Counting Demo</div>
+    </div>
+  </div>
+
+  <div class="model-selector" id="modelSelector">
+    <!-- Filled by JS -->
+  </div>
+
+  <select class="mobile-model-select" id="mobileModelSelect"></select>
+</div>
+
+<!-- ─── CHAT AREA ────────────────────────────────────────── -->
+<div class="chat-container" id="chatContainer">
+  <div class="chat-scroll" id="chatScroll">
+    <div class="welcome" id="welcome">
+      <div class="welcome-icon">👥</div>
+      <h1>Crowd Counting Analysis</h1>
+      <p>
+        Upload a crowd image and the model will estimate
+        the number of people using the P2R-ZIP architecture.
+      </p>
+      <div class="welcome-hint">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Click the upload button below or drag &amp; drop an image
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── INPUT BAR ────────────────────────────────────────── -->
+<div class="input-bar-wrapper">
+  <div class="input-bar" id="inputBar">
+    <span class="hint-text">Upload an image to count the crowd…</span>
+    <input type="file" id="gtFileInput" accept=".txt" style="display:none">
+    <button class="gt-upload-btn" id="gtUploadBtn" title="Carica ground truth (.txt)">
+      <span class="gt-btn-label">GT</span>
+      <span class="gt-btn-status" id="gtStatus"></span>
+    </button>
+    <input type="file" id="fileInput" accept="image/*">
+    <button class="upload-btn" id="uploadBtn" title="Upload image">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<!-- ─── LIGHTBOX ──────────────────────────────────────────── -->
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" onclick="closeLightbox()">✕</button>
+  <img id="lightboxImg" src="" alt="">
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     JAVASCRIPT
+     ═══════════════════════════════════════════════════════════ -->
+<script>
+const API = '';  // Same origin
+let selectedModel = 'ShanghaiTech Part A';
+let isProcessing = false;
+
+// ── Initialize ──────────────────────────────────────────────
+
+async function init() {
+  try {
+    const res = await fetch(`${API}/api/models`);
+    const data = await res.json();
+    // Merge server availability with our rich descriptions
+    const enriched = data.models.map(m => {
+      // Forza ShanghaiTech Part B sempre disponibile
+      if (m.name === 'ShanghaiTech Part B') {
+        return { ...m, available: true, tagline: MODEL_TAGLINES[m.name] || m.description };
+      }
+      return { ...m, tagline: MODEL_TAGLINES[m.name] || m.description };
+    });
+    renderModelSelector(enriched);
+  } catch (e) {
+    console.error('Failed to load models:', e);
+    renderModelSelector(DEFAULT_MODELS);
+  }
+}
+
+// Model descriptions – Claude-style taglines
+const MODEL_TAGLINES = {
+  'ShanghaiTech Part A': 'Best for dense and crowded scenes — squares, concerts, large gatherings',
+  'ShanghaiTech Part B': 'Optimized for sparse scenes — streets, sidewalks, pedestrian areas',
+  'UCF-QNRF': 'Most robust for extreme crowds — pilgrimages, stadiums, mass events',
+  'JHU-Crowd++': 'Most versatile — diverse scenes, varying weather, indoor and outdoor',
+};
+
+const DEFAULT_MODELS = [
+  { name: 'ShanghaiTech Part A', tagline: MODEL_TAGLINES['ShanghaiTech Part A'], available: true },
+  { name: 'ShanghaiTech Part B', tagline: MODEL_TAGLINES['ShanghaiTech Part B'], available: true },
+  { name: 'UCF-QNRF', tagline: MODEL_TAGLINES['UCF-QNRF'], available: true },
+  { name: 'JHU-Crowd++', tagline: MODEL_TAGLINES['JHU-Crowd++'], available: true },
+];
+
+function renderModelSelector(models) {
+  const container = document.getElementById('modelSelector');
+  const mobile = document.getElementById('mobileModelSelect');
+
+  // ── Desktop: Claude-style dropdown ──
+  const activeModel = models.find(m => m.name === selectedModel) || models[0];
+
+  container.innerHTML = `
+    <div class="model-selector-trigger" id="modelTrigger">
+      <span class="trigger-name">${activeModel.name}</span>
+      <svg class="trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"/>
+      </svg>
+    </div>
+    <div class="model-dropdown" id="modelDropdown">
+      <div class="model-dropdown-header">Seleziona modello</div>
+      ${models.map(m => `
+        <div class="model-option${m.name === selectedModel ? ' active' : ''}${!m.available ? ' unavailable' : ''}"
+             data-model="${m.name}" ${!m.available ? '' : ''}>
+          <div class="model-option-radio"></div>
+          <div class="model-option-info">
+            <div class="model-option-name">${m.name}</div>
+            <div class="model-option-desc">${m.tagline || m.description}</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+
+  // Toggle dropdown
+  document.getElementById('modelTrigger').addEventListener('click', (e) => {
+    e.stopPropagation();
+    container.classList.toggle('open');
+  });
+
+  // Click on option
+  container.querySelectorAll('.model-option:not(.unavailable)').forEach(opt => {
+    opt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const name = opt.dataset.model;
+      selectModel(name);
+      container.classList.remove('open');
+    });
+  });
+
+  // Close on outside click
+  document.addEventListener('click', () => {
+    container.classList.remove('open');
+  });
+
+  // ── Mobile: native select ──
+  mobile.innerHTML = '';
+  models.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.name;
+    opt.textContent = m.name;
+    opt.disabled = !m.available;
+    opt.selected = m.name === selectedModel;
+    mobile.appendChild(opt);
+  });
+  mobile.onchange = (e) => selectModel(e.target.value);
+}
+
+function selectModel(name) {
+  selectedModel = name;
+
+  // Update trigger text
+  const trigger = document.querySelector('.trigger-name');
+  if (trigger) trigger.textContent = name;
+
+  // Update active state in dropdown
+  document.querySelectorAll('.model-option').forEach(opt => {
+    opt.classList.toggle('active', opt.dataset.model === name);
+  });
+
+  // Update mobile select
+  document.getElementById('mobileModelSelect').value = name;
+}
+
+// ── File Upload ─────────────────────────────────────────────
+
+let pendingGtCount = null;  // ground truth from loaded .txt
+
+// GT file upload
+document.getElementById('gtUploadBtn').addEventListener('click', () => {
+  document.getElementById('gtFileInput').click();
+});
+
+document.getElementById('gtFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const text = ev.target.result.trim();
+    const lines = text.split('\n').filter(l => l.trim().length > 0);
+    pendingGtCount = lines.length;
+
+    // Update button appearance
+    const btn = document.getElementById('gtUploadBtn');
+    btn.classList.add('loaded');
+    document.getElementById('gtStatus').textContent = pendingGtCount;
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+});
+
+// Image upload
+document.getElementById('uploadBtn').addEventListener('click', () => {
+  if (!isProcessing) {
+    document.getElementById('fileInput').click();
+  }
+});
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) handleImage(file);
+  e.target.value = '';
+});
+
+// Drag & drop
+const inputBar = document.getElementById('inputBar');
+['dragenter', 'dragover'].forEach(evt => {
+  inputBar.addEventListener(evt, (e) => {
+    e.preventDefault();
+    inputBar.style.borderColor = 'var(--border-focus)';
+  });
+});
+['dragleave', 'drop'].forEach(evt => {
+  inputBar.addEventListener(evt, (e) => {
+    e.preventDefault();
+    inputBar.style.borderColor = '';
+  });
+});
+inputBar.addEventListener('drop', (e) => {
+  const file = e.dataTransfer.files[0];
+  if (file && file.type.startsWith('image/')) handleImage(file);
+});
+
+// ── Handle Image ────────────────────────────────────────────
+
+async function handleImage(file) {
+  if (isProcessing) return;
+  isProcessing = true;
+
+  // Capture current GT value before resetting
+  const currentGt = pendingGtCount;
+
+  // Hide welcome
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.style.display = 'none';
+
+  // Disable button
+  document.getElementById('uploadBtn').disabled = true;
+
+  // Show user message with image preview
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    addUserMessage(e.target.result);
+    addLoadingMessage();
+
+    try {
+      const formData = new FormData();
+      formData.append('image', file);
+      formData.append('model', selectedModel);
+      if (currentGt !== null) {
+        formData.append('ground_truth', currentGt);
+      }
+
+      const res = await fetch(`${API}/api/predict`, { method: 'POST', body: formData });
+      const data = await res.json();
+
+      // Inject client-side GT if server didn't provide one
+      if (currentGt !== null && !data.ground_truth) {
+        data.ground_truth = currentGt;
+      }
+
+      removeLoadingMessage();
+
+      if (data.success) {
+        addAIResponse(data);
+      } else {
+        addErrorMessage(data.error || 'Inference failed');
+      }
+    } catch (err) {
+      removeLoadingMessage();
+      addErrorMessage(`Connection error: ${err.message}`);
+    }
+
+    // Reset GT after use
+    pendingGtCount = null;
+    const gtBtn = document.getElementById('gtUploadBtn');
+    gtBtn.classList.remove('loaded');
+    document.getElementById('gtStatus').textContent = '';
+
+    isProcessing = false;
+    document.getElementById('uploadBtn').disabled = false;
+  };
+  reader.readAsDataURL(file);
+}
+
+// ── Chat Messages ───────────────────────────────────────────
+
+function addUserMessage(imageSrc) {
+  const chat = document.getElementById('chatScroll');
+  const div = document.createElement('div');
+  div.className = 'message user';
+  div.innerHTML = `
+    <div class="message-avatar">U</div>
+    <div class="message-content">
+      <div class="user-image-wrap">
+        <img src="${imageSrc}" alt="Uploaded image" onclick="openLightbox(this.src)">
+      </div>
+    </div>
+  `;
+  chat.appendChild(div);
+  scrollToBottom();
+}
+
+function addLoadingMessage() {
+  const chat = document.getElementById('chatScroll');
+  const div = document.createElement('div');
+  div.className = 'message ai';
+  div.id = 'loadingMsg';
+  div.innerHTML = `
+    <div class="message-avatar">P</div>
+    <div class="message-content">
+      <div class="ai-response">
+        <div class="loading-dots">
+          <span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+  `;
+  chat.appendChild(div);
+  scrollToBottom();
+}
+
+function removeLoadingMessage() {
+  const el = document.getElementById('loadingMsg');
+  if (el) el.remove();
+}
+
+function addAIResponse(data) {
+  const chat = document.getElementById('chatScroll');
+  const div = document.createElement('div');
+  div.className = 'message ai';
+
+  const s = data.stats;
+  const count = data.count;
+
+  div.innerHTML = `
+    <div class="message-avatar">P</div>
+    <div class="message-content">
+      <div class="ai-response">
+        <div class="count-highlight">
+          👥 Estimated count: <span class="count-number">${count}</span> people
+          ${data.ground_truth ? `<span style="font-size:0.85rem; font-weight:400; color:#6b6459; margin-left:8px;">( GT: ${data.ground_truth} )</span>` : ''}
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">Raw Count</div>
+            <div class="stat-value">${s.count_raw}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Soft Fusion</div>
+            <div class="stat-value">${s.count_soft}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">π Coverage</div>
+            <div class="stat-value">${s.pi_coverage}%</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Scale Comp.</div>
+            <div class="stat-value">${s.scale_compensation}</div>
+          </div>
+        </div>
+
+        <div class="viz-grid">
+          <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.pi_map}')">
+            <img src="data:image/png;base64,${data.images.pi_map}" alt="Pi Map">
+            <div class="viz-label">π Occupancy Map</div>
+          </div>
+          <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.density_raw}')">
+            <img src="data:image/png;base64,${data.images.density_raw}" alt="Raw Density">
+            <div class="viz-label">Raw Density</div>
+          </div>
+          <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.density_soft}')">
+            <img src="data:image/png;base64,${data.images.density_soft}" alt="Soft Fusion">
+            <div class="viz-label">Soft Fusion</div>
+          </div>
+        </div>
+
+        <div class="inference-time">⏱ Inference: ${data.inference_time}s</div>
+      </div>
+    </div>
+  `;
+
+  chat.appendChild(div);
+  scrollToBottom();
+}
+
+function addErrorMessage(errorText) {
+  const chat = document.getElementById('chatScroll');
+  const div = document.createElement('div');
+  div.className = 'message ai';
+  div.innerHTML = `
+    <div class="message-avatar">P</div>
+    <div class="message-content">
+      <div class="ai-response" style="color: #c44;">
+        ⚠️ ${errorText}
+      </div>
+    </div>
+  `;
+  chat.appendChild(div);
+  scrollToBottom();
+}
+
+// ── Utilities ───────────────────────────────────────────────
+
+function scrollToBottom() {
+  const container = document.getElementById('chatContainer');
+  requestAnimationFrame(() => {
+    container.scrollTop = container.scrollHeight;
+  });
+}
+
+// ── Lightbox ────────────────────────────────────────────────
+
+function openLightbox(src) {
+  document.getElementById('lightboxImg').src = src;
+  document.getElementById('lightbox').classList.add('open');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+}
+
+document.getElementById('lightbox').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeLightbox();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeLightbox();
+});
+
+// ── Start ───────────────────────────────────────────────────
+init();
+</script>
+
+</body>
+</html>

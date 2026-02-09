@@ -1,6 +1,5 @@
 # ============================================================
-# CONFIG JHU-CROWD++ - FUSION MODE
-# Obiettivo: Joint Training su JHU (Dataset Complesso e Vario)
+# CONFIG JHU-CROWD++
 # ============================================================
 
 RUN_NAME: "jhu"

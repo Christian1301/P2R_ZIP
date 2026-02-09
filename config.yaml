@@ -1,6 +1,5 @@
 # ============================================================
-# CONFIG V15 - FINETUNING MODE
-# Obiettivo: Recuperare il best model (Ep 75) e scendere < 60
+# CONFIG V15
 # ============================================================
 
 RUN_NAME: "shha"

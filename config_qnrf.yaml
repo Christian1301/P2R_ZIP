@@ -1,6 +1,5 @@
 # ============================================================
-# CONFIG UCF-QNRF - FUSION MODE
-# Obiettivo: Joint Training su UCF-QNRF (Scene Dense)
+# CONFIG UCF-QNRF
 # ============================================================
 
 RUN_NAME: "qnrf"

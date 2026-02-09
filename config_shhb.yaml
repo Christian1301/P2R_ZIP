@@ -1,6 +1,5 @@
 # ============================================================
-# CONFIG SHHB - RESCUE MODE (STAGE 3 OPTIMIZATION)
-# Obiettivo: Preservare MAE Stage 2 e correggere solo lo Scale
+# CONFIG SHHB 
 # ============================================================
 
 RUN_NAME: "shhab"

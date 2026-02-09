@@ -48,3 +48,11 @@ train_all.sh
 ```
 this command will train the model on the ShanghaiTech dataset, you can change the dataset by changing the config file in `configs/` folder.
 This commando will launch stage1, stage2, stage3 and all the validations, you can also launch each stage separately by launching the corresponding command.
+
+## Launch the demo
+To launch the demo, you can use the following command:
+```bash
+cd files
+pip install -r requirements.txt
+python server.py 
+```

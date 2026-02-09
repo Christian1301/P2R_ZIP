@@ -264,8 +264,8 @@ class CrowdCountingEngine:
         }
 
         stats = {
-            "count_raw": round(count_raw, 1),
-            "count_soft": round(count_soft, 1),
+            "count_raw": int(round(count_raw)),
+            "count_soft": int(round(count_soft)),
             "pi_mean": round(pi_probs.mean().item(), 3),
             "pi_coverage": round((pi_probs > tau).float().mean().item() * 100, 1),
             "scale_compensation": round(scale_val, 3),
@@ -274,7 +274,7 @@ class CrowdCountingEngine:
         }
 
         return {
-            "count": round(count_soft, 1),
+            "count": int(round(count_soft)),
             "images": images,
             "stats": stats,
         }

@@ -1,58 +1,69 @@
+
 # P2R-ZIP: Point-to-Region Counting with Zero-Inflatable Poisson Modeling
 
-Questa repository contiene l'implementazione del modello **P2R-ZIP**, un'evoluzione dell'architettura *Point-to-Region* (P2R) progettata per il crowd counting in scenari complessi. Il progetto introduce una testa di classificazione statistica basata sulla distribuzione di **Poisson gonfiata a zero (ZIP)** per migliorare la distinzione semantica tra aree di folla e background.
+This repository contains the implementation of the **P2R-ZIP** model, an evolution of the *Point-to-Region* (P2R) architecture designed for crowd counting in complex scenarios. The project introduces a statistical classification head based on the **Zero-Inflated Poisson (ZIP)** distribution to improve semantic distinction between crowd areas and background.
 
-## Architettura del Modello
+## Model Architecture
 
-Il modello integra due stadi principali per un'analisi congiunta della scena:
+The model integrates two main modules for joint scene analysis:
 
-1.  **ZIP Head (Semantic Reasoning):** Un modulo statistico che analizza le feature estratte dal backbone (VGG16) per modellare la distribuzione dei pixel. Produce due mappe fondamentali:
-    * **$\pi$-map:** Rappresenta la probabilità di occupazione (presenza di folla) per ogni regione.
-    * **$\lambda$-map:** Stima l'intensità locale della folla basata su una regressione a bin.
-2.  **P2R Head (Localization):** Il modulo di regressione finale che riceve le feature del backbone aumentate con le informazioni semantiche provenienti dallo ZIP Head (canali $\pi$ e $\lambda$ concatenati).
-
-
+1.  **ZIP Head (Semantic Reasoning):** A statistical module that analyzes features extracted from the backbone (VGG16) to model pixel distribution. It produces two fundamental maps:
+        * **$\pi$-map:** Represents the occupancy probability (crowd presence) for each region.
+        * **$\lambda$-map:** Estimates the local crowd intensity based on bin regression.
+2.  **P2R Head (Localization):** The final regression module that receives backbone features augmented with semantic information from the ZIP Head (concatenated $\pi$ and $\lambda$ channels).
 
 ![Architecture](readme_image/architecture.png)
 
-### Strategie di Fusione
-Il progetto supporta diverse modalità di integrazione semantica per guidare la regressione della densità:
-* **Soft Fusion (Bypass Gating):** Le mappe $\pi$ e $\lambda$ vengono utilizzate come feature aggiuntive, permettendo al modello di mantenere tutta l'informazione del backbone guidandola con "hint" statistici.
-* **Hard Gating:** La $\pi$-map agisce come una maschera binaria per sopprimere attivamente il rumore nelle regioni identificate come background.
+### Fusion Strategies
+The project supports different semantic integration modes to guide density regression:
+* **Soft Fusion (Bypass Gating):** The $\pi$ and $\lambda$ maps are used as additional features, allowing the model to retain all backbone information and guide it with statistical "hints".
+* **Hard Gating:** The $\pi$-map acts as a binary mask to actively suppress noise in regions identified as background.
 
-## Protocollo di Addestramento (Curriculum Learning)
+## Training Protocol (Curriculum Learning)
 
-L'addestramento segue una strategia multi-stadio per garantire la stabilità della convergenza e l'apprendimento progressivo delle caratteristiche:
+Training follows a multi-stage strategy to ensure stable convergence and progressive learning of features:
 
-* **Stage 1 (ZIP Training):** Training isolato dello **ZIP Head** utilizzando la Zero-Inflatable Poisson NLL Loss per modellare la sparsity della scena.
-* **Stage 2 (P2R Training):** Addestramento del modulo **P2R** standalone per consolidare le capacità di regressione della densità.
-* **Stage 3 (Joint Fine-Tuning):** Addestramento congiunto dell'intera architettura utilizzando una **Composite Loss** che bilancia l'accuratezza del conteggio e la corretta classificazione semantica.
+* **Stage 1 (ZIP Training):** Isolated training of the **ZIP Head** using the Zero-Inflated Poisson NLL Loss to model scene sparsity. Run with:
+    ```bash
+    python train_stage1_zip.py --config config_shhb.yaml
+    ```
+* **Stage 2 (P2R Training):** Training of the **P2R** module with $\pi$ and $\lambda$ as additional inputsì. Run with:
+    ```bash
+    python train_stage2_p2r.py --config config_shhb.yaml
+    ```
+* **Stage 3 (Joint Fine-Tuning):** Joint training of the entire architecture using a **Composite Loss** that balances counting accuracy and correct semantic classification. Run with:
+    ```bash
+    python train_stage3_joint.py --config config_shhb.yaml
+    ```
 
-## Requisiti e Installazione
+You can use the provided bash scripts to launch all stages sequentially:
+```bash
+./train_all.sh
+```
+or for specific datasets:
+```bash
+./train_all_jhu.sh
+./train_all_qnrf.sh
+```
+The config file in the `configs/` folder determines the dataset and training parameters.
 
-Il codice richiede un ambiente Python 3.8+ con le seguenti librerie principali:
+## Requirements and Installation
+
+The code requires a Python 3.8+ environment with the following main libraries:
 * PyTorch
-* Seaborn / Matplotlib (per la visualizzazione della Confusion Matrix e delle mappe)
+* Seaborn / Matplotlib (for Confusion Matrix and map visualization)
 * Scikit-learn
 
 ```bash
-git clone [https://github.com/Christian1301/p2r.git](https://github.com/Christian1301/p2r.git)
+git clone https://github.com/Christian1301/p2r.git
 cd p2r
 pip install -r requirements.txt
-
-## Requisiti e Installazione
-
-To run the code, lauche the following command:
-```bash
-train_all.sh
 ```
-this command will train the model on the ShanghaiTech dataset, you can change the dataset by changing the config file in `configs/` folder.
-This commando will launch stage1, stage2, stage3 and all the validations, you can also launch each stage separately by launching the corresponding command.
 
 ## Launch the demo
-To launch the demo, you can use the following command:
+To launch the demo, use the following commands:
 ```bash
 cd files
 pip install -r requirements.txt
-python server.py 
+python server.py
 ```

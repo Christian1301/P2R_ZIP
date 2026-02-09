@@ -22,14 +22,12 @@ MODEL:
   BACKBONE: "vgg16_bn"
   BACKBONE_PRETRAINED: true
   
-  # Per Stage 3, il backbone viene congelato via codice, 
-  # ma lasciamo false qui per flessibilità di caricamento
   FREEZE_BACKBONE_STAGE1: false
   FREEZE_BACKBONE_STAGE2: false
   FREEZE_BACKBONE_STAGE3: false
   
   ZIP_HIDDEN_DIM: 256
-  ZIP_PI_THRESH: 0.2    # <--- LASCIATO A 0.2 (OK per SHHB)
+  ZIP_PI_THRESH: 0.2    
   
   P2R_FEA_CHANNEL: 256
   P2R_OUT_STRIDE: 16
@@ -40,7 +38,7 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
 
 # ============================================================
-# STAGE 1 & 2 (Configurazioni standard preservate)
+# STAGE 1 & 2 
 # ============================================================
 OPTIM_ZIP:
   EPOCHS: 3000
@@ -100,22 +98,11 @@ OPTIM_JOINT:
 
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.1        # (Era 0.2/0.3 - Troppo aggressivo)
-  ALPHA_WARMUP: 20      # Warmup veloce
-
-  # --- CRUCIALE: FREEZE P2R ---
-  # Mettendo LR a 0.0, impediamo che i pesi dello Stage 2 cambino.
-  # Il MAE RAW rimarrà fisso a ~62.22.
-  LR_P2R: 0.0           # (Era 1.0e-5 - Questo ha causato il peggioramento)
-  
-  # Imariamo solo la compensazione di scala
+  ALPHA_END: 0.1        
+  ALPHA_WARMUP: 20      
+  LR_P2R: 0.0          
   LR_SCALE: 1.0e-3
-  
-  # --- CRUCIALE: DISABILITA SPATIAL LOSS ---
-  # Su JHU la ZIP map è imprecisa. Non forzare la density ad assomigliarle.
-  SPATIAL_WEIGHT: 0.0   # (Era 0.05 - Questo confondeva il conteggio)
-
-  # Training rapido (stiamo calibrando solo lo scale)
+  SPATIAL_WEIGHT: 0.0   
   EPOCHS: 150      
   PATIENCE: 80
 
@@ -123,7 +110,7 @@ JOINT_LOSS:
   COUNT_WEIGHT: 1.0
   MASK_WEIGHT: 0.0
   USE_SOFT_MASK: true
-  SOFT_ALPHA: 0.1      # <--- MODIFICA: Allineato con ALPHA_END (Prima era 0.25)
+  SOFT_ALPHA: 0.1     
   FREEZE_ZIP_HEAD: true
   FREEZE_P2R_BACKBONE_ONLY: true
 
@@ -133,7 +120,7 @@ JOINT_LOSS:
 AUGMENTATION:
   TRAIN:
     RANDOM_CROP: true
-    CROP_SIZE: [512, 512]  # <--- MODIFICA: Aumentato per catturare più contesto su SHHB
+    CROP_SIZE: [512, 512]  
     HORIZONTAL_FLIP: true
     FLIP_PROB: 0.5
     COLOR_JITTER: true
@@ -147,7 +134,7 @@ AUGMENTATION:
     BLUR_PROB: 0.1
     BLUR_KERNEL: [3, 7]
   VAL:
-    RESIZE: false  # Validazione a risoluzione piena
+    RESIZE: false  
 
 # ============================================================
 # Logging

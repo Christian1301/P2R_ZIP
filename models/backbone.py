@@ -1,13 +1,15 @@
-# P2R_ZIP/models/backbone.py
+"""
+VGG backbone wrapper for feature extraction.
+
+Provides a truncated VGG16-BN or VGG19-BN backbone (up to layer 43) with
+stride 16 and 512 output channels, wrapped in a simple nn.Module interface.
+"""
+
 import torch
 import torch.nn as nn
 from torchvision import models
 
 def make_backbone(name: str = "vgg16_bn", pretrained: bool = True):
-    """
-    Ritorna un feature extractor VGG con stride 16.
-    Output channels è 512 sia per VGG16 che VGG19.
-    """
     name = name.lower()
     weights = models.VGG16_BN_Weights.IMAGENET1K_V1 if pretrained else None
     model_class = models.vgg16_bn
@@ -21,7 +23,7 @@ def make_backbone(name: str = "vgg16_bn", pretrained: bool = True):
     model = model_class(weights=weights)
     features = model.features
     truncated_features = nn.Sequential(*list(features.children())[:43])
-    out_channels = 512 
+    out_channels = 512
 
     return truncated_features, out_channels
 

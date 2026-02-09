@@ -14,15 +14,11 @@ def zip_nll(pi, lam, target_counts, eps=1e-8, reduction="mean"):
       se y>0:    log( pi * e^{-lam} * lam^y / y! )
     """
     
-    # --- CODICE AGGIUNTO PER GESTIRE DIMENSIONI DIVERSE ---
-    # Controlla se le dimensioni spaziali dell'output (pi, lam) corrispondono a quelle del target.
-    # Se non corrispondono, ridimensiona l'output per allinearlo al target.
     target_h, target_w = target_counts.shape[-2:]
     if pi.shape[-2:] != (target_h, target_w):
         pi = F.interpolate(pi, size=(target_h, target_w), mode='bilinear', align_corners=False)
     if lam.shape[-2:] != (target_h, target_w):
         lam = F.interpolate(lam, size=(target_h, target_w), mode='bilinear', align_corners=False)
-    # --- FINE CODICE AGGIUNTO ---
 
     pi = torch.clamp(pi, 0.0 + eps, 1.0 - eps)
     lam = torch.clamp(lam, eps, 1e6)

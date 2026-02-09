@@ -1,11 +1,10 @@
-# train_utils_fixed.py
 """
-Train utilities con correzioni per padding consistente.
+Training utilities for the P2R-ZIP crowd counting pipeline.
 
-Modifiche:
-1. collate_fn con padding a multipli di 16 (come backbone VGG)
-2. Calibrazione per-batch invece che globale
-3. Funzioni di debug migliorate
+Provides seed initialization, optimizer/scheduler construction, a unified
+collate function with padding to multiples of 16, P2R grid canonicalization,
+density scale calibration, experiment setup, checkpoint save/resume, and
+batch prediction debugging helpers.
 """
 
 import os
@@ -30,7 +29,6 @@ def init_seeds(seed=42):
 
 
 def get_optimizer(param_groups, optim_config):
-    """Costruisce l'optimizer."""
     if not isinstance(param_groups, (list, tuple)):
         param_groups = [{'params': param_groups}]
 
@@ -71,7 +69,7 @@ def get_scheduler(optimizer, optim_config, max_epochs):
             if warmup_epochs > 0 and current_epoch < warmup_epochs:
                 warmup_ratio = float(current_epoch + 1) / float(max(1, warmup_epochs))
                 return min_factor + (1.0 - min_factor) * warmup_ratio
-            
+
             effective_epoch = current_epoch - warmup_epochs
             effective_max = max(1, max_epochs - warmup_epochs)
             progress = float(effective_epoch + 1) / float(effective_max)
@@ -85,24 +83,16 @@ def get_scheduler(optimizer, optim_config, max_epochs):
 
 
 def _round_to_multiple(x: int, multiple: int = 16) -> int:
-    """Arrotonda x al multiplo superiore più vicino."""
     return ((x + multiple - 1) // multiple) * multiple
 
 
 def collate_fn(batch):
-    """
-    Collate function UNIFICATA con padding a multipli di 16.
-    Supporta sia tuple (img, density, points) che dizionari.
-    """
     item = batch[0]
-    
-    # ========== NUOVO: Supporto per TUPLE ==========
+
     if isinstance(item, tuple) and len(item) == 3:
-        # Dataset restituisce (image, density, points)
         max_h = max(b[0].shape[1] for b in batch)
         max_w = max(b[0].shape[2] for b in batch)
-        
-        # Arrotonda a multipli di 16 per VGG backbone
+
         max_h = _round_to_multiple(max_h, 16)
         max_w = _round_to_multiple(max_w, 16)
 
@@ -113,14 +103,13 @@ def collate_fn(batch):
             pad_w = max_w - w
             pad_h = max_h - h
             pad = (0, pad_w, 0, pad_h)
-            
+
             padded_images.append(F.pad(img, pad, mode='constant', value=0))
             padded_densities.append(F.pad(den, pad, mode='constant', value=0))
             points_list.append(pts)
 
         return torch.stack(padded_images, 0), torch.stack(padded_densities, 0), points_list
 
-    # ========== Dizionario (legacy) ==========
     elif isinstance(item, dict):
         if 'density' in item and isinstance(item['points'], torch.Tensor):
             max_h = max(b['image'].shape[1] for b in batch)
@@ -136,7 +125,7 @@ def collate_fn(batch):
                 pad_w = max_w - w
                 pad_h = max_h - h
                 pad = (0, pad_w, 0, pad_h)
-                
+
                 padded_images.append(F.pad(img, pad, mode='constant', value=0))
                 padded_densities.append(F.pad(den, pad, mode='constant', value=0))
                 points_list.append(pts)
@@ -151,8 +140,8 @@ def collate_fn(batch):
 
     raise TypeError(f"Formato batch non riconosciuto: tipo={type(item)}, contenuto={item if not isinstance(item, tuple) else 'tuple'}")
 
+
 def canonicalize_p2r_grid(pred_density, input_hw, default_down, warn_tag=None, warn_tol=0.15):
-    """Calcola i fattori di downsampling effettivi."""
     if not hasattr(canonicalize_p2r_grid, "_warned_tags"):
         canonicalize_p2r_grid._warned_tags = set()
 
@@ -192,15 +181,9 @@ def calibrate_density_scale_v2(
     max_batches=None,
     clamp_range=None,
     max_adjust=2.0,
-    bias_eps=0.05,  # AUMENTATO da 1e-3
+    bias_eps=0.05,
     verbose=True,
 ):
-    """
-    Calibrazione MIGLIORATA con:
-    1. Threshold più alto per considerare calibrato (5% invece di 0.1%)
-    2. Analisi per-immagine per detectare outlier
-    3. Report dettagliato delle statistiche
-    """
     if not hasattr(model, "p2r_head") or not hasattr(model.p2r_head, "log_scale"):
         return None
 
@@ -228,12 +211,11 @@ def calibrate_density_scale_v2(
         down_h, down_w = down_tuple
         cell_area = down_h * down_w
 
-        # Per-image analysis
         for i, pts in enumerate(points_list):
             gt = len(pts)
             if gt == 0:
                 continue
-            
+
             pred = (pred_density[i].sum() / cell_area).item()
             pred_counts.append(pred)
             gt_counts.append(gt)
@@ -243,55 +225,51 @@ def calibrate_density_scale_v2(
         print("ℹ️ Calibrazione saltata: nessun dato valido")
         return None
 
-    # Statistiche dettagliate
     ratios_np = np.array(ratios)
     pred_np = np.array(pred_counts)
     gt_np = np.array(gt_counts)
-    
+
     bias_global = sum(pred_counts) / sum(gt_counts)
     bias_median = np.median(ratios_np)
     bias_std = np.std(ratios_np)
-    
+
     if verbose:
         print(f"\n📊 Statistiche Calibrazione:")
         print(f"   Bias globale (sum): {bias_global:.3f}")
         print(f"   Bias mediano: {bias_median:.3f}")
         print(f"   Std ratio: {bias_std:.3f}")
         print(f"   Range ratio: [{ratios_np.min():.3f}, {ratios_np.max():.3f}]")
-        
-        # Identifica outlier
+
         outliers_high = np.sum(ratios_np > 1.5)
         outliers_low = np.sum(ratios_np < 0.67)
         print(f"   Outlier (>1.5x): {outliers_high}/{len(ratios_np)}")
         print(f"   Outlier (<0.67x): {outliers_low}/{len(ratios_np)}")
 
-    # Usa il bias mediano per robustezza agli outlier
     bias = bias_median
-    
+
     if abs(bias - 1.0) < bias_eps:
         print(f"ℹ️ Calibrazione: bias già accettabile ({bias:.3f}, soglia ±{bias_eps})")
         return bias
 
-    # Applica correzione
     prev_log_scale = float(model.p2r_head.log_scale.detach().item())
     raw_adjust = float(np.log(bias))
-    
+
     if max_adjust is not None:
         adjust = float(np.clip(raw_adjust, -max_adjust, max_adjust))
     else:
         adjust = raw_adjust
-    
+
     model.p2r_head.log_scale.data -= torch.tensor(adjust, device=device)
-    
+
     if clamp_range is not None:
         min_val, max_val = float(clamp_range[0]), float(clamp_range[1])
         model.p2r_head.log_scale.data.clamp_(min_val, max_val)
-    
+
     new_log_scale = float(model.p2r_head.log_scale.detach().item())
     new_scale = float(torch.exp(model.p2r_head.log_scale.detach()).item())
-    
+
     print(f"🔧 Calibrazione: bias={bias:.3f} → log_scale {prev_log_scale:.4f}→{new_log_scale:.4f} (scala={new_scale:.4f})")
-    
+
     return bias
 
 
@@ -332,16 +310,15 @@ def save_checkpoint(model, optimizer, epoch, val_metric, best_metric, exp_dir, i
 
 
 def debug_batch_predictions(pred_counts, gt_counts, prefix=""):
-    """Stampa statistiche dettagliate per debugging."""
     if len(pred_counts) == 0:
         return
-    
+
     pred_np = np.array([p.item() if torch.is_tensor(p) else p for p in pred_counts])
     gt_np = np.array([g.item() if torch.is_tensor(g) else g for g in gt_counts])
-    
+
     errors = np.abs(pred_np - gt_np)
     ratios = pred_np / np.maximum(gt_np, 1)
-    
+
     print(f"\n{prefix}📈 Batch Statistics:")
     print(f"   MAE: {errors.mean():.2f}")
     print(f"   Ratio (pred/gt): mean={ratios.mean():.3f}, std={ratios.std():.3f}")

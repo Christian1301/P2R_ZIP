@@ -3,7 +3,7 @@
 # Obiettivo: Recuperare il best model (Ep 75) e scendere < 60
 # ============================================================
 
-RUN_NAME: "shha_v15"
+RUN_NAME: "shha"
 EXPERIMENT_DIR: "exp"
 
 # ============================================================
@@ -21,7 +21,6 @@ DATASET:
 MODEL:
   BACKBONE: "vgg16_bn"
   BACKBONE_PRETRAINED: true
-  # In stage 3 sblocchiamo tutto ma con LR basso
   FREEZE_BACKBONE_STAGE1: false
   FREEZE_BACKBONE_STAGE2: false
   FREEZE_BACKBONE_STAGE3: false
@@ -38,7 +37,7 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
 
 # ============================================================
-# STAGE CONFIGURATIONS (Invariati per compatibilità)
+# STAGE CONFIGURATIONS 
 # ============================================================
 OPTIM_ZIP:
   EPOCHS: 3000
@@ -91,15 +90,15 @@ P2R_LOSS:
   LOG_SCALE_LR_MULT: 0.1
 
 # ============================================================
-# STAGE 3: Joint Training - FINETUNING (CRITICO)
+# STAGE 3
 # ============================================================
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.15        # Ridotto da 0.3
-  ALPHA_WARMUP: 30       # Ridotto da 50
-  LR_P2R: 5.0e-6         # Ridotto da 1e-5
+  ALPHA_END: 0.15        
+  ALPHA_WARMUP: 30       
+  LR_P2R: 5.0e-6         
   LR_SCALE: 5.0e-3
-  SPATIAL_WEIGHT: 0.0    # Disabilitato (era 0.05)
+  SPATIAL_WEIGHT: 0.0    
   EPOCHS: 100
   PATIENCE: 40
 
@@ -108,8 +107,6 @@ JOINT_LOSS:
   MASK_WEIGHT: 0.0
   USE_SOFT_MASK: true
   
-  # Aumentiamo leggermente l'influenza dello ZIP 
-  # per contenere il rumore del P2R (era 0.2)
   SOFT_ALPHA: 0.25        
   
   FREEZE_ZIP_HEAD: true

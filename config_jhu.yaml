@@ -22,7 +22,6 @@ MODEL:
   BACKBONE: "vgg16_bn"
   BACKBONE_PRETRAINED: true
   
-  # Stage 3 Fusion sblocca tutto
   FREEZE_BACKBONE_STAGE1: false
   FREEZE_BACKBONE_STAGE2: false
   FREEZE_BACKBONE_STAGE3: false
@@ -39,29 +38,26 @@ ZIP_HEAD:
   USE_SOFTPLUS: true
 
 # ============================================================
-# STAGE 1 & 2 (Standard per compatibilità)
-# ============================================================
-# ============================================================
-# STAGE 1 - OTTIMIZZATO PER JHU (più conservativo)
+# STAGE 1 & 2 
 # ============================================================
 OPTIM_ZIP:
-  EPOCHS: 3000           # Più epoche per dataset complesso
-  BATCH_SIZE: 8          # Batch più grande se possibile
-  LR: 3.0e-5             # LR più basso per stabilità
-  LR_BACKBONE: 1.0e-5    # Backbone ancora più lento
-  HEAD_LR: 5.0e-5        # Head può imparare più veloce
-  WEIGHT_DECAY: 1.0e-4   # Più regularizzazione
-  WARMUP_EPOCHS: 150     # Warmup più lungo
-  EARLY_STOPPING_PATIENCE: 900  # Più pazienza
-  GRAD_CLIP: 0.5         # Clip più aggressivo
+  EPOCHS: 3000           
+  BATCH_SIZE: 8          
+  LR: 3.0e-5             
+  LR_BACKBONE: 1.0e-5    
+  HEAD_LR: 5.0e-5        
+  WEIGHT_DECAY: 1.0e-4  
+  WARMUP_EPOCHS: 150     
+  EARLY_STOPPING_PATIENCE: 900  
+  GRAD_CLIP: 0.5         
   VAL_INTERVAL: 10
   NUM_WORKERS: 4
 
 ZIP_LOSS_V4:
   WEIGHT_NLL: 1.0
-  WEIGHT_LAMBDA_REG: 0.005   # Meno regolarizzazione su λ
-  LAMBDA_MAX_TARGET: 10.0    # JHU ha celle molto dense
-  PI_THRESHOLD: 0.2          # Threshold più basso per recall
+  WEIGHT_LAMBDA_REG: 0.005   
+  LAMBDA_MAX_TARGET: 10.0    
+  PI_THRESHOLD: 0.2          
 
 OPTIM_P2R:
   EPOCHS: 3500
@@ -93,29 +89,18 @@ P2R_LOSS:
   LOG_SCALE_LR_MULT: 0.1
 
 # ============================================================
-# STAGE 3 FUSION CONFIGURATION (JHU OPTIMIZED - FROZEN MODE)
+# STAGE 3 FUSION CONFIGURATION 
 # ============================================================
 OPTIM_JOINT:
   BATCH_SIZE: 6
 
 STAGE3_FUSION:
   ALPHA_START: 0.0
-  ALPHA_END: 0.1        # (Era 0.2/0.3 - Troppo aggressivo)
-  ALPHA_WARMUP: 20      # Warmup veloce
-
-  # --- CRUCIALE: FREEZE P2R ---
-  # Mettendo LR a 0.0, impediamo che i pesi dello Stage 2 cambino.
-  # Il MAE RAW rimarrà fisso a ~62.22.
-  LR_P2R: 0.0           # (Era 1.0e-5 - Questo ha causato il peggioramento)
-  
-  # Imariamo solo la compensazione di scala
+  ALPHA_END: 0.1        
+  ALPHA_WARMUP: 20      
+  LR_P2R: 0.0          
   LR_SCALE: 1.0e-3
-  
-  # --- CRUCIALE: DISABILITA SPATIAL LOSS ---
-  # Su JHU la ZIP map è imprecisa. Non forzare la density ad assomigliarle.
-  SPATIAL_WEIGHT: 0.0   # (Era 0.05 - Questo confondeva il conteggio)
-
-  # Training rapido (stiamo calibrando solo lo scale)
+  SPATIAL_WEIGHT: 0.0   
   EPOCHS: 150      
   PATIENCE: 80
 

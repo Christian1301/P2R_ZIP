@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluation Stage 2 - P2R Head
+Stage 2 evaluation - P2R density head metrics.
 
-⚠️ CRITICO: Usa log_scale dal checkpoint, NON ri-calibrare!
-
-USO:
-    # Valuta su val set (default)
-    python evaluate_stage2.py --config config_jhu.yaml
-    
-    # Valuta su test set
-    python evaluate_stage2.py --config config_jhu.yaml --split test
-    
-    # Salva risultati dettagliati
-    python evaluate_stage2.py --config config_jhu.yaml --split test --save-results
+Evaluates the P2R head using MAE, RMSE, MSE, NAE, and bias. Includes
+per-density-band MAE analysis, pi coverage statistics, and log_scale
+reporting from the checkpoint. Supports val/test split selection and
+automatic checkpoint discovery.
 """
 
 import os
@@ -33,7 +26,6 @@ from datasets.transforms import build_transforms
 from train_utils import init_seeds, collate_fn, canonicalize_p2r_grid
 
 
-# Default bin definitions
 DEFAULT_BINS_CONFIG = {
     'shha': {
         'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
@@ -66,15 +58,13 @@ DATASET_ALIASES = {
 
 
 def resize_if_needed(images, max_size=2048):
-    """Ridimensiona immagini se troppo grandi per evitare OOM."""
     _, _, H, W = images.shape
     max_dim = max(H, W)
-    
+
     if max_dim > max_size:
         scale = max_size / max_dim
         new_H = int(H * scale)
         new_W = int(W * scale)
-        # Arrotonda a multiplo di 32
         new_H = (new_H // 32) * 32
         new_W = (new_W // 32) * 32
         images = F.interpolate(images, size=(new_H, new_W), mode='bilinear', align_corners=False)
@@ -84,92 +74,74 @@ def resize_if_needed(images, max_size=2048):
 
 @torch.no_grad()
 def validate_stage2(model, dataloader, device, default_down, pi_threshold=0.5, max_size=2048):
-    """
-    Validazione Stage 2 con metriche dettagliate.
-    
-    Args:
-        max_size: dimensione massima per lato (evita OOM su immagini grandi)
-    """
     model.eval()
-    
+
     all_mae = []
     all_mse = []
     all_errors = []
     total_pred = 0.0
     total_gt = 0.0
-    
+
     all_gt_counts = []
     all_pred_counts = []
-    
-    # Per analisi per fasce di densità
+
     density_bins = [0, 50, 100, 200, 500, 1000, float('inf')]
     density_bin_errors = {i: [] for i in range(len(density_bins) - 1)}
-    
-    # π statistics
+
     pi_coverages = []
     pi_means = []
-    
+
     for images, gt_density, points in tqdm(dataloader, desc="Evaluating Stage 2"):
         images = images.to(device)
         points_list = points
-        
-        # Ridimensiona se troppo grande
+
         images, scale = resize_if_needed(images, max_size)
-        
-        # Forward
+
         outputs = model(images)
         pred = outputs['p2r_density']
         pi_probs = outputs.get('pi_probs')
-        
+
         _, _, H_in, W_in = images.shape
-        
-        # Canonicalize
+
         pred, down_tuple, _ = canonicalize_p2r_grid(pred, (H_in, W_in), default_down)
-        
+
         down_h, down_w = down_tuple
         cell_area = down_h * down_w
-        
-        # π coverage
+
         if pi_probs is not None:
             coverage = (pi_probs > pi_threshold).float().mean().item() * 100
             pi_coverages.append(coverage)
             pi_means.append(pi_probs.mean().item())
-        
-        # Calcolo MAE per ogni immagine
+
         for i, pts in enumerate(points_list):
             gt = len(pts) if pts is not None else 0
             pred_count = (pred[i].sum() / cell_area).item()
             error = abs(pred_count - gt)
-            
+
             all_mae.append(error)
             all_mse.append((pred_count - gt) ** 2)
             all_errors.append(error)
-            
+
             total_pred += pred_count
             total_gt += gt
-            
+
             all_gt_counts.append(gt)
             all_pred_counts.append(pred_count)
-            
-            # Assegna a bin di densità
+
             for bin_idx in range(len(density_bins) - 1):
                 if density_bins[bin_idx] <= gt < density_bins[bin_idx + 1]:
                     density_bin_errors[bin_idx].append(error)
                     break
-    
-    # Metriche globali
+
     mae = np.mean(all_mae)
     rmse = np.sqrt(np.mean(all_mse))
     bias = total_pred / total_gt if total_gt > 0 else 0
-    
-    # Array per statistiche
+
     all_gt_counts = np.array(all_gt_counts)
     all_pred_counts = np.array(all_pred_counts)
-    
-    # NAE (Normalized Absolute Error)
+
     nae = np.sum(all_errors) / np.sum(all_gt_counts) if np.sum(all_gt_counts) > 0 else 0
-    
-    # MAE per fasce di densità
+
     density_mae = {}
     density_labels = ['0-50', '50-100', '100-200', '200-500', '500-1000', '1000+']
     for bin_idx, label in enumerate(density_labels):
@@ -179,7 +151,7 @@ def validate_stage2(model, dataloader, device, default_down, pi_threshold=0.5, m
                 'mae': float(np.mean(errors)),
                 'count': len(errors),
             }
-    
+
     return {
         'mae': mae,
         'rmse': rmse,
@@ -206,72 +178,62 @@ def validate_stage2(model, dataloader, device, default_down, pi_threshold=0.5, m
 
 
 def print_results(results, split):
-    """Stampa risultati in formato leggibile."""
-    
     print("\n" + "="*70)
-    print(f"📊 STAGE 2 EVALUATION RESULTS - {split.upper()} SET")
+    print(f"STAGE 2 EVALUATION RESULTS - {split.upper()} SET")
     print("="*70)
-    
-    print(f"\n🎯 Metriche Principali:")
+
+    print(f"\nMain Metrics:")
     print(f"   MAE:  {results['mae']:.2f}")
     print(f"   RMSE: {results['rmse']:.2f}")
     print(f"   MSE:  {results['mse']:.2f}")
     print(f"   NAE:  {results['nae']:.4f}")
     print(f"   Bias: {results['bias']:.3f}")
-    
-    print(f"\n📈 Statistiche Conteggi:")
+
+    print(f"\nCount Statistics:")
     print(f"   GT Total:   {results['gt_total']:,}")
     print(f"   Pred Total: {results['pred_total']:,.0f}")
-    print(f"   GT Mean:    {results['gt_mean']:.1f} ± {results['gt_std']:.1f}")
-    print(f"   Pred Mean:  {results['pred_mean']:.1f} ± {results['pred_std']:.1f}")
+    print(f"   GT Mean:    {results['gt_mean']:.1f} +/- {results['gt_std']:.1f}")
+    print(f"   Pred Mean:  {results['pred_mean']:.1f} +/- {results['pred_std']:.1f}")
     print(f"   GT Range:   [{results['gt_min']}, {results['gt_max']}]")
     print(f"   Pred Range: [{results['pred_min']:.1f}, {results['pred_max']:.1f}]")
-    
-    print(f"\n🔬 P2R Head Statistics:")
+
+    print(f"\nP2R Head Statistics:")
     print(f"   log_scale: {results['log_scale']:.4f}")
     print(f"   scale:     {results['scale']:.2f}")
-    
-    print(f"\n🎯 ZIP Statistics:")
-    print(f"   π coverage: {results['pi_coverage']:.1f}%")
-    print(f"   π mean:     {results['pi_mean']:.3f}")
-    
-    print(f"\n📊 MAE per Fascia di Densità:")
+
+    print(f"\nZIP Statistics:")
+    print(f"   pi coverage: {results['pi_coverage']:.1f}%")
+    print(f"   pi mean:     {results['pi_mean']:.3f}")
+
+    print(f"\nMAE per Density Band:")
     for label, data in results['density_mae'].items():
         print(f"   {label:>10}: MAE={data['mae']:.2f} (n={data['count']})")
-    
-    print(f"\n📁 Images evaluated: {results['num_images']}")
+
+    print(f"\nImages evaluated: {results['num_images']}")
     print("="*70)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Stage 2')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                        help='Path al file di configurazione YAML')
-    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'],
-                        help='Split da usare (val o test)')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path checkpoint (default: cerca automaticamente)')
-    parser.add_argument('--pi-threshold', type=float, default=0.5,
-                        help='Threshold per π coverage (default: 0.5)')
-    parser.add_argument('--max-size', type=int, default=2048,
-                        help='Max image size per side to avoid OOM (default: 2048)')
-    parser.add_argument('--save-results', action='store_true',
-                        help='Salva risultati in JSON')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Path output JSON')
+    parser.add_argument('--config', type=str, default='config.yaml')
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'])
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--pi-threshold', type=float, default=0.5)
+    parser.add_argument('--max-size', type=int, default=2048)
+    parser.add_argument('--save-results', action='store_true')
+    parser.add_argument('--output', type=str, default=None)
     args = parser.parse_args()
-    
+
     with open(args.config) as f:
         config = yaml.safe_load(f) or {}
-    
+
     device = torch.device(config.get('DEVICE', 'cuda'))
     init_seeds(config.get('SEED', 42))
-    
+
     print("="*70)
-    print(f"🔍 EVALUATION STAGE 2 ({args.split.upper()} SET)")
+    print(f"EVALUATION STAGE 2 ({args.split.upper()} SET)")
     print("="*70)
-    
-    # Setup modello / dataset
+
     dataset_section = config.get('DATASET', 'shha')
     data_section = config.get('DATA')
 
@@ -309,11 +271,11 @@ def main():
         bin_config = DEFAULT_BINS_CONFIG[dataset_name]
     else:
         raise KeyError(f"BINS_CONFIG missing for dataset '{dataset_name}'")
-    
+
     model_cfg = config.get('MODEL', {})
     zip_head_cfg = config.get('ZIP_HEAD', {})
     p2r_loss_cfg = config.get('P2R_LOSS', {})
-    
+
     model = P2R_ZIP_Model(
         bins=bin_config['bins'],
         bin_centers=bin_config['bin_centers'],
@@ -333,15 +295,13 @@ def main():
             'log_scale_clamp': tuple(p2r_loss_cfg.get('LOG_SCALE_CLAMP', [-2.0, 10.0])),
         },
     ).to(device)
-    
-    # Carica checkpoint
+
     exp_cfg = config.get('EXP', {})
     output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), config.get('RUN_NAME', 'stage2_eval'))
-    
+
     if args.checkpoint:
         ckpt_path = args.checkpoint
     else:
-        # Cerca automaticamente
         candidates = ['stage2_bypass_best.pth', 'stage2_best.pth', 'stage2_bypass_last.pth']
         ckpt_path = None
         for c in candidates:
@@ -350,33 +310,28 @@ def main():
                 ckpt_path = path
                 break
         if ckpt_path is None:
-            raise FileNotFoundError(f"Nessun checkpoint Stage 2 trovato in {output_dir}")
-    
-    print(f"\n✅ Caricamento: {ckpt_path}")
+            raise FileNotFoundError(f"No Stage 2 checkpoint found in {output_dir}")
+
+    print(f"\nLoading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model'], strict=False)
-    
-    # Info dal checkpoint
+
     if 'epoch' in checkpoint:
         print(f"   Epoch: {checkpoint['epoch']}")
     if 'mae' in checkpoint:
         print(f"   Checkpoint MAE: {checkpoint['mae']:.2f}")
     if 'best_mae' in checkpoint:
         print(f"   Best MAE: {checkpoint['best_mae']:.2f}")
-    
-    # Mostra log_scale (NON modificarlo!)
+
     if hasattr(model.p2r_head, 'log_scale'):
         ls = model.p2r_head.log_scale.item()
-        print(f"\n📊 log_scale: {ls:.4f} (scala={np.exp(ls):.2f})")
-        print(f"   ⚠️ Usando valore dal checkpoint, NESSUNA ri-calibrazione!")
-    
-    # Dataset
+        print(f"\nlog_scale: {ls:.4f} (scale={np.exp(ls):.2f})")
+        print(f"   Using value from checkpoint, no re-calibration.")
+
     DatasetClass = get_dataset(dataset_name)
     val_transforms = build_transforms(data_cfg, is_train=False)
-    
-    # Scegli split (con auto-detection)
+
     if args.split == 'test':
-        # Cerca in ordine: TEST_SPLIT config, poi 'test', poi 'testing'
         split_name = data_cfg.get('TEST_SPLIT', None)
         if split_name is None:
             for candidate in ['test', 'testing', 'eval']:
@@ -385,17 +340,17 @@ def main():
                     split_name = candidate
                     break
             if split_name is None:
-                split_name = 'test'  # fallback default
+                split_name = 'test'
     else:
         split_name = data_cfg.get('VAL_SPLIT', 'val')
-    
+
     dataset = DatasetClass(
         root=data_cfg['ROOT'],
         split=split_name,
         block_size=block_size,
         transforms=val_transforms,
     )
-    
+
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -403,39 +358,35 @@ def main():
         num_workers=4,
         collate_fn=collate_fn,
     )
-    
-    print(f"\n📊 Dataset: {dataset_name}")
+
+    print(f"\nDataset: {dataset_name}")
     print(f"   Split: {split_name}")
     print(f"   Images: {len(dataset)}")
-    
-    # Valida
+
     results = validate_stage2(model, dataloader, device, default_down, args.pi_threshold, args.max_size)
-    
-    # Stampa risultati
+
     print_results(results, args.split)
-    
-    # Confronto con checkpoint
+
     if 'mae' in checkpoint:
         train_mae = checkpoint['mae']
         diff = abs(results['mae'] - train_mae)
-        print(f"\n📈 Confronto con Training:")
+        print(f"\nComparison with Training:")
         print(f"   Training MAE:   {train_mae:.2f}")
         print(f"   Evaluation MAE: {results['mae']:.2f}")
-        print(f"   Differenza:     {diff:.2f}")
-        
+        print(f"   Difference:     {diff:.2f}")
+
         if diff < 1.0:
-            print(f"\n   ✅ ALLINEATO! Differenza < 1 punto")
+            print(f"\n   ALIGNED! Difference < 1 point")
         else:
-            print(f"\n   ⚠️ Discrepanza di {diff:.1f} punti")
-    
-    # Salva risultati
+            print(f"\n   Discrepancy of {diff:.1f} points")
+
     if args.save_results or args.output:
         if args.output:
             output_path = args.output
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = os.path.join(output_dir, f"stage2_eval_{args.split}_{timestamp}.json")
-        
+
         results_json = {
             **results,
             'metadata': {
@@ -446,13 +397,13 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             }
         }
-        
+
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
         with open(output_path, 'w') as f:
             json.dump(results_json, f, indent=2)
-        
-        print(f"\n💾 Risultati salvati: {output_path}")
-    
+
+        print(f"\nResults saved: {output_path}")
+
     print("="*70)
 
 

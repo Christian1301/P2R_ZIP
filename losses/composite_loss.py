@@ -9,8 +9,8 @@ class PiHeadLoss(nn.Module):
     """
     def __init__(
         self,
-        pos_weight: float = 3.0,  # Peso maggiore per i blocchi pieni (che sono pochi)
-        block_size: int = 8,      # Assicurati che combaci con il tuo modello (es. 8 o 16)
+        pos_weight: float = 3.0,  
+        block_size: int = 8,      
     ):
         super().__init__()
         self.pos_weight = pos_weight

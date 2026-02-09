@@ -33,9 +33,6 @@ class NWPU(BaseDataset):
 
         self.img_paths = []
         
-        # === STRATEGIA DI RICERCA ===
-        # Cerca pattern: ROOT/split/scene*/*.jpg
-        # Questo cattura scene01, scene02, etc.
         search_pattern = os.path.join(base_dir, "scene*", "*.jpg")
         found_imgs = sorted(glob.glob(search_pattern))
         

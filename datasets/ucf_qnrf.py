@@ -19,7 +19,7 @@ class UCF_QNRF(BaseDataset):
         # Gestisce anche eventuali maiuscole/minuscole
         split_name = self.split.lower()
         if split_name == "val": 
-            split_name = "test"  # UCF spesso usa test come validazione se non specificato diversamente
+            split_name = "test"  
             
         list_filename = f"{split_name}.list"
         list_path = os.path.join(self.root, list_filename)

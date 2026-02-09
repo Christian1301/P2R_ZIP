@@ -39,3 +39,12 @@ Il codice richiede un ambiente Python 3.8+ con le seguenti librerie principali:
 git clone [https://github.com/Christian1301/p2r.git](https://github.com/Christian1301/p2r.git)
 cd p2r
 pip install -r requirements.txt
+
+## Requisiti e Installazione
+
+To run the code, lauche the following command:
+```bash
+train_all.sh
+```
+this command will train the model on the ShanghaiTech dataset, you can change the dataset by changing the config file in `configs/` folder.
+This commando will launch stage1, stage2, stage3 and all the validations, you can also launch each stage separately by launching the corresponding command.

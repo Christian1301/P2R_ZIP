@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stage 1 V4 - ZIP Pre-training con ZIP NLL Loss
+Stage 1 - ZIP (Zero-Inflated Poisson) pre-training using ZIP NLL Loss.
 
-CAMBIAMENTO PRINCIPALE DA V3:
-- Usa ZIP Negative Log-Likelihood invece di BCE/Focal
-- ZIP NLL modella direttamente la distribuzione Zero-Inflated Poisson
-- Non richiede tuning di pos_weight per bilanciamento classi
-- π e λ vengono appresi congiuntamente in modo naturale
-
-CRITERIO BEST CHECKPOINT:
-- Priorità al recall (non perdere persone)
-- Se recall >= soglia (85%), confronta F1
-- Se recall sotto soglia, preferisce recall più alto
-
-TARGET:
-- Recall > 90% (priorità alta - non perdere persone)
-- Precision > 50% (accettabile - Stage 2 correggerà)
-- F1 > 65%
-
-FIX v4.1:
-- Aggiunto resize automatico per immagini grandi durante validazione (evita OOM)
+Trains the backbone and ZIP head to predict occupancy probability (pi) and
+Poisson rate (lambda) per block. Best checkpoint selection prioritizes recall
+to avoid missing people, then F1. Includes automatic image resizing during
+validation to prevent OOM errors.
 """
 
 import os
@@ -42,7 +28,6 @@ from train_utils import init_seeds, collate_fn
 from losses.zip_nll import zip_nll
 
 
-# Default bin configurations for common datasets
 DEFAULT_BINS_CONFIG = {
     'shha': {
         'bins': [[0, 0], [1, 3], [4, 6], [7, 10], [11, 15], [16, 22], [23, 32], [33, 9999]],
@@ -67,80 +52,43 @@ DEFAULT_BINS_CONFIG = {
 }
 
 
-# =============================================================================
-# BEST CHECKPOINT SELECTION - Criterio composito
-# =============================================================================
-
 def is_better_checkpoint(
-    current: Dict[str, float], 
-    best: Dict[str, float], 
+    current: Dict[str, float],
+    best: Dict[str, float],
     min_recall: float = 0.85,
     recall_margin: float = 0.02
 ) -> bool:
-    """
-    Criterio di selezione best checkpoint per Stage 1.
-    
-    Priorità:
-    1. Se current recall >= min_recall e best recall < min_recall → current vince
-    2. Se entrambi sotto min_recall → preferisce recall più alto
-    3. Se entrambi sopra min_recall → confronta F1
-    4. A parità di recall (±margin), preferisce F1 più alto
-    
-    Args:
-        current: metriche del checkpoint corrente
-        best: metriche del miglior checkpoint finora
-        min_recall: soglia minima di recall desiderata (default 85%)
-        recall_margin: margine per considerare recall "a parità" (default 2%)
-    
-    Returns:
-        True se current è migliore di best
-    """
     curr_r = current['recall']
     curr_f1 = current['f1']
     best_r = best['recall']
     best_f1 = best['f1']
-    
-    # Caso 1: current sopra soglia, best sotto → current vince sempre
+
     if curr_r >= min_recall and best_r < min_recall:
         return True
-    
-    # Caso 2: current sotto soglia, best sopra → best vince sempre
+
     if curr_r < min_recall and best_r >= min_recall:
         return False
-    
-    # Caso 3: entrambi sotto soglia → priorità al recall
+
     if curr_r < min_recall and best_r < min_recall:
-        # Se current ha recall significativamente più alto, vince
         if curr_r > best_r + recall_margin:
             return True
-        # Se best ha recall significativamente più alto, vince
         elif best_r > curr_r + recall_margin:
             return False
-        # A parità di recall (±margin), guarda F1
         else:
             return curr_f1 > best_f1
-    
-    # Caso 4: entrambi sopra soglia → confronta F1 (recall già garantito)
-    # Ma se uno ha recall molto più alto, consideralo
+
     if curr_r > best_r + recall_margin and curr_f1 >= best_f1 - 0.02:
-        # Recall molto migliore e F1 non troppo peggiore
         return True
-    
-    # Default: confronta F1
+
     return curr_f1 > best_f1
 
 
 def format_metrics_comparison(current: Dict, best: Dict) -> str:
-    """Formatta un confronto tra metriche per il logging."""
     return (
         f"Current: R={current['recall']*100:.1f}% F1={current['f1']*100:.1f}% P={current['precision']*100:.1f}% | "
         f"Best: R={best['recall']*100:.1f}% F1={best['f1']*100:.1f}% P={best['precision']*100:.1f}%"
     )
 
-
-# =============================================================================
-# HELPER: Resize immagini grandi per evitare OOM
-# =============================================================================
 
 def resize_if_needed(
     images: torch.Tensor,
@@ -148,55 +96,28 @@ def resize_if_needed(
     block_size: int,
     max_size: int = 1024
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Ridimensiona immagini e density map se superano max_size.
-    
-    Conserva il count totale nella density map scalando appropriatamente.
-    Assicura che le dimensioni siano multipli di block_size.
-    
-    Args:
-        images: [B, C, H, W] tensor immagini
-        gt_density: [B, 1, H, W] tensor density map
-        block_size: dimensione blocco per allineamento
-        max_size: dimensione massima consentita
-    
-    Returns:
-        images, gt_density ridimensionati (o originali se non necessario)
-    """
     _, _, H, W = images.shape
-    
+
     if max(H, W) <= max_size:
         return images, gt_density
-    
-    # Calcola scala
+
     scale = max_size / max(H, W)
     new_H = int(H * scale)
     new_W = int(W * scale)
-    
-    # Arrotonda a multiplo di block_size
+
     new_H = (new_H // block_size) * block_size
     new_W = (new_W // block_size) * block_size
-    
-    # Assicura dimensioni minime
+
     new_H = max(new_H, block_size)
     new_W = max(new_W, block_size)
-    
-    # Resize immagini
+
     images = F.interpolate(images, size=(new_H, new_W), mode='bilinear', align_corners=False)
-    
-    # Resize density e scala per conservare count totale
-    # count_originale = sum(density) * pixel_area
-    # Dopo resize: count = sum(new_density) * new_pixel_area
-    # Per conservare: new_density = density * (H*W) / (new_H*new_W)
+
     gt_density = F.interpolate(gt_density, size=(new_H, new_W), mode='bilinear', align_corners=False)
     gt_density = gt_density * (H * W) / (new_H * new_W)
-    
+
     return images, gt_density
 
-
-# =============================================================================
-# COMPUTE LOSS AND METRICS
-# =============================================================================
 
 def compute_zip_loss_and_metrics(
     outputs: dict,
@@ -206,59 +127,48 @@ def compute_zip_loss_and_metrics(
     lambda_max_target: float = 8.0,
     pi_threshold: float = 0.5,
 ) -> Tuple[torch.Tensor, dict]:
-    """
-    Calcola ZIP NLL loss e metriche.
-    
-    Usa direttamente la funzione zip_nll dal tuo file losses/zip_nll.py
-    """
-    pi_probs = outputs['pi_probs']       # [B, 1, H, W]
-    lambda_maps = outputs['lambda_maps']  # [B, 1, H, W]
-    
-    # GT counts per blocco
+    pi_probs = outputs['pi_probs']
+    lambda_maps = outputs['lambda_maps']
+
     gt_counts = F.avg_pool2d(
         gt_density,
         kernel_size=block_size,
         stride=block_size
     ) * (block_size ** 2)
-    
-    # 1. ZIP NLL Loss
+
     loss_nll = zip_nll(pi_probs, lambda_maps, gt_counts, reduction='mean')
-    
-    # 2. Lambda regularization (opzionale)
+
     if weight_lambda_reg > 0:
         loss_lambda_reg = F.relu(lambda_maps - lambda_max_target).mean()
     else:
         loss_lambda_reg = torch.tensor(0.0, device=pi_probs.device)
-    
-    # Total loss
+
     total_loss = loss_nll + weight_lambda_reg * loss_lambda_reg
-    
-    # Metriche per monitoraggio
+
     with torch.no_grad():
-        # Allinea gt_counts per metriche
         if gt_counts.shape[-2:] != pi_probs.shape[-2:]:
             gt_counts_aligned = F.interpolate(gt_counts, size=pi_probs.shape[-2:], mode='nearest')
         else:
             gt_counts_aligned = gt_counts
-        
+
         gt_occupancy = (gt_counts_aligned > 0.5).float()
         pred_binary = (pi_probs > pi_threshold).float()
-        
+
         tp = ((pred_binary == 1) & (gt_occupancy == 1)).sum().item()
         tn = ((pred_binary == 0) & (gt_occupancy == 0)).sum().item()
         fp = ((pred_binary == 1) & (gt_occupancy == 0)).sum().item()
         fn = ((pred_binary == 0) & (gt_occupancy == 1)).sum().item()
-        
+
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-6)
         accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
-        
+
         pi_mean = pi_probs.mean().item()
         pi_std = pi_probs.std().item()
         lambda_mean = lambda_maps.mean().item()
         lambda_max = lambda_maps.max().item()
-    
+
     metrics = {
         'total': total_loss.item(),
         'nll': loss_nll.item(),
@@ -273,13 +183,9 @@ def compute_zip_loss_and_metrics(
         'lambda_max': lambda_max,
         'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn,
     }
-    
+
     return total_loss, metrics
 
-
-# =============================================================================
-# TRAINING
-# =============================================================================
 
 def train_one_epoch(
     model: nn.Module,
@@ -290,20 +196,19 @@ def train_one_epoch(
     block_size: int,
     loss_cfg: dict,
 ) -> dict:
-    """Training di una epoch."""
     model.train()
-    
+
     total_loss = 0.0
     metrics_sum = {}
-    
+
     pbar = tqdm(dataloader, desc=f"Stage1 V4 [Ep {epoch}]")
-    
+
     for images, gt_density, _ in pbar:
         images = images.to(device)
         gt_density = gt_density.to(device)
-        
+
         optimizer.zero_grad()
-        
+
         outputs = model(images)
         loss, metrics = compute_zip_loss_and_metrics(
             outputs, gt_density,
@@ -312,20 +217,19 @@ def train_one_epoch(
             lambda_max_target=loss_cfg.get('LAMBDA_MAX_TARGET', 8.0),
             pi_threshold=loss_cfg.get('PI_THRESHOLD', 0.5),
         )
-        
+
         loss.backward()
-        
-        # Gradient clipping
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+
         optimizer.step()
-        
+
         total_loss += loss.item()
-        
+
         for k, v in metrics.items():
             if isinstance(v, (int, float)):
                 metrics_sum[k] = metrics_sum.get(k, 0) + v
-        
+
         pbar.set_postfix({
             'NLL': f"{metrics['nll']:.3f}",
             'P': f"{metrics['precision']*100:.1f}%",
@@ -334,11 +238,11 @@ def train_one_epoch(
             'π': f"{metrics['pi_mean']:.2f}",
             'λ': f"{metrics['lambda_mean']:.1f}",
         })
-    
+
     n = len(dataloader)
     avg_metrics = {k: v / n for k, v in metrics_sum.items()}
     avg_metrics['loss'] = total_loss / n
-    
+
     return avg_metrics
 
 
@@ -351,34 +255,22 @@ def validate(
     loss_cfg: dict,
     max_size: int = 1024,
 ) -> dict:
-    """
-    Validazione con metriche complete.
-    
-    Args:
-        model: modello da validare
-        dataloader: validation dataloader
-        device: device per computazione
-        block_size: dimensione blocco ZIP
-        loss_cfg: configurazione loss
-        max_size: dimensione massima immagine (evita OOM)
-    """
     model.eval()
-    
+
     total_tp, total_tn, total_fp, total_fn = 0, 0, 0, 0
     total_loss = 0.0
     total_nll = 0.0
     pi_means, pi_stds = [], []
     lambda_means = []
-    
+
     pi_threshold = loss_cfg.get('PI_THRESHOLD', 0.5)
-    
+
     for images, gt_density, _ in tqdm(dataloader, desc="Validate", leave=False):
         images = images.to(device)
         gt_density = gt_density.to(device)
-        
-        # Resize se necessario per evitare OOM
+
         images, gt_density = resize_if_needed(images, gt_density, block_size, max_size)
-        
+
         outputs = model(images)
         loss, batch_metrics = compute_zip_loss_and_metrics(
             outputs, gt_density,
@@ -387,28 +279,28 @@ def validate(
             lambda_max_target=loss_cfg.get('LAMBDA_MAX_TARGET', 8.0),
             pi_threshold=pi_threshold,
         )
-        
+
         total_loss += loss.item()
         total_nll += batch_metrics['nll']
-        
+
         pi_probs = outputs['pi_probs']
         lambda_maps = outputs['lambda_maps']
-        
+
         pi_means.append(pi_probs.mean().item())
         pi_stds.append(pi_probs.std().item())
         lambda_means.append(lambda_maps.mean().item())
-        
+
         total_tp += batch_metrics['tp']
         total_tn += batch_metrics['tn']
         total_fp += batch_metrics['fp']
         total_fn += batch_metrics['fn']
-    
+
     n = len(dataloader)
     precision = total_tp / max(total_tp + total_fp, 1)
     recall = total_tp / max(total_tp + total_fn, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-6)
     accuracy = (total_tp + total_tn) / max(total_tp + total_tn + total_fp + total_fn, 1)
-    
+
     return {
         'loss': total_loss / n,
         'nll': total_nll / n,
@@ -423,10 +315,6 @@ def validate(
     }
 
 
-# =============================================================================
-# THRESHOLD FINDER
-# =============================================================================
-
 @torch.no_grad()
 def find_optimal_threshold(
     model: nn.Module,
@@ -437,71 +325,56 @@ def find_optimal_threshold(
     thresholds: List[float] = None,
     max_size: int = 1024,
 ) -> dict:
-    """
-    Trova il threshold che garantisce un certo recall target.
-    
-    Args:
-        model: modello da analizzare
-        dataloader: validation dataloader
-        device: device per computazione
-        block_size: dimensione blocco ZIP
-        target_recall: recall minimo desiderato
-        thresholds: lista di threshold da testare
-        max_size: dimensione massima immagine (evita OOM)
-    """
     if thresholds is None:
         thresholds = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
-    
+
     model.eval()
-    
+
     threshold_stats = {t: {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0} for t in thresholds}
-    
+
     for images, gt_density, _ in tqdm(dataloader, desc="Threshold Search", leave=False):
         images = images.to(device)
         gt_density = gt_density.to(device)
-        
-        # Resize se necessario per evitare OOM
+
         images, gt_density = resize_if_needed(images, gt_density, block_size, max_size)
-        
+
         outputs = model(images)
         pi_probs = outputs['pi_probs']
-        
-        # GT occupancy
+
         gt_counts = F.avg_pool2d(
             gt_density, kernel_size=block_size, stride=block_size
         ) * (block_size ** 2)
         gt_occupancy = (gt_counts > 0.5).float()
-        
+
         if gt_occupancy.shape[-2:] != pi_probs.shape[-2:]:
             gt_occupancy = F.interpolate(
                 gt_occupancy, size=pi_probs.shape[-2:], mode='nearest'
             )
-        
+
         for thresh in thresholds:
             pred_binary = (pi_probs > thresh).float()
-            
+
             tp = ((pred_binary == 1) & (gt_occupancy == 1)).sum().item()
             tn = ((pred_binary == 0) & (gt_occupancy == 0)).sum().item()
             fp = ((pred_binary == 1) & (gt_occupancy == 0)).sum().item()
             fn = ((pred_binary == 0) & (gt_occupancy == 1)).sum().item()
-            
+
             threshold_stats[thresh]['tp'] += tp
             threshold_stats[thresh]['tn'] += tn
             threshold_stats[thresh]['fp'] += fp
             threshold_stats[thresh]['fn'] += fn
-    
-    # Calcola metriche
+
     results = []
     best_for_target_recall = None
-    
+
     for thresh in thresholds:
         stats = threshold_stats[thresh]
         tp, tn, fp, fn = stats['tp'], stats['tn'], stats['fp'], stats['fn']
-        
+
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-6)
-        
+
         result = {
             'threshold': thresh,
             'precision': precision,
@@ -509,19 +382,16 @@ def find_optimal_threshold(
             'f1': f1,
         }
         results.append(result)
-        
-        # Trova il threshold più alto che garantisce recall >= target
+
         if recall >= target_recall:
             if best_for_target_recall is None or thresh > best_for_target_recall['threshold']:
                 best_for_target_recall = result
-    
-    # Se nessun threshold raggiunge target recall, prendi quello con recall più alto
+
     if best_for_target_recall is None:
         best_for_target_recall = max(results, key=lambda x: x['recall'])
-    
-    # Trova anche il best per F1
+
     best_f1 = max(results, key=lambda x: x['f1'])
-    
+
     return {
         'for_target_recall': best_for_target_recall,
         'for_best_f1': best_f1,
@@ -529,10 +399,6 @@ def find_optimal_threshold(
         'all_results': results
     }
 
-
-# =============================================================================
-# CHECKPOINT
-# =============================================================================
 
 def save_checkpoint(
     model: nn.Module,
@@ -545,9 +411,8 @@ def save_checkpoint(
     output_dir: str,
     is_best: bool = False
 ):
-    """Salva checkpoint con tutte le metriche."""
     os.makedirs(output_dir, exist_ok=True)
-    
+
     state = {
         'epoch': epoch,
         'model': model.state_dict(),
@@ -557,9 +422,9 @@ def save_checkpoint(
         'best_metrics': best_metrics,
         'no_improve': no_improve,
     }
-    
+
     torch.save(state, os.path.join(output_dir, 'last.pth'))
-    
+
     if is_best:
         torch.save(state, os.path.join(output_dir, 'best_model.pth'))
         print(f"💾 New Best @ Epoch {epoch}:")
@@ -569,23 +434,19 @@ def save_checkpoint(
         print(f"   Accuracy:  {metrics['accuracy']*100:.2f}%")
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Train Stage 1 ZIP')
     parser.add_argument('--config', type=str, default='config.yaml',
                         help='Path al file di configurazione YAML')
     args = parser.parse_args()
-    
+
     with open(args.config) as f:
         config = yaml.safe_load(f)
-    
+
     device = torch.device(config['DEVICE'])
     init_seeds(config['SEED'])
-    
+
     print("="*70)
     print("🚀 STAGE 1 V4.1 - ZIP Pre-training con ZIP NLL Loss")
     print("="*70)
@@ -593,8 +454,7 @@ def main():
     print(f"Target: Recall > 90%, F1 > 65%")
     print(f"Best Selection: Recall-priority composite criterion")
     print("="*70)
-    
-    # Config
+
     dataset_section = config.get('DATASET', 'shha')
     data_section = config.get('DATA')
 
@@ -636,22 +496,19 @@ def main():
 
     optim_cfg = config['OPTIM_ZIP']
     loss_cfg = config.get('ZIP_LOSS_V4', {})
-    
-    # Parametri per selezione best checkpoint
+
     best_selection_cfg = config.get('BEST_SELECTION', {})
     min_recall_threshold = best_selection_cfg.get('MIN_RECALL', 0.85)
     recall_margin = best_selection_cfg.get('RECALL_MARGIN', 0.02)
-    
-    # Parametro per max_size validazione (evita OOM)
+
     val_max_size = config.get('VAL_MAX_SIZE', 1024)
-    
+
     block_size = data_cfg.get('ZIP_BLOCK_SIZE', data_cfg.get('BLOCK_SIZE', 16))
-    
-    # Dataset
+
     DatasetClass = get_dataset(dataset_name)
     train_tf = build_transforms(data_cfg, is_train=True)
     val_tf = build_transforms(data_cfg, is_train=False)
-    
+
     train_dataset = DatasetClass(
         root=data_cfg['ROOT'],
         split=data_cfg.get('TRAIN_SPLIT', 'train'),
@@ -664,7 +521,7 @@ def main():
         block_size=block_size,
         transforms=val_tf
     )
-    
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=optim_cfg['BATCH_SIZE'],
@@ -681,11 +538,10 @@ def main():
         num_workers=optim_cfg.get('VAL_NUM_WORKERS', optim_cfg.get('NUM_WORKERS', 4)),
         collate_fn=collate_fn
     )
-    
+
     print(f"\n📊 Dataset: Train={len(train_dataset)}, Val={len(val_dataset)}")
     print(f"📐 Validation max_size: {val_max_size} (resize immagini grandi)")
-    
-    # Model
+
     bins_config = config.get('BINS_CONFIG', {})
     if dataset_name in bins_config:
         bin_config = bins_config[dataset_name]
@@ -694,7 +550,7 @@ def main():
     else:
         raise KeyError(f"BINS_CONFIG missing definition for dataset '{dataset_name}' and no default is available.")
     zip_head_cfg = config.get('ZIP_HEAD', {})
-    
+
     model_cfg = config.get('MODEL', {})
     model = P2R_ZIP_Model(
         bins=bin_config['bins'],
@@ -710,7 +566,7 @@ def main():
             'use_softplus': zip_head_cfg.get('USE_SOFTPLUS', True),
         }
     ).to(device)
-    
+
     print(f"\n⚙️ Loss Config (ZIP NLL V4):")
     print(f"   Weight λ reg: {loss_cfg.get('WEIGHT_LAMBDA_REG', 0.01)}")
     print(f"   λ max target: {loss_cfg.get('LAMBDA_MAX_TARGET', 8.0)}")
@@ -718,8 +574,7 @@ def main():
     print(f"\n⚙️ Best Selection Config:")
     print(f"   Min recall threshold: {min_recall_threshold*100:.0f}%")
     print(f"   Recall margin: {recall_margin*100:.0f}%")
-    
-    # Optimizer
+
     base_lr = float(optim_cfg.get('LR', 1e-4))
     backbone_lr = float(optim_cfg.get('LR_BACKBONE', base_lr * 0.1))
     head_lr = float(optim_cfg.get('HEAD_LR', base_lr))
@@ -728,29 +583,26 @@ def main():
         {'params': model.backbone.parameters(), 'lr': backbone_lr},
         {'params': model.zip_head.parameters(), 'lr': head_lr},
     ]
-    
+
     optimizer = torch.optim.AdamW(param_groups, weight_decay=float(optim_cfg['WEIGHT_DECAY']))
-    
-    # Scheduler
+
     epochs = optim_cfg['EPOCHS']
     warmup = optim_cfg.get('WARMUP_EPOCHS', 50)
-    
+
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup)
     main_scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup, eta_min=1e-7)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup])
-    
-    # Output
+
     exp_cfg = config.get('EXP', {})
     output_dir = os.path.join(exp_cfg.get('OUT_DIR', 'exp'), config.get('RUN_NAME', 'stage1_run'))
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Resume
+
     best_metrics: Optional[Dict] = None
     start_epoch = 1
     patience = optim_cfg.get('EARLY_STOPPING_PATIENCE', 800)
     no_improve = 0
     val_interval = optim_cfg.get('VAL_INTERVAL', 5)
-    
+
     resume_path = os.path.join(output_dir, 'last.pth')
     if os.path.exists(resume_path):
         print(f"\n🔄 Resume: {resume_path}")
@@ -762,35 +614,32 @@ def main():
         start_epoch = checkpoint['epoch'] + 1
         best_metrics = checkpoint.get('best_metrics', None)
         no_improve = checkpoint.get('no_improve', 0)
-        
+
         if best_metrics:
             print(f"   Epoch {checkpoint['epoch']}")
             print(f"   Best: R={best_metrics['recall']*100:.1f}% F1={best_metrics['f1']*100:.1f}% P={best_metrics['precision']*100:.1f}%")
         else:
-            # Backward compatibility: convert old format
             old_best_f1 = checkpoint.get('best_f1', 0.0)
             old_metrics = checkpoint.get('metrics', {})
             if old_metrics:
                 best_metrics = old_metrics
                 print(f"   Epoch {checkpoint['epoch']}, converted from old format")
-    
+
     print(f"\n🚀 Training: {start_epoch} → {epochs}")
-    
+
     for epoch in range(start_epoch, epochs + 1):
-        # Train
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, device, epoch,
             block_size=block_size, loss_cfg=loss_cfg
         )
         scheduler.step()
-        
-        # Validate
+
         if epoch % val_interval == 0:
             val_metrics = validate(
                 model, val_loader, device, block_size, loss_cfg,
                 max_size=val_max_size
             )
-            
+
             print(f"\n📊 Epoch {epoch}:")
             print(f"   NLL:       {val_metrics['nll']:.4f}")
             print(f"   Precision: {val_metrics['precision']*100:.2f}%")
@@ -799,66 +648,62 @@ def main():
             print(f"   Accuracy:  {val_metrics['accuracy']*100:.2f}%")
             print(f"   π mean:    {val_metrics['pi_mean']:.3f} ± {val_metrics['pi_std']:.3f}")
             print(f"   λ mean:    {val_metrics['lambda_mean']:.3f}")
-            
-            # Determina se è il best usando criterio composito
+
             if best_metrics is None:
                 is_best = True
             else:
                 is_best = is_better_checkpoint(
-                    val_metrics, 
+                    val_metrics,
                     best_metrics,
                     min_recall=min_recall_threshold,
                     recall_margin=recall_margin
                 )
                 print(f"   {format_metrics_comparison(val_metrics, best_metrics)}")
-            
+
             if is_best:
                 best_metrics = val_metrics.copy()
                 no_improve = 0
             else:
                 no_improve += val_interval
-            
+
             save_checkpoint(
-                model, optimizer, scheduler, epoch, 
-                val_metrics, best_metrics, no_improve, 
+                model, optimizer, scheduler, epoch,
+                val_metrics, best_metrics, no_improve,
                 output_dir, is_best
             )
-            
-            # Check targets
+
             if val_metrics['recall'] > 0.90 and val_metrics['f1'] > 0.65:
                 print(f"\n🎯 TARGETS RAGGIUNTI!")
-            
+
             if no_improve >= patience:
                 print(f"\n⛔ Early stopping @ epoch {epoch}")
                 break
-    
-    # Final: threshold tuning
+
     print(f"\n🔍 Threshold Tuning per Recall Target 90%...")
-    
+
     best_path = os.path.join(output_dir, 'best_model.pth')
     if os.path.exists(best_path):
         best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state['model'])
         print(f"   Loaded best model from epoch {best_state['epoch']}")
-    
+
     thresh_results = find_optimal_threshold(
         model, val_loader, device, block_size,
         target_recall=0.90,
         thresholds=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
         max_size=val_max_size,
     )
-    
+
     print(f"\n📊 Threshold Analysis:")
     print(f"{'Thresh':<8} {'Precision':<12} {'Recall':<12} {'F1':<12}")
     print("-" * 44)
     for r in thresh_results['all_results']:
         print(f"{r['threshold']:<8.2f} {r['precision']*100:<12.1f} {r['recall']*100:<12.1f} {r['f1']*100:<12.1f}")
-    
+
     best_for_recall = thresh_results['for_target_recall']
     print(f"\n✅ Per Recall ≥ 90%: τ = {best_for_recall['threshold']}")
     print(f"   R={best_for_recall['recall']*100:.1f}%, P={best_for_recall['precision']*100:.1f}%, F1={best_for_recall['f1']*100:.1f}%")
-    
-    # Save results
+
     results = {
         'best_metrics': best_metrics,
         'optimal_threshold_for_recall': best_for_recall['threshold'],
@@ -870,10 +715,10 @@ def main():
         },
         'val_max_size': val_max_size,
     }
-    
+
     with open(os.path.join(output_dir, 'stage1_v4_results.json'), 'w') as f:
         json.dump(results, f, indent=2)
-    
+
     print(f"\n{'='*70}")
     print(f"🏁 STAGE 1 V4.1 COMPLETATO")
     if best_metrics:

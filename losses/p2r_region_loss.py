@@ -1,12 +1,5 @@
 """
-P2R Region Loss V15 - Loss function per density estimation
-Basato su V9 (MAE ~69) con correzioni critiche
-
-CORREZIONI RISPETTO A V14:
-1. COUNT_WEIGHT=2.0 (alto) per enfatizzare count accuracy
-2. SPATIAL_WEIGHT=0.15 (basso) per guidare localizzazione senza dominare
-3. Multi-scale loss per consistenza a diverse risoluzioni
-4. Scale loss per penalizzare errori relativi
+P2R Region Loss 
 """
 
 import torch

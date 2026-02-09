@@ -36,23 +36,6 @@ from .p2r_head import P2RHead
 
 
 class P2R_ZIP_Model(nn.Module):
-    """
-    Modello P2R-ZIP V2 con ZIP come feature (no gating).
-    
-    Args:
-        bins: Lista di tuple per bin classification
-        bin_centers: Centri dei bin per calcolo λ
-        backbone_name: Nome backbone ("vgg16_bn")
-        pi_thresh: Threshold per π (solo per metriche, non usato nel forward)
-        upsample_to_input: Se True, upsamplare density alla risoluzione input
-        zip_head_kwargs: Kwargs per ZIPHead
-        p2r_head_kwargs: Kwargs per P2RHead
-        freeze_backbone: Se True, congela backbone
-        freeze_zip: Se True, congela ZIP head
-        gate: IGNORATO - mantenuto per retrocompatibilità Stage 1
-        gate_thresh: IGNORATO - mantenuto per retrocompatibilità
-        use_ste: IGNORATO - mantenuto per retrocompatibilità
-    """
     
     def __init__(
         self,
@@ -65,11 +48,10 @@ class P2R_ZIP_Model(nn.Module):
         p2r_head_kwargs: Optional[dict] = None,
         freeze_backbone: bool = False,
         freeze_zip: bool = False,
-        # Parametri legacy per retrocompatibilità (ignorati in bypass mode)
-        gate: str = "none",  # Ignorato - sempre bypass
-        gate_thresh: float = 0.5,  # Ignorato
-        use_ste: bool = False,  # Ignorato
-        use_ste_mask: bool = False,  # Ignorato
+        gate: str = "none",  
+        gate_thresh: float = 0.5, 
+        use_ste: bool = False, 
+        use_ste_mask: bool = False,  
     ):
         super().__init__()
         
@@ -79,7 +61,6 @@ class P2R_ZIP_Model(nn.Module):
         self.freeze_backbone = freeze_backbone
         self.freeze_zip = freeze_zip
         
-        # Bin centers come buffer (non parametro)
         self.register_buffer(
             "bin_centers",
             torch.tensor(bin_centers, dtype=torch.float32).view(1, -1, 1, 1)
@@ -89,7 +70,7 @@ class P2R_ZIP_Model(nn.Module):
         # BACKBONE
         # ============================================================
         self.backbone = BackboneWrapper(backbone_name)
-        backbone_out_ch = self.backbone.out_channels  # 512 per VGG16
+        backbone_out_ch = self.backbone.out_channels 
         
         # ============================================================
         # ZIP HEAD (produce π e λ)
@@ -106,12 +87,10 @@ class P2R_ZIP_Model(nn.Module):
         # ============================================================
         p2r_head_kwargs = p2r_head_kwargs or {}
         
-        # Rimuovi eventuali kwargs incompatibili
         p2r_head_kwargs.pop("up_scale", None)
         p2r_head_kwargs.pop("out_channel", None)
         
-        # IMPORTANTE: in_channel = 514 (512 features + 1 π + 1 λ)
-        p2r_in_channel = backbone_out_ch + 2  # 512 + 2 = 514
+        p2r_in_channel = backbone_out_ch + 2  
         
         self.p2r_head = P2RHead(
             in_channel=p2r_in_channel,
@@ -164,7 +143,6 @@ class P2R_ZIP_Model(nn.Module):
         """Override train() per rispettare freeze settings."""
         super().train(mode)
         
-        # Mantieni frozen i moduli che devono restare frozen
         if self.freeze_backbone:
             self.backbone.eval()
         if self.freeze_zip:
@@ -173,22 +151,6 @@ class P2R_ZIP_Model(nn.Module):
         return self
     
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass con ZIP come feature.
-        
-        Args:
-            x: Input tensor [B, 3, H, W]
-            
-        Returns:
-            dict con:
-            - p2r_density: [B, 1, H', W'] density map finale
-            - pi_probs: [B, 1, Hb, Wb] probabilità π
-            - lambda_maps: [B, 1, Hb, Wb] rate Poisson λ
-            - logit_pi_maps: [B, 2, Hb, Wb] logits π
-            - logit_bin_maps: [B, num_bins-1, Hb, Wb] logits bin
-            - features: [B, 512, Hf, Wf] backbone features (per debug)
-            - features_augmented: [B, 514, Hf, Wf] features + π + λ
-        """
         B, C, H, W = x.shape
         
         # ============================================================
@@ -200,7 +162,6 @@ class P2R_ZIP_Model(nn.Module):
         else:
             feat = self.backbone(x)
         
-        # feat shape: [B, 512, H/16, W/16]
         _, _, Hf, Wf = feat.shape
         
         # ============================================================
@@ -212,13 +173,12 @@ class P2R_ZIP_Model(nn.Module):
         else:
             zip_outputs = self.zip_head(feat, self.bin_centers)
         
-        logit_pi_maps = zip_outputs["logit_pi_maps"]  # [B, 2, Hb, Wb]
-        lambda_maps = zip_outputs["lambda_maps"]       # [B, 1, Hb, Wb]
+        logit_pi_maps = zip_outputs["logit_pi_maps"]  
+        lambda_maps = zip_outputs["lambda_maps"]       
         logit_bin_maps = zip_outputs["logit_bin_maps"]
         
-        # π probabilità (canale 1 = "occupato")
         pi_softmax = logit_pi_maps.softmax(dim=1)
-        pi_probs = pi_softmax[:, 1:2]  # [B, 1, Hb, Wb]
+        pi_probs = pi_softmax[:, 1:2]  
         
         # ============================================================
         # 3. ALLINEA π e λ ALLA RISOLUZIONE FEATURES
@@ -242,8 +202,7 @@ class P2R_ZIP_Model(nn.Module):
             lambda_aligned = lambda_maps
         
         # ============================================================
-        # 4. CONCATENA FEATURES + π + λ (NO MASKING!)
-        # Questa è la differenza chiave rispetto a V1
+        # 4. CONCATENA FEATURES + π + λ 
         # ============================================================
         features_augmented = torch.cat([feat, pi_aligned, lambda_aligned], dim=1)
         # Shape: [B, 514, Hf, Wf]
@@ -282,16 +241,6 @@ class P2R_ZIP_Model(nn.Module):
         density: torch.Tensor,
         cell_area: float = 1.0
     ) -> torch.Tensor:
-        """
-        Calcola il conteggio dalla density map.
-        
-        Args:
-            density: [B, 1, H, W]
-            cell_area: area di ogni cella per normalizzazione
-            
-        Returns:
-            [B] conteggio per ogni immagine
-        """
         return density.sum(dim=(1, 2, 3)) / cell_area
     
     def load_stage1_checkpoint(
@@ -300,18 +249,6 @@ class P2R_ZIP_Model(nn.Module):
         device: torch.device,
         strict: bool = False
     ) -> dict:
-        """
-        Carica checkpoint Stage 1 (backbone + ZIP head).
-        P2R head rimane con pesi inizializzati fresh.
-        
-        Args:
-            checkpoint_path: Path al checkpoint
-            device: Device target
-            strict: Se True, richiede match esatto delle chiavi
-            
-        Returns:
-            dict con info sul caricamento
-        """
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Estrai state dict

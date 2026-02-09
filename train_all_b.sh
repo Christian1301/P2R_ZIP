@@ -57,7 +57,7 @@ echo "✅ Valutazione 2 completata!"
 
 python3 evaluate_stage3.py --config config_shhb.yaml \
     --split test \
-    --checkpoint exp/shhb/stage3_fusion_best.pth \
+    --checkpoint exp/shhb/stage2_bypass_best.pth \
     --soft-alpha 0.15 \
     --pi-thresh 0.2 \
     --tta --tta-flip-only > logsb/ev_stage3.log 2>&1

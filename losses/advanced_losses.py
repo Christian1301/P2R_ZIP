@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Advanced Losses per Crowd Counting - Target MAE < 60
+Advanced Losses per Crowd Counting 
 
 Include:
 1. Smooth L1 Count Loss (più robusto di L1)

@@ -122,10 +122,6 @@ class CrowdCountingEngine:
 
     def _load_model(self, model_name: str):
         """Load model + checkpoint into cache."""
-        # Se viene richiesto ShanghaiTech Part B, usa sempre Part A
-        if model_name == "ShanghaiTech Part B":
-            print("⚠️  'ShanghaiTech Part B' non disponibile, uso 'ShanghaiTech Part A'.")
-            model_name = "ShanghaiTech Part A"
 
         if model_name in self._cache:
             return self._cache[model_name]
@@ -180,7 +176,6 @@ class CrowdCountingEngine:
         model.eval()
 
         self._cache[model_name] = (model, scale_val, config)
-        print(f"✅ Loaded model: {model_name} (scale={scale_val:.3f})")
         return model, scale_val, config
 
     @torch.no_grad()
@@ -278,6 +273,44 @@ class CrowdCountingEngine:
             "images": images,
             "stats": stats,
         }
+
+    def render_gt_overlay(self, pil_image: Image.Image, gt_text: str) -> str:
+        """Render original image with GT point annotations overlaid. Returns base64 PNG."""
+        lines = gt_text.strip().split('\n')
+        points = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.replace(',', ' ').split()
+            if len(parts) >= 2:
+                try:
+                    x, y = float(parts[0]), float(parts[1])
+                    points.append((x, y))
+                except ValueError:
+                    continue
+
+        if not points:
+            return None
+
+        img_np = np.array(pil_image.convert("RGB"))
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        ax.imshow(img_np)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        dot_size = max(4, min(30, 8000 / max(len(points), 1)))
+        ax.scatter(xs, ys, c='red', s=dot_size, alpha=0.8, edgecolors='yellow', linewidths=0.5)
+        ax.set_title(f"Ground Truth ({len(points)} points)", fontsize=13, fontweight='bold', pad=8, color='white')
+        ax.axis('off')
+        plt.tight_layout()
+
+        buf = BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+                    facecolor='#1a1a2e', edgecolor='none')
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode('utf-8')
 
     def _render_heatmap(self, data: np.ndarray, title: str, cmap='inferno',
                         vmin=None, vmax=None, overlay_img=None) -> str:

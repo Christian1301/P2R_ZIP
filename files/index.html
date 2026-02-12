@@ -443,9 +443,13 @@ body {
 /* Visualization cards */
 .viz-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 10px;
   margin: 14px 0;
+}
+
+.viz-grid:has(.viz-card:nth-child(3)) {
+  grid-template-columns: 1fr 1fr 1fr;
 }
 
 .viz-card {
@@ -477,12 +481,13 @@ body {
   background: #1a1a2e;
 }
 
-/* Inference time */
-.inference-time {
-  font-size: 0.75rem;
+/* Meta line */
+.meta-line {
+  font-size: 0.78rem;
   color: var(--text-tertiary);
-  margin-top: 8px;
   font-family: var(--font-mono);
+  letter-spacing: 0.01em;
+  margin-bottom: 4px;
 }
 
 /* Loading */
@@ -860,7 +865,7 @@ function renderModelSelector(models) {
       </svg>
     </div>
     <div class="model-dropdown" id="modelDropdown">
-      <div class="model-dropdown-header">Seleziona modello</div>
+      <div class="model-dropdown-header">Choose model</div>
       ${models.map(m => `
         <div class="model-option${m.name === selectedModel ? ' active' : ''}${!m.available ? ' unavailable' : ''}"
              data-model="${m.name}" ${!m.available ? '' : ''}>
@@ -927,6 +932,7 @@ function selectModel(name) {
 // ── File Upload ─────────────────────────────────────────────
 
 let pendingGtCount = null;  // ground truth from loaded .txt
+let pendingGtText = null;   // full GT file content (coordinates)
 
 // GT file upload
 document.getElementById('gtUploadBtn').addEventListener('click', () => {
@@ -942,6 +948,7 @@ document.getElementById('gtFileInput').addEventListener('change', (e) => {
     const text = ev.target.result.trim();
     const lines = text.split('\n').filter(l => l.trim().length > 0);
     pendingGtCount = lines.length;
+    pendingGtText = text;
 
     // Update button appearance
     const btn = document.getElementById('gtUploadBtn');
@@ -992,6 +999,7 @@ async function handleImage(file) {
 
   // Capture current GT value before resetting
   const currentGt = pendingGtCount;
+  const currentGtText = pendingGtText;
 
   // Hide welcome
   const welcome = document.getElementById('welcome');
@@ -1012,6 +1020,9 @@ async function handleImage(file) {
       formData.append('model', selectedModel);
       if (currentGt !== null) {
         formData.append('ground_truth', currentGt);
+      }
+      if (currentGtText !== null) {
+        formData.append('gt_points', currentGtText);
       }
 
       const res = await fetch(`${API}/api/predict`, { method: 'POST', body: formData });
@@ -1036,6 +1047,7 @@ async function handleImage(file) {
 
     // Reset GT after use
     pendingGtCount = null;
+    pendingGtText = null;
     const gtBtn = document.getElementById('gtUploadBtn');
     gtBtn.classList.remove('loaded');
     document.getElementById('gtStatus').textContent = '';
@@ -1102,36 +1114,19 @@ function addAIResponse(data) {
       <div class="ai-response">
         <div class="count-highlight">
           👥 Estimated count: <span class="count-number">${count}</span> people
-          ${data.ground_truth ? `<span style="font-size:0.85rem; font-weight:400; color:#6b6459; margin-left:8px;">( GT: ${data.ground_truth} )</span>` : ''}
+          ${data.ground_truth ? `<span style="font-size:1.05rem; font-weight:600; color:#6b6459; margin-left:10px;">( GT: ${data.ground_truth} )</span>` : ''}
         </div>
-
-        <div class="stats-grid">
-          <div class="stat-card">
-            <div class="stat-label">Raw Count</div>
-            <div class="stat-value">${s.count_raw}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Soft Fusion</div>
-            <div class="stat-value">${s.count_soft}</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">π Coverage</div>
-            <div class="stat-value">${s.pi_coverage}%</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Scale Comp.</div>
-            <div class="stat-value">${s.scale_compensation}</div>
-          </div>
-        </div>
+        <div class="meta-line">${s.model} · π coverage ${s.pi_coverage}% · ${data.inference_time}s</div>
 
         <div class="viz-grid">
+          ${data.images.gt_overlay ? `
+          <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.gt_overlay}')">
+            <img src="data:image/png;base64,${data.images.gt_overlay}" alt="Ground Truth">
+            <div class="viz-label">Ground Truth</div>
+          </div>` : ''}
           <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.pi_map}')">
             <img src="data:image/png;base64,${data.images.pi_map}" alt="Pi Map">
             <div class="viz-label">π Occupancy Map</div>
-          </div>
-          <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.density_raw}')">
-            <img src="data:image/png;base64,${data.images.density_raw}" alt="Raw Density">
-            <div class="viz-label">Raw Density</div>
           </div>
           <div class="viz-card" onclick="openLightbox('data:image/png;base64,${data.images.density_soft}')">
             <img src="data:image/png;base64,${data.images.density_soft}" alt="Soft Fusion">
@@ -1139,7 +1134,6 @@ function addAIResponse(data) {
           </div>
         </div>
 
-        <div class="inference-time">⏱ Inference: ${data.inference_time}s</div>
       </div>
     </div>
   `;

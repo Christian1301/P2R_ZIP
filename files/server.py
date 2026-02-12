@@ -187,11 +187,19 @@ def predict():
         else:
             ground_truth = find_ground_truth(file.filename, model_name)
 
+        # Generate GT overlay image if GT points are provided
+        gt_points_text = request.form.get('gt_points')
+        images = result["images"]
+        if gt_points_text:
+            gt_overlay = engine.render_gt_overlay(pil_image, gt_points_text)
+            if gt_overlay:
+                images["gt_overlay"] = gt_overlay
+
         return jsonify({
             "success": True,
             "count": result["count"],
             "stats": result["stats"],
-            "images": result["images"],
+            "images": images,
             "original_image": original_b64,
             "inference_time": inference_time,
             "ground_truth": ground_truth,
